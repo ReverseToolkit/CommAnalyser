@@ -285,11 +285,12 @@ fn class_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>) -> JsResult<Object<'js
         let function = method_function(ctx.clone(), class.clone(), target, methods)?;
         wrapper.set(name, function)?;
     }
-    if let Some(ctor) = class.info.ctors.first() {
-        let mut method = ctor_method(ctor);
-        method.name = "$init".into();
-        let function =
-            method_function(ctx.clone(), class.clone(), Target::Prototype, vec![method])?;
+    if !class.info.ctors.is_empty() {
+        let mut methods: Vec<MethodInfo> = class.info.ctors.iter().map(ctor_method).collect();
+        for method in &mut methods {
+            method.name = "$init".into();
+        }
+        let function = method_function(ctx.clone(), class.clone(), Target::Prototype, methods)?;
         wrapper.set("$init", function)?;
     }
     for field in class
