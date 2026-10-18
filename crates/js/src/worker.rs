@@ -22,6 +22,8 @@ use crate::ScriptRuntime;
 
 thread_local! {
     static JS_THREAD: Cell<bool> = const { Cell::new(false) };
+    static JAVA_HOOKS_TLS: RefCell<Option<Rc<RefCell<JavaHookTable>>>> =
+        const { RefCell::new(None) };
     static HOOK_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -138,6 +140,24 @@ pub(crate) struct JavaImplArgs {
     pub globals: u32,
 }
 
+pub(crate) fn find_java_hook(
+    class_name: &str,
+    method: &art::java::MethodInfo,
+) -> Option<Rc<RefCell<art::hook::JavaHook>>> {
+    JAVA_HOOKS_TLS.with(|slot| {
+        let table = slot.borrow();
+        let table = table.as_ref()?;
+        let table = table.borrow();
+        table.entries.iter().flatten().find_map(|entry| {
+            (entry.class.info.name == class_name
+                && entry.method.name == method.name
+                && entry.method.signature == method.signature
+                && entry.method.is_static == method.is_static)
+                .then(|| entry.hook.clone())
+        })
+    })
+}
+
 /// Handle used by the agent control thread and by hook trampolines.
 #[derive(Clone)]
 pub struct JsWorker {
@@ -195,6 +215,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
     let hooks = Rc::new(RefCell::new(HookTable::default()));
     let callbacks = Rc::new(RefCell::new(CallbackTable::default()));
     let java_hooks = Rc::new(RefCell::new(JavaHookTable::default()));
+    JAVA_HOOKS_TLS.with(|slot| *slot.borrow_mut() = Some(java_hooks.clone()));
     let runtime = match ScriptRuntime::new_with_hooks(
         tx,
         hooks.clone(),

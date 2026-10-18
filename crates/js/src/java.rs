@@ -267,8 +267,9 @@ fn class_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>) -> JsResult<Object<'js
             move |args: Rest<Value<'js>>| -> JsResult<Value<'js>> {
                 let ctor = choose_ctor(&ctor_class, &args.0)?;
                 let java_args = convert_args(&args.0, &ctor.params)?;
-                let object = ctor_class
-                    .new_object_with(ctor, &java_args)
+                let method = ctor_method(ctor);
+                let hook = crate::worker::find_java_hook(&ctor_class.info.name, &method);
+                let object = call_with_hook(hook, || ctor_class.new_object_with(ctor, &java_args))
                     .map_err(to_js_error)?;
                 let id = register(object);
                 Ok(instance_object(ctor_ctx.clone(), ctor_class.clone(), id)?.into_value())
@@ -475,6 +476,20 @@ enum Target {
     Prototype,
 }
 
+fn call_with_hook<R>(
+    hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
+    call: impl FnOnce() -> R,
+) -> R {
+    let Some(hook) = hook else {
+        return call();
+    };
+    let hook = hook.borrow();
+    hook.suspend();
+    let result = call();
+    hook.resume();
+    result
+}
+
 fn method_function<'js>(
     ctx: Ctx<'js>,
     class: Rc<JavaClass>,
@@ -492,9 +507,14 @@ fn method_function<'js>(
         move |args: Rest<Value<'js>>| -> JsResult<Value<'js>> {
             let method = choose_method(&methods, &args.0)?;
             let java_args = convert_args(&args.0, &method.params)?;
+            let hook = crate::worker::find_java_hook(&call_class.info.name, method);
             let value = match &target {
-                Target::Static => call_class.call_static(method, &java_args),
-                Target::Instance(object) => object.call(method, &java_args),
+                Target::Static => {
+                    call_with_hook(hook, || call_class.call_static(method, &java_args))
+                }
+                Target::Instance(object) => {
+                    call_with_hook(hook, || object.call(method, &java_args))
+                }
                 Target::Super { object, class } => class.call_super(object, method, &java_args),
                 Target::Prototype => {
                     return Err(js_error(

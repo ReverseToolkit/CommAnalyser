@@ -1693,3 +1693,40 @@ pub fn enumerate_loaded_classes() -> Result<Vec<String>> {
         Ok(names)
     })
 }
+
+pub fn helper_key_event() -> Result<String> {
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        let class = env.find_class(&*JNIString::new("android/view/KeyEvent"))?;
+        let sig = RuntimeMethodSignature::from_str("(JJIIIIIII)V")?;
+        let params = [
+            Kind::Long,
+            Kind::Long,
+            Kind::Int,
+            Kind::Int,
+            Kind::Int,
+            Kind::Int,
+            Kind::Int,
+            Kind::Int,
+            Kind::Int,
+        ];
+        let args = [
+            JavaArg::Long(0),
+            JavaArg::Long(0),
+            JavaArg::Int(0),
+            JavaArg::Int(4),
+            JavaArg::Int(0),
+            JavaArg::Int(0),
+            JavaArg::Int(0),
+            JavaArg::Int(0),
+            JavaArg::Int(0),
+        ];
+        let object = new_object_with_values(env, &class, sig.method_signature(), &params, &args)?;
+        let name = JNIString::new("getKeyCode");
+        let get = RuntimeMethodSignature::from_str("()I")?;
+        let code = env
+            .call_method(&object, &*name, get.method_signature(), &[])?
+            .i()?;
+        Ok(format!("ok keyCode={code}"))
+    })
+}

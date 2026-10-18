@@ -142,6 +142,10 @@ fn run(name: &str) -> std::io::Result<()> {
                 Ok(value) => json!({"ok": true, "value": format!("{value:#x}")}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
+            "java_key_event" => match art::java::helper_key_event() {
+                Ok(text) => json!({ "ok": true, "value": text }),
+                Err(error) => json!({ "ok": false, "error": error.to_string() }),
+            },
             "java_ctor_helper" => match art::java::helper_ctor() {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
