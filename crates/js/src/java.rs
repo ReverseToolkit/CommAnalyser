@@ -229,6 +229,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
     let java = Object::new(ctx.clone())?;
     java.set("available", true)?;
     java.set("perform", Func::from(perform))?;
+    java.set("performNow", Func::from(perform))?;
     java.set("use", Func::from(use_class))?;
     java.set("array", Func::from(make_array))?;
     java.set("cast", Func::from(cast))?;
