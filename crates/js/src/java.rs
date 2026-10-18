@@ -31,6 +31,8 @@ struct HookMeta {
 }
 
 static HOOK_META: OnceLock<Mutex<HashMap<usize, HookMeta>>> = OnceLock::new();
+static JAVA_ERROR: Mutex<Option<String>> = Mutex::new(None);
+static LAST_JAVA_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 fn hook_meta() -> &'static Mutex<HashMap<usize, HookMeta>> {
     HOOK_META.get_or_init(|| Mutex::new(HashMap::new()))
@@ -40,6 +42,23 @@ pub(crate) fn hook_meta_for(id: usize) -> Option<(bool, Vec<Kind>)> {
     let meta = hook_meta().lock().ok()?;
     let entry = meta.get(&id)?;
     Some((entry.is_static, entry.params.clone()))
+}
+
+pub(crate) fn set_java_error(message: String) {
+    if let Ok(mut slot) = JAVA_ERROR.lock() {
+        *slot = Some(message.clone());
+    }
+    if let Ok(mut slot) = LAST_JAVA_ERROR.lock() {
+        *slot = Some(message);
+    }
+}
+
+pub(crate) fn take_java_error() -> Option<String> {
+    JAVA_ERROR.lock().ok()?.take()
+}
+
+pub fn last_java_error() -> Option<String> {
+    LAST_JAVA_ERROR.lock().ok()?.clone()
 }
 
 pub(crate) fn hook_returns_object(id: usize) -> bool {

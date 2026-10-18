@@ -404,6 +404,9 @@ pub(crate) extern "C" fn java_dispatch(
     let mut result = response
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
+    if let Some(message) = crate::java::take_java_error() {
+        let _ = art::java::throw_runtime_exception(&message);
+    }
     if result.x0 != 0 && crate::java::hook_returns_object(id) {
         result.x0 = art::soa::global_to_raw(result.x0 as usize).unwrap_or(0) as u64;
     }

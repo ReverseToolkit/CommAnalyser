@@ -16,6 +16,7 @@ use gum::SavedRegs;
 use rquickjs::{CatchResultExt, Context, Function, Runtime};
 use runtime::{Error, Result};
 
+pub use java::last_java_error;
 pub use worker::JsWorker;
 
 use worker::{CallbackTable, HookTable, JavaHookTable, Job};
@@ -236,7 +237,10 @@ impl ScriptRuntime {
                 },
             ) {
                 Ok((x0, d0)) => crate::worker::DispatchResult { x0, d0 },
-                Err(_) => crate::worker::DispatchResult::default(),
+                Err(error) => {
+                    crate::java::set_java_error(error.to_string());
+                    crate::worker::DispatchResult::default()
+                }
             }
         })
     }

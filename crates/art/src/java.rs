@@ -1251,6 +1251,16 @@ pub fn call_double_to_bits() -> Result<i64> {
     }
 }
 
+pub fn throw_runtime_exception(message: &str) -> Result<()> {
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        let class = jni::strings::JNIString::from("java/lang/RuntimeException");
+        let message = jni::strings::JNIString::from(message);
+        env.throw_new(class, message)?;
+        Ok(())
+    })
+}
+
 /// Create a Java `int[]` and wrap it as a JavaObject.
 pub fn new_int_array(values: &[i32]) -> Result<JavaObject> {
     let class = JavaClass::find("[I")?;
@@ -1321,5 +1331,20 @@ pub fn new_string_array(values: &[String]) -> Result<JavaObject> {
         let object: &JObject<'_> = array.as_ref();
         let global = env.new_global_ref(object)?;
         Ok(JavaObject::from_global(class.info.clone(), global))
+    })
+}
+
+pub fn exception_pending() -> Result<bool> {
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| Ok(env.exception_check()))
+}
+
+pub fn clear_pending_exception() -> Result<()> {
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        if env.exception_check() {
+            env.exception_clear();
+        }
+        Ok(())
     })
 }

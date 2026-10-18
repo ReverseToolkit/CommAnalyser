@@ -207,6 +207,22 @@ fn run(name: &str) -> std::io::Result<()> {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
+            "java_last_error" => json!({
+                "ok": true,
+                "error": js::last_java_error(),
+            }),
+            "java_throw_test" => match art::java::throw_runtime_exception("probe") {
+                Ok(()) => json!({"ok": true}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_exception" => match art::java::exception_pending() {
+                Ok(value) => json!({"ok": true, "pending": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_exception_clear" => match art::java::clear_pending_exception() {
+                Ok(()) => json!({"ok": true}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
             "java_length" => match art::java::call_length() {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
