@@ -90,11 +90,12 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
         globalThis.__analyser_call_impl = function (fn, thisObj, args) {
             return fn.apply(thisObj, args);
         };
-        globalThis.__analyser_make_java_field = function (getter) {
+        globalThis.__analyser_make_java_field = function (getter, setter) {
             const field = {};
             Object.defineProperty(field, 'value', {
                 enumerable: true,
-                get: getter
+                get: getter,
+                set: setter
             });
             return field;
         };
@@ -172,7 +173,12 @@ fn class_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>) -> JsResult<Object<'js
     {
         wrapper.set(
             field.name.clone(),
-            field_object(ctx.clone(), class.clone(), field.clone())?,
+            field_object(
+                ctx.clone(),
+                class.clone(),
+                FieldTarget::Static,
+                field.clone(),
+            )?,
         )?;
     }
     Ok(wrapper)
@@ -196,22 +202,80 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
         )?;
         wrapper.set(name, function)?;
     }
+    for field in class
+        .info
+        .fields
+        .iter()
+        .filter(|field| !field.is_static && field.is_public)
+    {
+        wrapper.set(
+            field.name.clone(),
+            field_object(
+                ctx.clone(),
+                class.clone(),
+                FieldTarget::Instance(object.clone()),
+                field.clone(),
+            )?,
+        )?;
+    }
     Ok(wrapper)
+}
+
+enum FieldTarget {
+    Static,
+    Instance(Rc<JavaObject>),
+}
+
+impl FieldTarget {
+    fn get(&self, class: &JavaClass, field: &FieldInfo) -> runtime::Result<JavaValue> {
+        match self {
+            Self::Static => class.get_static_field(field),
+            Self::Instance(object) => object.get_field(field),
+        }
+    }
+
+    fn set(&self, class: &JavaClass, field: &FieldInfo, arg: &JavaArg) -> runtime::Result<()> {
+        match self {
+            Self::Static => class.set_static_field(field, arg),
+            Self::Instance(object) => object.set_field(field, arg),
+        }
+    }
 }
 
 fn field_object<'js>(
     ctx: Ctx<'js>,
     class: Rc<JavaClass>,
+    target: FieldTarget,
     field: FieldInfo,
 ) -> JsResult<Object<'js>> {
-    let call_ctx = ctx.clone();
-    let call_class = class.clone();
+    let get_ctx = ctx.clone();
+    let get_class = class.clone();
+    let get_target = match &target {
+        FieldTarget::Static => FieldTarget::Static,
+        FieldTarget::Instance(object) => FieldTarget::Instance(object.clone()),
+    };
+    let get_field = field.clone();
     let getter = Function::new(ctx.clone(), move || -> JsResult<Value<'js>> {
-        let value = call_class.get_static_field(&field).map_err(to_js_error)?;
-        value_to_js(call_ctx.clone(), call_class.clone(), value)
+        let value = get_target
+            .get(&get_class, &get_field)
+            .map_err(to_js_error)?;
+        value_to_js(get_ctx.clone(), get_class.clone(), value)
     })?;
+
+    let set_class = class.clone();
+    let set_target = target;
+    let set_field = field;
+    let setter = Function::new(
+        ctx.clone(),
+        move |_ctx: Ctx<'js>, value: Value<'js>| -> JsResult<()> {
+            let arg = to_arg(&value, &set_field.kind)?;
+            set_target
+                .set(&set_class, &set_field, &arg)
+                .map_err(to_js_error)
+        },
+    )?;
     let wrap: Function<'js> = ctx.globals().get("__analyser_make_java_field")?;
-    wrap.call((getter,))
+    wrap.call((getter, setter))
 }
 
 fn method_groups(info: &ClassInfo) -> BTreeMap<String, Vec<MethodInfo>> {

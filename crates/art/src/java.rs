@@ -221,6 +221,22 @@ impl JavaClass {
         })
     }
 
+    pub fn set_static_field(&self, field: &FieldInfo, arg: &JavaArg) -> Result<()> {
+        let vm = JavaVm::get()?;
+        vm.with_env(|env| {
+            let FieldId::Static(id) = field.id else {
+                return Err(jni::errors::Error::JniCall(
+                    jni::errors::JniError::InvalidArguments,
+                ));
+            };
+            with_jvalue(env, &field.kind, arg, |env, value| {
+                // SAFETY: the field id and JValue type match the reflected
+                // field.
+                unsafe { env.set_static_field_unchecked(&self.class, id, value) }
+            })
+        })
+    }
+
     pub fn call_static(&self, method: &MethodInfo, args: &[JavaArg]) -> Result<JavaValue> {
         let vm = JavaVm::get()?;
         vm.with_env(|env| {
@@ -249,6 +265,38 @@ impl JavaObject {
         self.object.as_obj()
     }
 
+    pub fn get_field(&self, field: &FieldInfo) -> Result<JavaValue> {
+        let vm = JavaVm::get()?;
+        vm.with_env(|env| {
+            let FieldId::Instance(id) = field.id else {
+                return Err(jni::errors::Error::JniCall(
+                    jni::errors::JniError::InvalidArguments,
+                ));
+            };
+            // SAFETY: the field id came from the object's class and the
+            // return type matches the reflected field type.
+            let value =
+                unsafe { env.get_field_unchecked(&self.object, id, return_type(&field.kind))? };
+            convert(env, &field.kind, value)
+        })
+    }
+
+    pub fn set_field(&self, field: &FieldInfo, arg: &JavaArg) -> Result<()> {
+        let vm = JavaVm::get()?;
+        vm.with_env(|env| {
+            let FieldId::Instance(id) = field.id else {
+                return Err(jni::errors::Error::JniCall(
+                    jni::errors::JniError::InvalidArguments,
+                ));
+            };
+            with_jvalue(env, &field.kind, arg, |env, value| {
+                // SAFETY: the field id and JValue type match the reflected
+                // field.
+                unsafe { env.set_field_unchecked(&self.object, id, value) }
+            })
+        })
+    }
+
     pub fn call(&self, method: &MethodInfo, args: &[JavaArg]) -> Result<JavaValue> {
         let vm = JavaVm::get()?;
         vm.with_env(|env| {
@@ -265,6 +313,40 @@ impl JavaObject {
             };
             convert(env, &method.ret, value)
         })
+    }
+}
+
+fn with_jvalue<'a, T>(
+    env: &mut Env<'a>,
+    kind: &Kind,
+    arg: &JavaArg,
+    set: impl FnOnce(&mut Env<'a>, JValue<'_>) -> jni::errors::Result<T>,
+) -> jni::errors::Result<T> {
+    match (kind, arg) {
+        (Kind::Boolean, JavaArg::Boolean(value)) => set(env, JValue::Bool(*value)),
+        (Kind::Byte, JavaArg::Int(value)) => set(env, JValue::Byte(*value as i8)),
+        (Kind::Char, JavaArg::Int(value)) => set(env, JValue::Char(*value as u16)),
+        (Kind::Short, JavaArg::Int(value)) => set(env, JValue::Short(*value as i16)),
+        (Kind::Int, JavaArg::Int(value)) => set(env, JValue::Int(*value)),
+        (Kind::Long, JavaArg::Long(value)) => set(env, JValue::Long(*value)),
+        (Kind::Object(_), JavaArg::String(value)) => {
+            let string = env.new_string(value)?;
+            let object = JObject::from(string);
+            set(env, JValue::Object(&object))
+        }
+        (Kind::Object(_), JavaArg::Object(object)) => {
+            // SAFETY: the global reference is valid for this call.
+            let local = unsafe { JObject::from_raw(env, object.as_obj().as_raw()) };
+            set(env, JValue::Object(&local))
+        }
+        (Kind::Object(_), JavaArg::Null) => {
+            // SAFETY: a null object reference is valid for a reference field.
+            let local = unsafe { JObject::from_raw(env, ptr::null_mut()) };
+            set(env, JValue::Object(&local))
+        }
+        _ => Err(jni::errors::Error::JniCall(
+            jni::errors::JniError::InvalidArguments,
+        )),
     }
 }
 
