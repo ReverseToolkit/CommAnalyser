@@ -4,6 +4,7 @@
 //! `jmethodID` (= `ArtMethod*` on ART), and inspect the first cache line for
 //! candidate entrypoint offsets.  Patching/deoptimization builds on this.
 
+pub mod hook;
 pub mod java;
 
 use std::ffi::c_void;

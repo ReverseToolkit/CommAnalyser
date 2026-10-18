@@ -10,8 +10,9 @@ use std::rc::Rc;
 
 use rquickjs::function::Rest;
 use rquickjs::prelude::Func;
-use rquickjs::{Ctx, Function, IntoJs, Object, Result as JsResult, Value};
+use rquickjs::{Ctx, Function, IntoJs, Object, Persistent, Result as JsResult, Value};
 
+use crate::worker::{java_dispatch, JavaHookEntry, JavaHookTable};
 use art::java::{ClassInfo, CtorInfo, JavaArg, JavaClass, JavaObject, JavaValue, Kind, MethodInfo};
 
 thread_local! {
@@ -20,7 +21,56 @@ thread_local! {
 
 const HANDLE: &str = "__analyserJavaId";
 
-pub(crate) fn install(ctx: &Ctx<'_>) -> JsResult<()> {
+pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>>) -> JsResult<()> {
+    ctx.globals().set(
+        "__analyser_java_set_impl",
+        Func::from(
+            move |ctx: Ctx<'js>,
+                  class_name: String,
+                  method_name: String,
+                  signature: String,
+                  is_static: bool,
+                  callback: Function<'js>|
+                  -> JsResult<()> {
+                let class = JavaClass::find(&class_name).map_err(to_js_error)?;
+                let method = class
+                    .info
+                    .methods
+                    .iter()
+                    .find(|method| {
+                        method.name == method_name
+                            && method.signature == signature
+                            && method.is_static == is_static
+                    })
+                    .ok_or_else(|| js_error("Java method not found"))?;
+                let mut table = java_hooks.borrow_mut();
+                let id = table.entries.len();
+                let hook = art::hook::install(method.id, java_dispatch as *const () as usize, id)
+                    .map_err(to_js_error)?;
+                table.entries.push(JavaHookEntry {
+                    function: Persistent::save(&ctx, callback),
+                    _hook: hook,
+                });
+                Ok(())
+            },
+        ),
+    )?;
+    ctx.eval::<(), _>(
+        r#"
+        globalThis.__analyser_make_java_method = function (fn, className, methodName, signature, isStatic) {
+            Object.defineProperty(fn, 'implementation', {
+                configurable: true,
+                get() { return fn.__impl || null; },
+                set(cb) {
+                    fn.__impl = cb;
+                    __analyser_java_set_impl(className, methodName, signature, isStatic, cb);
+                }
+            });
+            return fn;
+        };
+        "#,
+    )?;
+
     let java = Object::new(ctx.clone())?;
     java.set("available", true)?;
     java.set("perform", Func::from(perform))?;
@@ -58,8 +108,13 @@ fn class_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>) -> JsResult<Object<'js
         ),
     )?;
 
-    for (name, methods) in method_groups(&class.info, true) {
-        let function = method_function(ctx.clone(), class.clone(), None, methods)?;
+    for (name, methods) in method_groups(&class.info) {
+        let target = if methods[0].is_static {
+            Target::Static
+        } else {
+            Target::Prototype
+        };
+        let function = method_function(ctx.clone(), class.clone(), target, methods)?;
         wrapper.set(name, function)?;
     }
     Ok(wrapper)
@@ -71,43 +126,76 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
     wrapper.set("$className", class.info.name.clone())?;
 
     let object = get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
-    for (name, methods) in method_groups(&class.info, false) {
-        let function = method_function(ctx.clone(), class.clone(), Some(object.clone()), methods)?;
+    for (name, methods) in method_groups(&class.info) {
+        if methods[0].is_static {
+            continue;
+        }
+        let function = method_function(
+            ctx.clone(),
+            class.clone(),
+            Target::Instance(object.clone()),
+            methods,
+        )?;
         wrapper.set(name, function)?;
     }
     Ok(wrapper)
 }
 
-fn method_groups(info: &ClassInfo, static_methods: bool) -> BTreeMap<String, Vec<MethodInfo>> {
+fn method_groups(info: &ClassInfo) -> BTreeMap<String, Vec<MethodInfo>> {
     let mut groups: BTreeMap<String, Vec<MethodInfo>> = BTreeMap::new();
     for method in &info.methods {
-        if method.is_static == static_methods {
-            groups
-                .entry(method.name.clone())
-                .or_default()
-                .push(method.clone());
-        }
+        groups
+            .entry(method.name.clone())
+            .or_default()
+            .push(method.clone());
     }
     groups
+}
+
+enum Target {
+    Static,
+    Instance(Rc<JavaObject>),
+    Prototype,
 }
 
 fn method_function<'js>(
     ctx: Ctx<'js>,
     class: Rc<JavaClass>,
-    object: Option<Rc<JavaObject>>,
+    target: Target,
     methods: Vec<MethodInfo>,
 ) -> JsResult<Function<'js>> {
+    let first = methods
+        .first()
+        .ok_or_else(|| js_error("empty Java method group"))?
+        .clone();
     let call_ctx = ctx.clone();
-    Function::new(ctx, move |args: Rest<Value<'js>>| -> JsResult<Value<'js>> {
-        let method = choose_method(&methods, &args.0)?;
-        let java_args = convert_args(&args.0, &method.params)?;
-        let value = match &object {
-            Some(object) => object.call(method, &java_args),
-            None => class.call_static(method, &java_args),
-        }
-        .map_err(to_js_error)?;
-        value_to_js(call_ctx.clone(), class.clone(), value)
-    })
+    let call_class = class.clone();
+    let function = Function::new(
+        ctx.clone(),
+        move |args: Rest<Value<'js>>| -> JsResult<Value<'js>> {
+            let method = choose_method(&methods, &args.0)?;
+            let java_args = convert_args(&args.0, &method.params)?;
+            let value = match &target {
+                Target::Static => call_class.call_static(method, &java_args),
+                Target::Instance(object) => object.call(method, &java_args),
+                Target::Prototype => {
+                    return Err(js_error(
+                        "instance method called on the class object; call it on an instance",
+                    ))
+                }
+            }
+            .map_err(to_js_error)?;
+            value_to_js(call_ctx.clone(), call_class.clone(), value)
+        },
+    )?;
+    let wrap: Function<'js> = ctx.globals().get("__analyser_make_java_method")?;
+    wrap.call((
+        function,
+        class.info.name.clone(),
+        first.name,
+        first.signature,
+        first.is_static,
+    ))
 }
 
 fn choose_method<'a>(methods: &'a [MethodInfo], args: &[Value<'_>]) -> JsResult<&'a MethodInfo> {

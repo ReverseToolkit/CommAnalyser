@@ -52,6 +52,17 @@ pub(crate) struct HookBridge {
     pub(crate) tx: Sender<Job>,
 }
 
+pub(crate) struct JavaHookEntry {
+    pub(crate) function: Persistent<Function<'static>>,
+    // Held only so the entrypoint is restored when the table is dropped.
+    pub(crate) _hook: art::hook::JavaHook,
+}
+
+#[derive(Default)]
+pub(crate) struct JavaHookTable {
+    pub(crate) entries: Vec<JavaHookEntry>,
+}
+
 pub(crate) struct CallbackEntry {
     pub(crate) function: Persistent<Function<'static>>,
     pub(crate) arg_types: Vec<String>,
@@ -93,6 +104,10 @@ pub(crate) enum Job {
         name: String,
         args: String,
         reply: Sender<Result<String>>,
+    },
+    JavaImpl {
+        id: usize,
+        reply: Sender<u64>,
     },
     Shutdown,
 }
@@ -153,13 +168,15 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
     let _ = JS_TX.set(tx.clone());
     let hooks = Rc::new(RefCell::new(HookTable::default()));
     let callbacks = Rc::new(RefCell::new(CallbackTable::default()));
-    let runtime = match ScriptRuntime::new_with_hooks(tx, hooks.clone(), callbacks, event_tx) {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("[js] failed to create runtime: {err}");
-            return;
-        }
-    };
+    let java_hooks = Rc::new(RefCell::new(JavaHookTable::default()));
+    let runtime =
+        match ScriptRuntime::new_with_hooks(tx, hooks.clone(), callbacks, java_hooks, event_tx) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("[js] failed to create runtime: {err}");
+                return;
+            }
+        };
 
     while let Ok(job) = rx.recv() {
         match job {
@@ -188,9 +205,17 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
             Job::Rpc { name, args, reply } => {
                 let _ = reply.send(runtime.run_rpc(&name, &args));
             }
+            Job::JavaImpl { id, reply } => {
+                let _ = reply.send(runtime.run_java_impl(id));
+            }
             Job::Shutdown => break,
         }
     }
+    // QuickJS can assert in JS_FreeRuntime when the host closes the control
+    // channel while any JS closure is still reachable.  Hooks are detached
+    // first, then the runtime is intentionally leaked with the process.
+    runtime.shutdown();
+    std::mem::forget(runtime);
 }
 
 /// Trampoline for `Interceptor.attach` onEnter.
@@ -277,6 +302,21 @@ pub(crate) extern "C" fn callback_dispatch(id: usize, args: *const u64) -> u64 {
         })
         .is_err()
     {
+        return 0;
+    }
+    response.recv_timeout(Duration::from_secs(5)).unwrap_or(0)
+}
+
+/// Dispatcher embedded in every Java method trampoline.
+pub(crate) extern "C" fn java_dispatch(id: usize) -> u64 {
+    if is_js_thread() {
+        return 0;
+    }
+    let Some(tx) = JS_TX.get() else {
+        return 0;
+    };
+    let (reply, response) = mpsc::channel();
+    if tx.send(Job::JavaImpl { id, reply }).is_err() {
         return 0;
     }
     response.recv_timeout(Duration::from_secs(5)).unwrap_or(0)

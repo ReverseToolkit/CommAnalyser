@@ -70,6 +70,15 @@ pub enum MethodId {
     Static(JStaticMethodID),
 }
 
+impl MethodId {
+    pub fn raw(self) -> usize {
+        match self {
+            Self::Instance(id) => id.into_raw() as usize,
+            Self::Static(id) => id.into_raw() as usize,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MethodInfo {
     pub name: String,
@@ -488,4 +497,72 @@ fn convert<'a>(
             ))
         }
     })
+}
+
+/// Test helper used by the agent to invoke `StringBuilder.length()` from a
+/// non-JS thread while a JS `implementation` hook is installed.
+pub fn call_length() -> Result<i64> {
+    let class = JavaClass::find("java.lang.StringBuilder")?;
+    let object = class.new_object(&[])?;
+    let method = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "length" && method.params.is_empty())
+        .ok_or_else(|| Error::NotFound("StringBuilder.length".into()))?;
+    match object.call(method, &[])? {
+        JavaValue::Int(value) => Ok(i64::from(value)),
+        _ => Err(Error::Parse("StringBuilder.length returned non-int".into())),
+    }
+}
+
+/// Diagnostic: current quick entrypoint of `StringBuilder.length`.
+pub fn length_entrypoint() -> Result<usize> {
+    let class = JavaClass::find("java.lang.StringBuilder")?;
+    let method = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "length" && method.params.is_empty())
+        .ok_or_else(|| Error::NotFound("StringBuilder.length".into()))?;
+    let address = method.id.raw() + 24;
+    // SAFETY: ArtMethod layout on Android 15 has the entrypoint at offset 24.
+    Ok(unsafe { ptr::read_unaligned(address as *const usize) })
+}
+
+extern "C" fn test_dispatcher(_id: usize) -> u64 {
+    77
+}
+
+/// Isolated test: install a Rust-only hook, call through JNI, then restore.
+pub fn hook_install_test() -> Result<String> {
+    let class = JavaClass::find("java.lang.StringBuilder")?;
+    let method = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "length" && method.params.is_empty())
+        .ok_or_else(|| Error::NotFound("StringBuilder.length".into()))?;
+    let entry = method.id.raw() + 24;
+    // SAFETY: Android 15 ArtMethod entrypoint offset.
+    let original = unsafe { ptr::read_unaligned(entry as *const usize) };
+    let mut hook = crate::hook::install(method.id, test_dispatcher as *const () as usize, 0)?;
+    // SAFETY: same layout assumption.
+    let patched = unsafe { ptr::read_unaligned(entry as *const usize) };
+    let object = class.new_object(&[])?;
+    let value = match object.call(method, &[])? {
+        JavaValue::Int(value) => value,
+        _ => -1,
+    };
+    hook.detach()?;
+    // SAFETY: same layout assumption.
+    let restored = unsafe { ptr::read_unaligned(entry as *const usize) };
+    Ok(serde_json::json!({
+        "ok": true,
+        "original": format!("{original:#x}"),
+        "patched": format!("{patched:#x}"),
+        "restored": format!("{restored:#x}"),
+        "value": value,
+    })
+    .to_string())
 }

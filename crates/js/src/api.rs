@@ -21,7 +21,7 @@ use runtime::module;
 
 use crate::worker::{
     callback_dispatch, hook_enter, hook_leave, make_bridge, CallbackEntry, CallbackTable,
-    HookGroup, HookTable, Job, Listener,
+    HookGroup, HookTable, JavaHookTable, Job, Listener,
 };
 
 /// JavaScript `NativePointer`.
@@ -191,6 +191,7 @@ pub(crate) fn install_with_hooks<'js>(
     tx: Sender<Job>,
     hooks: Rc<RefCell<HookTable>>,
     callbacks: Rc<RefCell<CallbackTable>>,
+    java_hooks: Rc<RefCell<JavaHookTable>>,
     event_tx: Sender<String>,
 ) -> JsResult<()> {
     install(ctx)?;
@@ -311,7 +312,7 @@ pub(crate) fn install_with_hooks<'js>(
         };
         "#,
     )?;
-    crate::java::install(ctx)?;
+    crate::java::install(ctx, java_hooks)?;
     Ok(())
 }
 

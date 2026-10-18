@@ -66,6 +66,9 @@ cargo build --target aarch64-linux-android -p agent -p daemon -p cli
 - **M3b (partial)**: `Java.perform`, `Java.use` with JNI reflection,
   constructors, static/instance calls, string/int/long/boolean marshalling.
   Details: [`docs/10-m3b.md`](docs/10-m3b.md).
+- **M3c (partial)**: Java `implementation` via ArtMethod entrypoint hooks and
+  the QuickJS worker; validated by replacing `StringBuilder.length()`.
+  Details: [`docs/11-m3c.md`](docs/11-m3c.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 

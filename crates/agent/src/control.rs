@@ -133,6 +133,19 @@ fn run(name: &str) -> std::io::Result<()> {
                     None => json!({"ok": false, "error": "QuickJS unavailable"}),
                 }
             }
+            "java_hook_install_test" => match art::java::hook_install_test() {
+                Ok(text) => serde_json::from_str::<Value>(&text)
+                    .unwrap_or_else(|_| json!({"ok": true, "raw": text})),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_entrypoint" => match art::java::length_entrypoint() {
+                Ok(value) => json!({"ok": true, "value": format!("{value:#x}")}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_length" => match art::java::call_length() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
             "java_stub_info" => match art::stub_info() {
                 Ok(text) => serde_json::from_str::<Value>(&text)
                     .unwrap_or_else(|_| json!({"ok": true, "raw": text})),

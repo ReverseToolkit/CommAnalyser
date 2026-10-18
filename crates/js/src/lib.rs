@@ -13,12 +13,12 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use gum::SavedRegs;
-use rquickjs::{CatchResultExt, Context, Function, Runtime};
+use rquickjs::{CatchResultExt, Context, Function, Runtime, Value};
 use runtime::{Error, Result};
 
 pub use worker::JsWorker;
 
-use worker::{CallbackTable, HookTable, Job};
+use worker::{CallbackTable, HookTable, JavaHookTable, Job};
 
 pub struct ScriptRuntime {
     // Drop order matters: JS values in the tables and the context must be
@@ -26,6 +26,7 @@ pub struct ScriptRuntime {
     ctx: Context,
     hooks: Rc<RefCell<HookTable>>,
     callbacks: Rc<RefCell<CallbackTable>>,
+    java_hooks: Rc<RefCell<JavaHookTable>>,
     rt: Runtime,
 }
 
@@ -35,6 +36,7 @@ impl ScriptRuntime {
             None,
             Rc::new(RefCell::new(HookTable::default())),
             Rc::new(RefCell::new(CallbackTable::default())),
+            Rc::new(RefCell::new(JavaHookTable::default())),
             None,
         )
     }
@@ -43,15 +45,17 @@ impl ScriptRuntime {
         tx: Sender<Job>,
         hooks: Rc<RefCell<HookTable>>,
         callbacks: Rc<RefCell<CallbackTable>>,
+        java_hooks: Rc<RefCell<JavaHookTable>>,
         event_tx: Sender<String>,
     ) -> Result<Self> {
-        Self::new_inner(Some(tx), hooks, callbacks, Some(event_tx))
+        Self::new_inner(Some(tx), hooks, callbacks, java_hooks, Some(event_tx))
     }
 
     fn new_inner(
         tx: Option<Sender<Job>>,
         hooks: Rc<RefCell<HookTable>>,
         callbacks: Rc<RefCell<CallbackTable>>,
+        java_hooks: Rc<RefCell<JavaHookTable>>,
         event_tx: Option<Sender<String>>,
     ) -> Result<Self> {
         let rt = Runtime::new().map_err(js_error)?;
@@ -76,9 +80,14 @@ impl ScriptRuntime {
             )
             .map_err(js_error)?;
             match (tx, event_tx) {
-                (Some(tx), Some(event_tx)) => {
-                    api::install_with_hooks(&ctx, tx, hooks.clone(), callbacks.clone(), event_tx)
-                }
+                (Some(tx), Some(event_tx)) => api::install_with_hooks(
+                    &ctx,
+                    tx,
+                    hooks.clone(),
+                    callbacks.clone(),
+                    java_hooks.clone(),
+                    event_tx,
+                ),
                 _ => api::install(&ctx),
             }
             .map_err(js_error)?;
@@ -89,6 +98,7 @@ impl ScriptRuntime {
             ctx,
             hooks,
             callbacks,
+            java_hooks,
             rt,
         })
     }
@@ -185,6 +195,31 @@ impl ScriptRuntime {
         })
     }
 
+    pub(crate) fn run_java_impl(&self, id: usize) -> u64 {
+        let function = self
+            .java_hooks
+            .borrow()
+            .entries
+            .get(id)
+            .map(|entry| entry.function.clone());
+        let Some(function) = function else {
+            return 0;
+        };
+        self.ctx.with(|ctx| {
+            let Ok(function) = function.restore(&ctx) else {
+                return 0;
+            };
+            let Ok(value) = function.call::<_, Value>(()) else {
+                return 0;
+            };
+            value
+                .get::<i64>()
+                .map(|value| value as u64)
+                .or_else(|_| value.get::<bool>().map(u64::from))
+                .unwrap_or(0)
+        })
+    }
+
     pub(crate) fn run_rpc(&self, name: &str, args: &str) -> Result<String> {
         self.ctx
             .with(|ctx| api::invoke_rpc(&ctx, name, args))
@@ -200,12 +235,22 @@ fn js_caught_error(error: rquickjs::CaughtError<'_>) -> Error {
     Error::Parse(format!("quickjs: {error}"))
 }
 
+impl ScriptRuntime {
+    /// Drop every persistent JS value and restore native hooks without
+    /// destroying the QuickJS runtime.
+    pub(crate) fn shutdown(&self) {
+        self.hooks.borrow_mut().groups.clear();
+        self.callbacks.borrow_mut().entries.clear();
+        self.java_hooks.borrow_mut().entries.clear();
+    }
+}
+
 impl Drop for ScriptRuntime {
     fn drop(&mut self) {
         // Break persistent-function references before JS_FreeRuntime checks
         // that the GC object list is empty.
-        self.hooks.borrow_mut().groups.clear();
-        self.callbacks.borrow_mut().entries.clear();
+        self.shutdown();
+        self.rt.run_gc();
     }
 }
 
