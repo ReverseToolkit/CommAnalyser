@@ -138,6 +138,10 @@ impl JavaObject {
     pub fn clone_global_handle(&self) -> Result<usize> {
         clone_global_handle(self.object.as_raw() as usize)
     }
+
+    pub fn recast(&self, info: Rc<ClassInfo>) -> Result<JavaObject> {
+        cast_global_handle(info, self.object.as_raw() as usize)
+    }
 }
 
 pub fn new_string_global(value: &str) -> Result<usize> {
@@ -1245,4 +1249,31 @@ pub fn call_double_to_bits() -> Result<i64> {
         JavaValue::Long(value) => Ok(value),
         _ => Err(Error::Parse("doubleToRawLongBits returned non-long".into())),
     }
+}
+
+/// Create a Java `int[]` and wrap it as a JavaObject.
+pub fn new_int_array(values: &[i32]) -> Result<JavaObject> {
+    let class = JavaClass::find("[I")?;
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        let array = env.new_int_array(values.len())?;
+        env.set_int_array_region(&array, 0, values)?;
+        let object: &JObject<'_> = array.as_ref();
+        let global = env.new_global_ref(object)?;
+        Ok(JavaObject::from_global(class.info.clone(), global))
+    })
+}
+
+/// Reinterpret an existing global reference as another declared class.
+pub fn cast_global_handle(info: Rc<ClassInfo>, handle: usize) -> Result<JavaObject> {
+    let cloned = clone_global_handle(handle)?;
+    if cloned == 0 {
+        return Err(Error::Parse("null Java global reference".into()));
+    }
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        // SAFETY: cloned is a fresh global reference owned by this object.
+        let global = unsafe { env.global_from_raw::<JObject>(cloned as jni::sys::jobject) };
+        Ok(JavaObject::from_global(info, global))
+    })
 }

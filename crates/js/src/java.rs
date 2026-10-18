@@ -185,6 +185,8 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
     java.set("available", true)?;
     java.set("perform", Func::from(perform))?;
     java.set("use", Func::from(use_class))?;
+    java.set("array", Func::from(make_array))?;
+    java.set("cast", Func::from(cast))?;
     ctx.globals().set("Java", java)?;
     Ok(())
 }
@@ -767,6 +769,30 @@ fn original_args(
             })
         })
         .collect()
+}
+
+fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsResult<Value<'js>> {
+    if type_name != "int" {
+        return Err(js_error("Java.array currently supports only 'int'"));
+    }
+    let mut ints = Vec::with_capacity(values.len());
+    for index in 0..values.len() {
+        let value: Value<'js> = values.get(index)?;
+        ints.push(value.get::<i32>()?);
+    }
+    let object = art::java::new_int_array(&ints).map_err(to_js_error)?;
+    let class = JavaClass::find("[I").map_err(to_js_error)?;
+    let id = register(object);
+    Ok(instance_object(ctx, class, id)?.into_value())
+}
+
+fn cast<'js>(ctx: Ctx<'js>, value: Value<'js>, class_name: String) -> JsResult<Value<'js>> {
+    let id = java_id(&value).ok_or_else(|| js_error("Java.cast expects a Java object"))?;
+    let object = get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
+    let class = JavaClass::find(&class_name).map_err(to_js_error)?;
+    let casted = object.recast(class.info.clone()).map_err(to_js_error)?;
+    let id = register(casted);
+    Ok(instance_object(ctx, class, id)?.into_value())
 }
 
 fn value_to_js<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, value: JavaValue) -> JsResult<Value<'js>> {
