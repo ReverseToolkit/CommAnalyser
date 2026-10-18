@@ -11,3 +11,6 @@ ca-core.workspace = true
 ca-gum.workspace = true
 rquickjs.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+rquickjs = { workspace = true, features = ["bindgen"] }

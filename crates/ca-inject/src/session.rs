@@ -339,6 +339,8 @@ fn read_dlerror(
     }
 }
 
+// Deliberately explicit: every parameter is a distinct remote-call register or
+// stack value; bundling them into a struct would make register mix-ups easier.
 #[allow(clippy::too_many_arguments)]
 fn finish_session(
     pid: u32,

@@ -1,12 +1,20 @@
-//! Minimal agent control channel over an abstract Unix socket.
+//! Resident agent control channel over an abstract Unix socket.
 //!
-//! Wire format is line-delimited JSON.  M1 only needs `hello`, `ping` and
-//! `bye`; script evaluation is added in M2.
+//! Wire format is line-delimited JSON.  Commands are intentionally small:
+//! `ping`, `hook_getpid`, and `eval` (QuickJS).
 
+use std::ffi::c_void;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use ca_gum::InlineHook;
+use ca_js::ScriptRuntime;
 
 fn connect_abstract(name: &str) -> std::io::Result<UnixStream> {
     if name.len() + 1 > 108 {
@@ -56,12 +64,21 @@ fn run(name: &str) -> std::io::Result<()> {
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
-    let hello = format!(
-        "{{\"op\":\"hello\",\"pid\":{},\"abi\":{}}}\n",
-        std::process::id(),
-        crate::ca_agent_abi_version()
-    );
-    writer.write_all(hello.as_bytes())?;
+    let runtime = match ScriptRuntime::new() {
+        Ok(runtime) => Some(runtime),
+        Err(err) => {
+            eprintln!("[ca-agent] QuickJS init failed: {err}");
+            None
+        }
+    };
+
+    let hello = json!({
+        "op": "hello",
+        "pid": std::process::id(),
+        "abi": crate::ca_agent_abi_version(),
+        "quickjs": runtime.is_some(),
+    });
+    writeln!(writer, "{hello}")?;
     writer.flush()?;
 
     let mut line = String::new();
@@ -70,16 +87,35 @@ fn run(name: &str) -> std::io::Result<()> {
         if reader.read_line(&mut line)? == 0 {
             break;
         }
-        let command = line.trim();
-        if command.contains("\"bye\"") || command.contains("\"exit\"") {
-            break;
-        }
-        let response = if command.contains("\"ping\"") {
-            "{\"ok\":true,\"pong\":true}\n"
-        } else {
-            "{\"ok\":false,\"error\":\"unsupported\"}\n"
+        let request: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(err) => {
+                let response = json!({"ok": false, "error": format!("bad json: {err}")});
+                writeln!(writer, "{response}")?;
+                writer.flush()?;
+                continue;
+            }
         };
-        writer.write_all(response.as_bytes())?;
+
+        let op = request.get("op").and_then(Value::as_str).unwrap_or("");
+        let response = match op {
+            "ping" => json!({"ok": true, "pong": true}),
+            "bye" | "exit" => break,
+            "hook_getpid" => hook_getpid(),
+            "eval" => {
+                let code = request.get("code").and_then(Value::as_str).unwrap_or("");
+                match runtime.as_ref() {
+                    Some(runtime) => match runtime.eval(code) {
+                        Ok(value) => json!({"ok": true, "value": value}),
+                        Err(err) => json!({"ok": false, "error": err.to_string()}),
+                    },
+                    None => json!({"ok": false, "error": "QuickJS unavailable"}),
+                }
+            }
+            other => json!({"ok": false, "error": format!("unknown command: {other}")}),
+        };
+
+        writeln!(writer, "{response}")?;
         writer.flush()?;
     }
     Ok(())
@@ -87,8 +123,6 @@ fn run(name: &str) -> std::io::Result<()> {
 
 pub fn spawn(name: String) {
     std::thread::spawn(move || {
-        // Retry briefly: the daemon must already be listening, but giving it
-        // a few milliseconds hides scheduler races during spawn.
         let mut last = None;
         for _ in 0..50 {
             match run(&name) {
@@ -103,4 +137,36 @@ pub fn spawn(name: String) {
             eprintln!("[ca-agent] control channel failed: {err}");
         }
     });
+}
+
+static HOOK_HITS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn on_getpid(_regs: *mut ca_gum::SavedRegs, _data: *mut c_void) {
+    HOOK_HITS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn hook_getpid() -> Value {
+    HOOK_HITS.store(0, Ordering::SeqCst);
+    // SAFETY: dlsym with a NUL-terminated symbol name.
+    let target = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getpid".as_ptr()) } as usize;
+    if target == 0 {
+        return json!({"ok": false, "error": "dlsym(getpid) failed"});
+    }
+
+    // SAFETY: user_data is null; the callback only touches an atomic.
+    let hook = unsafe { InlineHook::attach(target, on_getpid, ptr::null_mut()) };
+    let mut hook = match hook {
+        Ok(hook) => hook,
+        Err(err) => return json!({"ok": false, "error": format!("attach: {err}")}),
+    };
+
+    for _ in 0..5 {
+        // SAFETY: plain libc call.
+        unsafe {
+            libc::getpid();
+        }
+    }
+    let hits = HOOK_HITS.load(Ordering::SeqCst);
+    let detached = hook.detach().is_ok();
+    json!({"ok": hits >= 5 && detached, "hits": hits, "detach": detached})
 }

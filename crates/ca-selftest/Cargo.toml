@@ -1,0 +1,15 @@
+[package]
+name = "ca-selftest"
+description = "On-device smoke test for the AArch64 inline hook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ca-selftest"
+path = "src/main.rs"
+
+[dependencies]
+ca-gum.workspace = true
+libc.workspace = true

@@ -149,18 +149,38 @@ pub fn patch_code(addr: usize, data: &[u8]) -> Result<()> {
 }
 
 /// Flush the instruction cache for `[addr, addr + len)`.
+///
+/// bionic does not export `__clear_cache`, so emit the AArch64 cache
+/// maintenance operations directly.  The line size is conservatively 64 bytes.
 pub fn flush_icache(addr: usize, len: usize) {
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe extern "C" {
-            fn __clear_cache(start: *mut core::ffi::c_char, end: *mut core::ffi::c_char);
+        if len == 0 {
+            return;
         }
-        // SAFETY: bionic/libgcc provide __clear_cache for exactly this purpose.
+        let start = addr & !63;
+        let end = (addr + len + 63) & !63;
+        let mut line = start;
+        while line < end {
+            // SAFETY: DC CVAU / IC IVAU are EL0-accessible cache maintenance.
+            unsafe {
+                core::arch::asm!("dc cvau, {}", in(reg) line, options(nostack, preserves_flags));
+            }
+            line += 64;
+        }
+        // SAFETY: barriers are side-effect free.
         unsafe {
-            __clear_cache(
-                addr as *mut core::ffi::c_char,
-                (addr + len) as *mut core::ffi::c_char,
-            );
+            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        }
+        let mut line = start;
+        while line < end {
+            unsafe {
+                core::arch::asm!("ic ivau, {}", in(reg) line, options(nostack, preserves_flags));
+            }
+            line += 64;
+        }
+        unsafe {
+            core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
         }
     }
     #[cfg(not(target_arch = "aarch64"))]

@@ -115,6 +115,123 @@ impl CodeWriter {
         true
     }
 
+    /// `B.cond` with a PC-relative byte offset.
+    pub fn b_cond(&mut self, cond: u8, offset: i64) -> bool {
+        if offset & 3 != 0 || !(-(1 << 20)..(1 << 20)).contains(&offset) {
+            return false;
+        }
+        let imm19 = ((offset >> 2) as u32) & 0x7_FFFF;
+        self.put(0x5400_0000 | (imm19 << 5) | (cond as u32 & 0xF));
+        true
+    }
+
+    /// `CBZ` / `CBNZ`.
+    pub fn cbz(&mut self, sf: bool, nonzero: bool, rt: u8, offset: i64) -> bool {
+        if offset & 3 != 0 || !(-(1 << 20)..(1 << 20)).contains(&offset) {
+            return false;
+        }
+        let imm19 = ((offset >> 2) as u32) & 0x7_FFFF;
+        let op = if nonzero { 1u32 << 24 } else { 0 };
+        let sf = if sf { 1u32 << 31 } else { 0 };
+        self.put(0x3400_0000 | sf | op | (imm19 << 5) | (rt as u32));
+        true
+    }
+
+    /// `TBZ` / `TBNZ`.
+    pub fn tbz(&mut self, op: bool, rt: u8, bit: u8, offset: i64) -> bool {
+        if offset & 3 != 0 || !(-(1 << 15)..(1 << 15)).contains(&offset) {
+            return false;
+        }
+        let imm14 = ((offset >> 2) as u32) & 0x3FFF;
+        let op = if op { 1u32 << 24 } else { 0 };
+        let b5 = ((bit as u32) & 0x20) << 26;
+        let b40 = ((bit as u32) & 0x1F) << 19;
+        self.put(0x3600_0000 | b5 | op | b40 | (imm14 << 5) | (rt as u32));
+        true
+    }
+
+    /// 64-bit `MOVZ`.
+    pub fn movz(&mut self, rd: u8, imm16: u16, shift: u8) {
+        debug_assert!(shift % 16 == 0 && shift <= 48);
+        self.put(0xD280_0000 | (((shift / 16) as u32) << 21) | ((imm16 as u32) << 5) | (rd as u32));
+    }
+
+    /// 64-bit `MOVK`.
+    pub fn movk(&mut self, rd: u8, imm16: u16, shift: u8) {
+        debug_assert!(shift % 16 == 0 && shift <= 48);
+        self.put(0xF280_0000 | (((shift / 16) as u32) << 21) | ((imm16 as u32) << 5) | (rd as u32));
+    }
+
+    /// Materialise an arbitrary 64-bit value into `rd` (4 instructions).
+    pub fn abs_addr(&mut self, rd: u8, value: u64) {
+        self.movz(rd, value as u16, 0);
+        self.movk(rd, (value >> 16) as u16, 16);
+        self.movk(rd, (value >> 32) as u16, 32);
+        self.movk(rd, (value >> 48) as u16, 48);
+    }
+
+    /// 32-bit `LDR` (literal).
+    pub fn ldr_literal_w(&mut self, rt: u8, offset: i64) -> bool {
+        if offset & 3 != 0 || !(-(1 << 20)..(1 << 20)).contains(&offset) {
+            return false;
+        }
+        let imm19 = ((offset >> 2) as u32) & 0x7_FFFF;
+        self.put(0x1800_0000 | (imm19 << 5) | (rt as u32));
+        true
+    }
+
+    /// `LDRSW` (literal).
+    pub fn ldrsw_literal(&mut self, rt: u8, offset: i64) -> bool {
+        if offset & 3 != 0 || !(-(1 << 20)..(1 << 20)).contains(&offset) {
+            return false;
+        }
+        let imm19 = ((offset >> 2) as u32) & 0x7_FFFF;
+        self.put(0x9800_0000 | (imm19 << 5) | (rt as u32));
+        true
+    }
+
+    /// `STP Xt, Xt2, [Xn, #imm]` (signed offset form, imm multiple of 8).
+    pub fn stp(&mut self, rt: u8, rt2: u8, rn: u8, offset: i64) {
+        debug_assert!(offset % 8 == 0 && (-512..512).contains(&offset));
+        let imm7 = ((offset / 8) as u32) & 0x7F;
+        self.put(
+            0xA900_0000 | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt as u32,
+        );
+    }
+
+    /// `LDP Xt, Xt2, [Xn, #imm]`.
+    pub fn ldp(&mut self, rt: u8, rt2: u8, rn: u8, offset: i64) {
+        debug_assert!(offset % 8 == 0 && (-512..512).contains(&offset));
+        let imm7 = ((offset / 8) as u32) & 0x7F;
+        self.put(
+            0xA940_0000 | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt as u32,
+        );
+    }
+
+    /// `STR Xt, [Xn, #imm]` (unsigned offset, imm multiple of 8).
+    pub fn str_imm(&mut self, rt: u8, rn: u8, offset: u32) {
+        debug_assert!(offset % 8 == 0 && offset < 32768);
+        self.put(0xF900_0000 | ((offset / 8) << 10) | ((rn as u32) << 5) | rt as u32);
+    }
+
+    /// `LDR Xt, [Xn, #imm]` (unsigned offset, imm multiple of 8).
+    pub fn ldr_imm(&mut self, rt: u8, rn: u8, offset: u32) {
+        debug_assert!(offset % 8 == 0 && offset < 32768);
+        self.put(0xF940_0000 | ((offset / 8) << 10) | ((rn as u32) << 5) | rt as u32);
+    }
+
+    /// `SUB SP, SP, #imm` (imm multiple of 16, <= 4095).
+    pub fn sub_sp(&mut self, imm: u32) {
+        debug_assert!(imm % 16 == 0 && imm <= 4095);
+        self.put(0xD100_0000 | (imm << 10) | (31 << 5) | 31);
+    }
+
+    /// `ADD SP, SP, #imm`.
+    pub fn add_sp(&mut self, imm: u32) {
+        debug_assert!(imm % 16 == 0 && imm <= 4095);
+        self.put(0x9100_0000 | (imm << 10) | (31 << 5) | 31);
+    }
+
     /// Absolute unconditional branch: `ldr x16, #8; br x16; .quad target`.
     pub fn abs_b(&mut self, target: usize) {
         self.ldr_literal_x(16, 8);

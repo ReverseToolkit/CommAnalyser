@@ -5,13 +5,26 @@
 
 mod control_server;
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
 use ca_inject::AttachOptions;
+
+struct AgentChannel {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+fn agents() -> &'static Mutex<HashMap<u32, AgentChannel>> {
+    static AGENTS: OnceLock<Mutex<HashMap<u32, AgentChannel>>> = OnceLock::new();
+    AGENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -125,6 +138,22 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
                 Err(err) => error_response(format!("inject: {err}")),
             }
         }
+        "agent" => {
+            let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let command = request.get("command").and_then(Value::as_str).unwrap_or("");
+            match agent_command(pid, command) {
+                Ok(response) => json!({"ok": true, "pid": pid, "response": response}).to_string(),
+                Err(err) => error_response(format!("agent: {err}")),
+            }
+        }
+        "eval" => {
+            let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let code = request.get("code").and_then(Value::as_str).unwrap_or("");
+            match agent_request(pid, &json!({"op": "eval", "code": code})) {
+                Ok(response) => json!({"ok": true, "pid": pid, "response": response}).to_string(),
+                Err(err) => error_response(format!("eval: {err}")),
+            }
+        }
         "" => error_response("missing op".to_owned()),
         other => error_response(format!("unknown op: {other}")),
     }
@@ -159,11 +188,68 @@ fn inject(pid: u32, agent: &str) -> Result<String, String> {
 
     let hello = control_server::Listener::read_hello(&stream, std::time::Duration::from_secs(2))
         .map_err(|err| format!("hello: {err}"))?;
-    let mut stream = stream;
-    control_server::Listener::send_bye(&mut stream);
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|err| format!("set timeout: {err}"))?;
+    let reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|err| format!("clone agent stream: {err}"))?,
+    );
+    agents()
+        .lock()
+        .map_err(|_| "agent registry poisoned".to_owned())?
+        .insert(
+            pid,
+            AgentChannel {
+                writer: stream,
+                reader,
+            },
+        );
 
     session.resume();
     Ok(hello)
+}
+
+fn agent_command(pid: u32, command: &str) -> Result<Value, String> {
+    if command.is_empty()
+        || command.len() > 64
+        || !command
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err("invalid command".to_owned());
+    }
+    agent_request(pid, &json!({"op": command}))
+}
+
+fn agent_request(pid: u32, request: &Value) -> Result<Value, String> {
+    let mut registry = agents()
+        .lock()
+        .map_err(|_| "agent registry poisoned".to_owned())?;
+    let channel = registry
+        .get_mut(&pid)
+        .ok_or_else(|| format!("no agent for pid {pid}"))?;
+
+    let line = serde_json::to_string(request).map_err(|err| format!("encode: {err}"))?;
+    channel
+        .writer
+        .write_all(line.as_bytes())
+        .and_then(|_| channel.writer.write_all(b"\n"))
+        .and_then(|_| channel.writer.flush())
+        .map_err(|err| format!("send: {err}"))?;
+
+    let mut response = String::new();
+    let n = channel
+        .reader
+        .read_line(&mut response)
+        .map_err(|err| format!("recv: {err}"))?;
+    if n == 0 {
+        registry.remove(&pid);
+        return Err("agent closed the channel".to_owned());
+    }
+    Ok(serde_json::from_str(response.trim()).unwrap_or_else(|_| json!({"raw": response.trim()})))
 }
 
 fn error_response(message: String) -> String {

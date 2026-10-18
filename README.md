@@ -41,8 +41,10 @@ cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
   `android_dlopen_ext`, abstract-socket agent hello.  Validated on
   `282eb4e4` against `sleep` (shell domain) and `com.android.settings`
   (app domain), with the target alive and `TracerPid=0`.
-- **M2 (next)**: resident agent control channel, pure-Rust ARM64 inline hook,
-  NativeFunction/NativeCallback stubs.
+- **M2 (in progress)**: pure-Rust AArch64 inline hook + resident agent +
+  QuickJS eval.  Validated `hook_getpid` (5 hits, clean detach) and
+  `eval 1+2` inside both `sleep` and `com.android.settings`.
+  Details: [`docs/03-m2.md`](docs/03-m2.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 
@@ -59,6 +61,15 @@ adb shell 'chmod 755 /data/local/tmp/ca-daemon; /data/local/tmp/ca-daemon --addr
 adb forward tcp:17321 tcp:17321
 ./target/debug/ca --addr 127.0.0.1:17321 ps
 ./target/debug/ca --addr 127.0.0.1:17321 inject <pid> --agent /data/local/tmp/libca_agent.so
+./target/debug/ca --addr 127.0.0.1:17321 eval <pid> '1+2'
+./target/debug/ca --addr 127.0.0.1:17321 agent <pid> hook_getpid
+```
+
+QuickJS cross-compile needs libclang + the Android sysroot:
+
+```bash
+export LIBCLANG_PATH=$NDK/toolchains/llvm/prebuilt/linux-x86_64/lib
+export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot -target aarch64-linux-android24"
 ```
 
 ## Protocol (M0)

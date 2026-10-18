@@ -1,6 +1,6 @@
 //! Abstract-Unix-socket listener used to receive the agent hello.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -88,11 +88,6 @@ impl Listener {
         let mut line = String::new();
         reader.read_line(&mut line)?;
         Ok(line.trim().to_owned())
-    }
-
-    pub fn send_bye(stream: &mut UnixStream) {
-        let _ = stream.write_all(b"{\"op\":\"bye\"}\n");
-        let _ = stream.flush();
     }
 }
 

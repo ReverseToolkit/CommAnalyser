@@ -38,13 +38,80 @@ pub fn relocate_one(word: u32, pc: usize) -> Result<Relocated, RelocError> {
             let target = pc.wrapping_add(offset as usize);
             w.abs_bl(target);
         }
-        Insn::BCond { .. }
-        | Insn::Cbz { .. }
-        | Insn::Tbz { .. }
-        | Insn::Adr { .. }
-        | Insn::Adrp { .. }
-        | Insn::LdrLiteral { .. }
-        | Insn::Other(_) => return Err(RelocError::Unsupported(word)),
+        Insn::BCond { cond, offset } => {
+            if cond >= 0xE {
+                return Err(RelocError::Unsupported(word));
+            }
+            let target = pc.wrapping_add(offset as usize);
+            // Invert the condition to skip the absolute branch, then jump.
+            if !w.b_cond(cond ^ 1, 20) {
+                return Err(RelocError::OutOfRange);
+            }
+            w.abs_b(target);
+        }
+        Insn::Cbz {
+            sf,
+            nonzero,
+            rt,
+            offset,
+        } => {
+            let target = pc.wrapping_add(offset as usize);
+            if !w.cbz(sf, !nonzero, rt, 20) {
+                return Err(RelocError::OutOfRange);
+            }
+            w.abs_b(target);
+        }
+        Insn::Tbz {
+            op,
+            rt,
+            bit,
+            offset,
+        } => {
+            let target = pc.wrapping_add(offset as usize);
+            if !w.tbz(!op, rt, bit, 20) {
+                return Err(RelocError::OutOfRange);
+            }
+            w.abs_b(target);
+        }
+        Insn::Adr { rd, offset } => {
+            let target = pc.wrapping_add(offset as usize);
+            w.abs_addr(rd, target as u64);
+        }
+        Insn::Adrp { rd, offset } => {
+            let base = (pc & !0xFFF) as i64;
+            let target = base.wrapping_add(offset);
+            w.abs_addr(rd, target as u64);
+        }
+        Insn::LdrLiteral {
+            rt,
+            offset,
+            is_64,
+            is_signed,
+            is_prfm,
+        } => {
+            if is_prfm {
+                return Err(RelocError::Unsupported(word));
+            }
+            let target = pc.wrapping_add(offset as usize) as u64;
+            // Preserve a scratch register while materialising the literal
+            // address, then load from it.  This avoids copying target bytes
+            // into the trampoline and works for any target address.
+            let scratch = if rt == 16 { 17 } else { 16 };
+            w.put(0xF81F_0FE0 | scratch as u32); // str x<scratch>, [sp, #-16]!
+            w.abs_addr(scratch, target);
+            if is_signed {
+                w.put(0xB980_0000 | ((scratch as u32) << 5) | rt as u32); // ldrsw x<rt>, [x<scratch>]
+            } else if is_64 {
+                w.put(0xF940_0000 | ((scratch as u32) << 5) | rt as u32); // ldr x<rt>, [x<scratch>]
+            } else {
+                w.put(0xB940_0000 | ((scratch as u32) << 5) | rt as u32); // ldr w<rt>, [x<scratch>]
+            }
+            w.put(0xF841_07E0 | scratch as u32); // ldr x<scratch>, [sp], #16
+        }
+        // Anything we did not classify is treated as position-independent and
+        // copied verbatim.  All known PC-relative forms are classified above;
+        // PRFM-literal is rejected explicitly.
+        Insn::Other(_) => w.put(word),
     }
 
     Ok(Relocated {
@@ -83,13 +150,35 @@ mod tests {
     }
 
     #[test]
+    fn relocates_conditional_branch() {
+        // b.eq #0x1000 from pc 0x2000 -> target 0x3000.
+        let r = relocate_one(0x5400_8000, 0x2000).unwrap();
+        assert_eq!(r.consumed, 4);
+        assert_eq!(r.bytes.len(), 20);
+        let target = u64::from_le_bytes(r.bytes[12..20].try_into().unwrap());
+        assert_eq!(target, 0x3000);
+    }
+
+    #[test]
+    fn relocates_adr_and_adrp() {
+        let r = relocate_one(0x1000_0000, 0x1000).unwrap();
+        assert_eq!(r.bytes.len(), 16);
+        let r = relocate_one(0x9000_0000, 0x1000).unwrap();
+        assert_eq!(r.bytes.len(), 16);
+    }
+
+    #[test]
+    fn relocates_ldr_literal() {
+        // ldr x0, #8 from pc 0x1000.
+        let r = relocate_one(0x5800_0040, 0x1000).unwrap();
+        assert_eq!(r.bytes.len(), 28);
+    }
+
+    #[test]
     fn rejects_unsupported() {
+        assert!(relocate_one(0xD503_201F, 0x1000).is_ok());
         assert!(matches!(
-            relocate_one(0x5400_0000, 0x1000),
-            Err(RelocError::Unsupported(_))
-        ));
-        assert!(matches!(
-            relocate_one(0x1000_0000, 0x1000),
+            relocate_one(0xD800_0000, 0x1000),
             Err(RelocError::Unsupported(_))
         ));
     }

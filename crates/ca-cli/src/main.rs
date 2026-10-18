@@ -39,7 +39,8 @@ fn run() -> Result<(), String> {
     }
 
     let command = command.ok_or_else(|| {
-        "usage: ca [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject>".to_owned()
+        "usage: ca [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|agent|eval>"
+            .to_owned()
     })?;
 
     let request = match command.as_str() {
@@ -67,6 +68,27 @@ fn run() -> Result<(), String> {
                 .map(String::as_str)
                 .unwrap_or("/data/local/tmp/libca_agent.so");
             json!({"op": "inject", "pid": pid, "agent": agent})
+        }
+        "agent" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: ca agent <pid> <command>")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let command = rest.get(1).ok_or("usage: ca agent <pid> <command>")?;
+            json!({"op": "agent", "pid": pid, "command": command})
+        }
+        "eval" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: ca eval <pid> <expression>")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let code = rest[1..].join(" ");
+            if code.is_empty() {
+                return Err("usage: ca eval <pid> <expression>".to_owned());
+            }
+            json!({"op": "eval", "pid": pid, "code": code})
         }
         other => return Err(format!("unknown command: {other}")),
     };
