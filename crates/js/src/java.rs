@@ -24,19 +24,32 @@ thread_local! {
 
 const HANDLE: &str = "__analyserJavaId";
 
-static HOOK_META: OnceLock<Mutex<HashMap<usize, bool>>> = OnceLock::new();
+struct HookMeta {
+    is_static: bool,
+    params: Vec<Kind>,
+}
 
-fn hook_meta() -> &'static Mutex<HashMap<usize, bool>> {
+static HOOK_META: OnceLock<Mutex<HashMap<usize, HookMeta>>> = OnceLock::new();
+
+fn hook_meta() -> &'static Mutex<HashMap<usize, HookMeta>> {
     HOOK_META.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn hook_is_static(id: usize) -> Option<bool> {
-    hook_meta().lock().ok()?.get(&id).copied()
+pub(crate) fn hook_meta_for(id: usize) -> Option<(bool, Vec<Kind>)> {
+    let meta = hook_meta().lock().ok()?;
+    let entry = meta.get(&id)?;
+    Some((entry.is_static, entry.params.clone()))
 }
 
-fn register_hook(id: usize, is_static: bool) {
+fn register_hook(id: usize, method: &MethodInfo) {
     if let Ok(mut meta) = hook_meta().lock() {
-        meta.insert(id, is_static);
+        meta.insert(
+            id,
+            HookMeta {
+                is_static: method.is_static,
+                params: method.params.clone(),
+            },
+        );
     }
 }
 
@@ -74,7 +87,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                 let id = table.entries.len();
                 let hook = art::hook::install(method.id, java_dispatch as *const () as usize, id)
                     .map_err(to_js_error)?;
-                register_hook(id, is_static);
+                register_hook(id, &method);
                 table.entries.push(Some(JavaHookEntry {
                     function: Persistent::save(&ctx, callback),
                     class,
@@ -481,14 +494,14 @@ pub(crate) fn invoke_impl<'js>(
     class: Rc<JavaClass>,
     method: &MethodInfo,
     args: [u64; 8],
-    this_global: bool,
+    globals: u8,
     hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
 ) -> JsResult<u64> {
     let start = if method.is_static { 1 } else { 2 };
     let this_value: Value<'js> = if method.is_static {
         Value::new_undefined(ctx.clone())
     } else {
-        let object = if this_global {
+        let object = if globals & (1 << 1) != 0 {
             art::java::object_from_global_handle(class.info.clone(), args[1] as usize)
         } else {
             art::java::object_from_raw(class.info.clone(), args[1] as usize)
@@ -500,7 +513,15 @@ pub(crate) fn invoke_impl<'js>(
             let method_function: Function<'js> = this.get(method.name.clone())?;
             method_function.set(
                 "original",
-                original_function(ctx.clone(), class.clone(), method.clone(), hook, args)?,
+                original_function(
+                    ctx.clone(),
+                    class.clone(),
+                    method.clone(),
+                    hook,
+                    id,
+                    args,
+                    globals,
+                )?,
             )?;
         }
         this.into_value()
@@ -514,14 +535,30 @@ pub(crate) fn invoke_impl<'js>(
             Kind::Byte | Kind::Char | Kind::Short | Kind::Int => (raw as i32).into_js(ctx)?,
             Kind::Long => (raw as i64).into_js(ctx)?,
             Kind::Object(name) if name == "java.lang.String" => {
-                match art::java::string_from_raw(raw as usize).map_err(to_js_error)? {
+                let value = if globals & (1 << (start + slot)) != 0 {
+                    art::java::string_from_global_handle(raw as usize)
+                } else {
+                    art::java::string_from_raw(raw as usize)
+                }
+                .map_err(to_js_error)?;
+                match value {
                     Some(value) => value.into_js(ctx)?,
                     None => Value::new_null(ctx.clone()),
                 }
             }
-            Kind::Object(_) => {
-                let object = art::java::object_from_raw(class.info.clone(), raw as usize)
-                    .map_err(to_js_error)?;
+            Kind::Object(name) => {
+                let (info, global) = if globals & (1 << (start + slot)) != 0 {
+                    let param_class = JavaClass::find(name).map_err(to_js_error)?;
+                    (param_class.info.clone(), true)
+                } else {
+                    (class.info.clone(), false)
+                };
+                let object = if global {
+                    art::java::object_from_global_handle(info, raw as usize)
+                } else {
+                    art::java::object_from_raw(info, raw as usize)
+                }
+                .map_err(to_js_error)?;
                 let id = register(object);
                 instance_object(ctx.clone(), class.clone(), id)?.into_value()
             }
@@ -550,13 +587,14 @@ fn original_function<'js>(
     class: Rc<JavaClass>,
     method: MethodInfo,
     hook: Rc<RefCell<art::hook::JavaHook>>,
+    this_id: u32,
     raw: [u64; 8],
+    globals: u8,
 ) -> JsResult<Function<'js>> {
     let call_ctx = ctx.clone();
     Function::new(ctx, move || -> JsResult<Value<'js>> {
-        let object = art::java::object_from_global_handle(class.info.clone(), raw[1] as usize)
-            .map_err(to_js_error)?;
-        let args = original_args(&method, &raw);
+        let object = get_object(this_id).ok_or_else(|| js_error("invalid Java object handle"))?;
+        let args = original_args(&method, &raw, globals)?;
         hook.borrow().suspend();
         let result = object.call(&method, &args);
         hook.borrow().resume();
@@ -568,21 +606,42 @@ fn original_function<'js>(
     })
 }
 
-fn original_args(method: &MethodInfo, raw: &[u64; 8]) -> Vec<JavaArg> {
+fn original_args(method: &MethodInfo, raw: &[u64; 8], globals: u8) -> JsResult<Vec<JavaArg>> {
     let start = if method.is_static { 1 } else { 2 };
     method
         .params
         .iter()
         .enumerate()
-        .map(|(slot, kind)| match kind {
-            Kind::Boolean => JavaArg::Boolean(raw[start + slot] != 0),
-            Kind::Byte | Kind::Char | Kind::Short | Kind::Int => {
-                JavaArg::Int(raw[start + slot] as i32)
-            }
-            Kind::Long => JavaArg::Long(raw[start + slot] as i64),
-            Kind::Object(_) | Kind::Array(_) | Kind::Float | Kind::Double | Kind::Void => {
-                JavaArg::Null
-            }
+        .map(|(slot, kind)| {
+            let register = start + slot;
+            let is_global = globals & (1 << register) != 0;
+            Ok(match kind {
+                Kind::Boolean => JavaArg::Boolean(raw[register] != 0),
+                Kind::Byte | Kind::Char | Kind::Short | Kind::Int => {
+                    JavaArg::Int(raw[register] as i32)
+                }
+                Kind::Long => JavaArg::Long(raw[register] as i64),
+                Kind::Object(name) if name == "java.lang.String" && is_global => {
+                    match art::java::string_from_global_handle(raw[register] as usize)
+                        .map_err(to_js_error)?
+                    {
+                        Some(value) => JavaArg::String(value),
+                        None => JavaArg::Null,
+                    }
+                }
+                Kind::Object(name) if is_global => {
+                    let param_class = JavaClass::find(name).map_err(to_js_error)?;
+                    let object = art::java::object_from_global_handle(
+                        param_class.info.clone(),
+                        raw[register] as usize,
+                    )
+                    .map_err(to_js_error)?;
+                    JavaArg::Object(Rc::new(object))
+                }
+                Kind::Object(_) | Kind::Array(_) | Kind::Float | Kind::Double | Kind::Void => {
+                    JavaArg::Null
+                }
+            })
         })
         .collect()
 }

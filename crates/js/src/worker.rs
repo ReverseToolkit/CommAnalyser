@@ -114,7 +114,7 @@ pub(crate) enum Job {
     JavaImpl {
         id: usize,
         args: [u64; 8],
-        this_global: bool,
+        globals: u8,
         reply: Sender<u64>,
     },
     Shutdown,
@@ -221,7 +221,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
             Job::JavaImpl {
                 id,
                 args,
-                this_global,
+                globals,
                 reply,
             } => {
                 let hook = java_hooks
@@ -229,7 +229,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
                     .entries
                     .get(id)
                     .and_then(|entry| entry.as_ref().map(|entry| entry.hook.clone()));
-                let _ = reply.send(runtime.run_java_impl(id, args, this_global, hook));
+                let _ = reply.send(runtime.run_java_impl(id, args, globals, hook));
             }
             Job::Shutdown => break,
         }
@@ -343,11 +343,27 @@ pub(crate) extern "C" fn java_dispatch(id: usize, args: *const u64) -> u64 {
         // SAFETY: the hook stub passes a pointer to its saved x0-x7.
         unsafe { std::ptr::copy_nonoverlapping(args, saved.as_mut_ptr(), 8) };
     }
-    let mut this_global = false;
-    if crate::java::hook_is_static(id) == Some(false) && saved[1] != 0 {
-        if let Ok(handle) = art::soa::convert(saved[1] as usize) {
-            saved[1] = handle as u64;
-            this_global = true;
+    let mut globals = 0u8;
+    if let Some((is_static, params)) = crate::java::hook_meta_for(id) {
+        let start = if is_static { 1 } else { 2 };
+        if !is_static && saved[1] != 0 {
+            if let Ok(handle) = art::soa::convert(saved[1] as usize) {
+                saved[1] = handle as u64;
+                globals |= 1 << 1;
+            }
+        }
+        for (slot, kind) in params.iter().enumerate() {
+            if !matches!(kind, art::java::Kind::Object(_) | art::java::Kind::Array(_)) {
+                continue;
+            }
+            let register = start + slot;
+            if register >= 8 || saved[register] == 0 {
+                continue;
+            }
+            if let Ok(handle) = art::soa::convert(saved[register] as usize) {
+                saved[register] = handle as u64;
+                globals |= 1 << register;
+            }
         }
     }
     let (reply, response) = mpsc::channel();
@@ -355,7 +371,7 @@ pub(crate) extern "C" fn java_dispatch(id: usize, args: *const u64) -> u64 {
         .send(Job::JavaImpl {
             id,
             args: saved,
-            this_global,
+            globals,
             reply,
         })
         .is_err()

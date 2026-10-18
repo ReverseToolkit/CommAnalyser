@@ -171,6 +171,10 @@ fn run(name: &str) -> std::io::Result<()> {
                     "converted": format!("{converted:#x}"),
                 })
             }
+            "java_index_of" => match art::java::call_index_of() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
             "java_char_at" => match art::java::call_char_at() {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),

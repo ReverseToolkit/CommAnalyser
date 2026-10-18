@@ -932,6 +932,22 @@ pub fn string_from_raw(raw: usize) -> Result<Option<String>> {
     })
 }
 
+pub fn string_from_global_handle(handle: usize) -> Result<Option<String>> {
+    if handle == 0 {
+        return Ok(None);
+    }
+    let cloned = clone_global_handle(handle)?;
+    if cloned == 0 {
+        return Ok(None);
+    }
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        // SAFETY: cloned is a fresh global reference owned by this function.
+        let global = unsafe { env.global_from_raw::<JString>(cloned as jni::sys::jstring) };
+        Ok(Some(jstring_to_string(env, &global)?))
+    })
+}
+
 /// Test helper: `new StringBuilder("A").charAt(0)`.
 pub fn call_char_at() -> Result<i64> {
     let class = JavaClass::find("java.lang.StringBuilder")?;
@@ -1056,11 +1072,56 @@ pub fn ref_debug() -> Result<String> {
     .to_string())
 }
 
-pub fn object_from_global_handle(info: Rc<ClassInfo>, handle: usize) -> Result<JavaObject> {
+fn clone_global_handle(handle: usize) -> Result<usize> {
+    if handle == 0 {
+        return Ok(0);
+    }
     let vm = JavaVm::get()?;
     vm.with_env(|env| {
-        // SAFETY: the caller owns this global reference.
-        let global = unsafe { env.global_from_raw::<JObject>(handle as jni::sys::jobject) };
+        // SAFETY: handle is a borrowed global reference; the new global is
+        // owned by the caller.
+        let object = unsafe { JObject::from_raw(env, handle as jni::sys::jobject) };
+        Ok(env.new_global_ref(&object)?.into_raw() as usize)
+    })
+}
+
+pub fn object_from_global_handle(info: Rc<ClassInfo>, handle: usize) -> Result<JavaObject> {
+    let cloned = clone_global_handle(handle)?;
+    if cloned == 0 {
+        return Err(Error::Parse("null Java global reference".into()));
+    }
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        // SAFETY: cloned is a fresh global reference owned by this object.
+        let global = unsafe { env.global_from_raw::<JObject>(cloned as jni::sys::jobject) };
         Ok(JavaObject::from_global(info, global))
     })
+}
+
+/// Test helper: `new StringBuilder("abc").indexOf("bc")`.
+pub fn call_index_of() -> Result<i64> {
+    let class = JavaClass::find("java.lang.StringBuilder")?;
+    let object = class.new_object(&[])?;
+    let append = class
+        .info
+        .methods
+        .iter()
+        .find(|method| {
+            method.name == "append"
+                && method.signature == "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
+        })
+        .ok_or_else(|| Error::NotFound("StringBuilder.append(String)".into()))?;
+    let _ = object.call(append, &[JavaArg::String("abc".into())])?;
+    let index_of = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "indexOf" && method.signature == "(Ljava/lang/String;)I")
+        .ok_or_else(|| Error::NotFound("StringBuilder.indexOf(String)".into()))?;
+    match object.call(index_of, &[JavaArg::String("bc".into())])? {
+        JavaValue::Int(value) => Ok(i64::from(value)),
+        _ => Err(Error::Parse(
+            "StringBuilder.indexOf returned non-int".into(),
+        )),
+    }
 }
