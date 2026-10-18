@@ -1654,9 +1654,9 @@ pub fn enumerate_loaded_classes() -> Result<Vec<String>> {
     static VTABLE: std::sync::OnceLock<Box<[usize; 3]>> = std::sync::OnceLock::new();
     let vtable = VTABLE.get_or_init(|| {
         Box::new([
-            visitor_destructor as usize,
-            visitor_destructor as usize,
-            visit_class as usize,
+            visitor_destructor as *const () as usize,
+            visitor_destructor as *const () as usize,
+            visit_class as *const () as usize,
         ])
     });
     let visitor = [vtable.as_ptr() as usize];
