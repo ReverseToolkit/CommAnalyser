@@ -320,6 +320,20 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
     wrapper.set("$className", class.info.name.clone())?;
 
     let object = get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
+    let same_object = object.clone();
+    wrapper.set(
+        "$isSameObject",
+        Function::new(ctx.clone(), move |other: Value<'_>| -> bool {
+            let Some(other_id) = java_id(&other) else {
+                return false;
+            };
+            let Some(other) = get_object(other_id) else {
+                return false;
+            };
+            same_object.is_same_object(&other).unwrap_or(false)
+        })?,
+    )?;
+    wrapper.set("$dispose", Function::new(ctx.clone(), || {}))?;
     for (name, methods) in method_groups(&class.info) {
         if methods[0].is_static {
             continue;

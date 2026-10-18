@@ -141,6 +141,11 @@ impl JavaObject {
         clone_global_handle(self.object.as_raw() as usize)
     }
 
+    pub fn is_same_object(&self, other: &JavaObject) -> Result<bool> {
+        let vm = JavaVm::get()?;
+        vm.with_env(|env| Ok(env.is_same_object(&self.object, &other.object)?))
+    }
+
     pub fn recast(&self, info: Rc<ClassInfo>) -> Result<JavaObject> {
         cast_global_handle(info, self.object.as_raw() as usize)
     }
