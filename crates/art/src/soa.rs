@@ -23,7 +23,6 @@ const MAX_BRANCH: isize = 0x07FF_FFFF;
 type ExceptionClear = unsafe extern "C" fn(*mut jni::sys::JNIEnv);
 type AddGlobalRef =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> jni::sys::jobject;
-type SoaCallback = extern "C" fn(usize);
 
 thread_local! {
     static PENDING_RAW: Cell<usize> = const { Cell::new(0) };
@@ -238,7 +237,8 @@ fn add_global_ref() -> Option<AddGlobalRef> {
         )
     }))?;
     // SAFETY: address comes from libart's dynamic symbol table.
-    Some(unsafe { std::mem::transmute(address) })
+    let function: AddGlobalRef = unsafe { std::mem::transmute(address) };
+    Some(function)
 }
 
 fn resolve_libart_symbol(name: &str) -> Option<usize> {
