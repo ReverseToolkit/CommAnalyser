@@ -543,7 +543,26 @@ pub(crate) fn invoke_impl<'js>(
     } = call;
     let start = if method.is_static { 1 } else { 2 };
     let this_value: Value<'js> = if method.is_static {
-        Value::new_undefined(ctx.clone())
+        let this = class_object(ctx.clone(), class.clone())?;
+        if let Some(hook) = hook.clone() {
+            let method_function: Function<'js> = this.get(method.name.clone())?;
+            method_function.set(
+                "original",
+                original_function(
+                    ctx.clone(),
+                    class.clone(),
+                    method.clone(),
+                    hook,
+                    OriginalCall {
+                        this_id: 0,
+                        raw: args,
+                        fargs,
+                        globals,
+                    },
+                )?,
+            )?;
+        }
+        this.into_value()
     } else {
         let object = if globals & (1 << 1) != 0 {
             art::java::object_from_global_handle(class.info.clone(), args[1] as usize)
@@ -678,10 +697,15 @@ fn original_function<'js>(
     } = call;
     let call_ctx = ctx.clone();
     Function::new(ctx, move || -> JsResult<Value<'js>> {
-        let object = get_object(this_id).ok_or_else(|| js_error("invalid Java object handle"))?;
         let args = original_args(&method, &raw, &fargs, globals)?;
         hook.borrow().suspend();
-        let result = object.call(&method, &args);
+        let result = if method.is_static {
+            class.call_static(&method, &args)
+        } else {
+            let object =
+                get_object(this_id).ok_or_else(|| js_error("invalid Java object handle"))?;
+            object.call(&method, &args)
+        };
         hook.borrow().resume();
         value_to_js(
             call_ctx.clone(),
