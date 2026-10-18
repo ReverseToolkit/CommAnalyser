@@ -160,6 +160,22 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                     }
                 }
             });
+            fn.overload = function (signature) {
+                const bound = function () { return fn.apply(this, arguments); };
+                Object.defineProperty(bound, 'implementation', {
+                    configurable: true,
+                    get() { return bound.__impl || null; },
+                    set(cb) {
+                        bound.__impl = cb;
+                        if (cb === null || cb === undefined) {
+                            __analyser_java_detach(className, methodName, signature, isStatic);
+                        } else {
+                            __analyser_java_set_impl(className, methodName, signature, isStatic, cb);
+                        }
+                    }
+                });
+                return bound;
+            };
             return fn;
         };
         "#,
