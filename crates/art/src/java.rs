@@ -4,6 +4,7 @@
 //! constructors, keeps global references, and marshals the common
 //! int/long/boolean/String/object signatures.  Hooking lives in `lib.rs`.
 
+use std::ffi::c_void;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -1251,14 +1252,139 @@ pub fn call_double_to_bits() -> Result<i64> {
     }
 }
 
-pub fn throw_runtime_exception(message: &str) -> Result<()> {
+fn resolve_libart_symbol(name: &str) -> Option<usize> {
+    let base = crate::libart_base().ok()?;
+    for path in [
+        "/apex/com.android.art/lib64/libart.so",
+        "/system/lib64/libart.so",
+    ] {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let Ok(elf) = goblin::elf::Elf::parse(&bytes) else {
+            continue;
+        };
+        let Some(symbol) = elf
+            .dynsyms
+            .iter()
+            .find(|symbol| elf.dynstrtab.get_at(symbol.st_name) == Some(name))
+        else {
+            continue;
+        };
+        if symbol.st_value != 0 {
+            return Some(base + symbol.st_value as usize);
+        }
+    }
+    None
+}
+
+static JNI_ENV_OFFSET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RUNTIME_EXCEPTION_CLASS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static THROW_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static THROW_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn throw_state() -> (usize, Option<String>) {
+    (
+        THROW_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        THROW_ERROR.lock().ok().and_then(|slot| slot.clone()),
+    )
+}
+
+fn discover_env_offset(env: *mut jni::sys::JNIEnv) -> Option<usize> {
+    use std::sync::atomic::Ordering;
+    if JNI_ENV_OFFSET.load(Ordering::Relaxed) != 0 {
+        return Some(JNI_ENV_OFFSET.load(Ordering::Relaxed));
+    }
+    // SAFETY: JNIEnvExt embeds Thread* at +8.
+    let thread = unsafe { ptr::read_unaligned((env as usize + 8) as *const usize) };
+    if thread < 0x1000 {
+        return None;
+    }
+    for offset in (0..0x400).step_by(8) {
+        // SAFETY: reading within the ART Thread TLS block.
+        let value = unsafe { ptr::read_unaligned((thread + offset) as *const usize) };
+        if value == env as usize {
+            JNI_ENV_OFFSET.store(offset, Ordering::Relaxed);
+            return Some(offset);
+        }
+    }
+    None
+}
+
+pub fn cache_exception_class() -> Result<()> {
+    use std::sync::atomic::Ordering;
     let vm = JavaVm::get()?;
     vm.with_env(|env| {
-        let class = jni::strings::JNIString::from("java/lang/RuntimeException");
-        let message = jni::strings::JNIString::from(message);
-        env.throw_new(class, message)?;
+        discover_env_offset(env.get_raw());
+        if RUNTIME_EXCEPTION_CLASS.load(Ordering::Relaxed) != 0 {
+            return Ok(());
+        }
+        let name = jni::strings::JNIString::from("java/lang/RuntimeException");
+        let class = env.find_class(name)?;
+        let global = env.new_global_ref(&class)?;
+        RUNTIME_EXCEPTION_CLASS.store(global.into_raw() as usize, Ordering::Relaxed);
         Ok(())
     })
+}
+
+fn current_thread() -> Option<usize> {
+    let address = resolve_libart_symbol("_ZN3art6Thread14CurrentFromGdbEv")?;
+    type Current = unsafe extern "C" fn() -> *mut c_void;
+    // SAFETY: address comes from libart's dynamic symbol table.
+    let current: Current = unsafe { std::mem::transmute(address) };
+    let thread = unsafe { current() };
+    (!thread.is_null()).then_some(thread as usize)
+}
+
+pub fn throw_runtime_exception(message: &str) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    THROW_CALLS.fetch_add(1, Ordering::Relaxed);
+    let result = (|| {
+        cache_exception_class()?;
+        let offset = JNI_ENV_OFFSET.load(Ordering::Relaxed);
+        if offset == 0 {
+            return Err(Error::NotFound("Thread::jni_env offset".into()));
+        }
+        let class_handle = RUNTIME_EXCEPTION_CLASS.load(Ordering::Relaxed);
+        if class_handle == 0 {
+            return Err(Error::NotFound("RuntimeException class".into()));
+        }
+        let thread = current_thread().ok_or_else(|| Error::NotFound("ART thread".into()))?;
+        // SAFETY: offset was measured from a live JNIEnv/Thread pair.
+        let env = unsafe { ptr::read_unaligned((thread + offset) as *const usize) };
+        // SAFETY: check the JNIEnvExt back-pointer.
+        let self_ptr = unsafe { ptr::read_unaligned((env + 8) as *const usize) };
+        if env < 0x1000 || self_ptr != thread {
+            return Err(Error::Parse("invalid Thread::jni_env".into()));
+        }
+        let message = std::ffi::CString::new(message)
+            .map_err(|_| Error::Parse("exception message contains NUL".into()))?;
+        // SAFETY: env is the JNIEnvExt for this thread; ThrowNew is entry 14.
+        let table = unsafe { *(env as *mut *const usize) };
+        let throw_new: unsafe extern "C" fn(
+            *mut jni::sys::JNIEnv,
+            jni::sys::jclass,
+            *const std::os::raw::c_char,
+        ) -> jni::sys::jint = unsafe { std::mem::transmute(*table.add(14)) };
+        let status = unsafe {
+            throw_new(
+                env as *mut jni::sys::JNIEnv,
+                class_handle as jni::sys::jclass,
+                message.as_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::Parse(format!("ThrowNew failed: {status}")));
+        }
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        if let Ok(mut slot) = THROW_ERROR.lock() {
+            *slot = Some(error.to_string());
+        }
+    }
+    result
 }
 
 /// Create a Java `int[]` and wrap it as a JavaObject.

@@ -207,6 +207,10 @@ fn run(name: &str) -> std::io::Result<()> {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
+            "java_throw_state" => {
+                let (calls, error) = art::java::throw_state();
+                json!({"ok": true, "calls": calls, "error": error})
+            }
             "java_last_error" => json!({
                 "ok": true,
                 "error": js::last_java_error(),
