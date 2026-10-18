@@ -9,17 +9,20 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use rquickjs::class::Trace;
-use rquickjs::function::Args;
+use rquickjs::function::{Args, Rest};
 use rquickjs::prelude::Func;
 use rquickjs::{
-    Array, ArrayBuffer, Class, Ctx, Function, JsLifetime, Object, Persistent, Result as JsResult,
-    Value,
+    Array, ArrayBuffer, Class, Ctx, Function, IntoJs, JsLifetime, Object, Persistent,
+    Result as JsResult, Value,
 };
 
 use ca_core::module;
-use ca_gum::{memory, process, thread, InlineHook, SavedRegs};
+use ca_gum::{memory, native, process, thread, InlineHook, SavedRegs};
 
-use crate::worker::{hook_enter, hook_leave, make_bridge, HookGroup, HookTable, Job, Listener};
+use crate::worker::{
+    callback_dispatch, hook_enter, hook_leave, make_bridge, CallbackEntry, CallbackTable,
+    HookGroup, HookTable, Job, Listener,
+};
 
 /// JavaScript `NativePointer`.
 #[derive(Clone, Trace, JsLifetime)]
@@ -171,6 +174,14 @@ pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     globals.set("Process", process_object(ctx)?)?;
     globals.set("Module", module_object(ctx)?)?;
     globals.set("Thread", thread_object(ctx)?)?;
+    globals.set("__ca_make_native", Func::from(make_native_function))?;
+    ctx.eval::<(), _>(
+        r#"
+        globalThis.NativeFunction = function (address, retType, argTypes) {
+            return __ca_make_native(address, retType, argTypes);
+        };
+        "#,
+    )?;
     Ok(())
 }
 
@@ -179,6 +190,7 @@ pub(crate) fn install_with_hooks<'js>(
     ctx: &Ctx<'js>,
     tx: Sender<Job>,
     hooks: Rc<RefCell<HookTable>>,
+    callbacks: Rc<RefCell<CallbackTable>>,
 ) -> JsResult<()> {
     install(ctx)?;
 
@@ -241,7 +253,92 @@ pub(crate) fn install_with_hooks<'js>(
         ),
     )?;
     ctx.globals().set("Interceptor", interceptor)?;
+
+    ctx.globals().set(
+        "__ca_make_callback",
+        Func::from(
+            move |ctx: Ctx<'js>,
+                  function: Function<'js>,
+                  ret_type: String,
+                  arg_types: Value<'js>|
+                  -> JsResult<Class<'js, NativePointer>> {
+                if matches!(ret_type.as_str(), "float" | "double") {
+                    return Err(js_error(
+                        "NativeCallback: float returns are not supported yet",
+                    ));
+                }
+                let array: Array<'js> = arg_types.get()?;
+                let mut types = Vec::with_capacity(array.len());
+                for index in 0..array.len() {
+                    types.push(array.get::<String>(index)?);
+                }
+                let id = {
+                    let mut table = callbacks.borrow_mut();
+                    table.entries.push(CallbackEntry {
+                        function: Persistent::save(&ctx, function),
+                        arg_types: types,
+                        ret_void: ret_type == "void",
+                        ret_signed: is_signed_type(&ret_type),
+                        ret_pointer: ret_type == "pointer",
+                    });
+                    table.entries.len() - 1
+                };
+                let stub =
+                    ca_gum::native::make_callback_stub(callback_dispatch as *const () as usize, id)
+                        .map_err(to_js_error)?;
+                NativePointer::instance(ctx, stub as u64)
+            },
+        ),
+    )?;
+    ctx.eval::<(), _>(
+        r#"
+        globalThis.NativeCallback = function (fn, retType, argTypes) {
+            return __ca_make_callback(fn, retType, argTypes);
+        };
+        "#,
+    )?;
     Ok(())
+}
+
+/// Invoke a JS `NativeCallback` and convert its return value to x0.
+pub(crate) fn invoke_callback<'js>(
+    ctx: &Ctx<'js>,
+    function: Persistent<Function<'static>>,
+    arg_types: &[String],
+    ret_void: bool,
+    ret_signed: bool,
+    ret_pointer: bool,
+    args: [u64; 8],
+) -> JsResult<u64> {
+    let function = function.restore(ctx)?;
+    let mut call_args = Args::new(ctx.clone(), 8);
+    for (index, arg) in args.iter().enumerate() {
+        let ty = arg_types
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or("pointer");
+        let value: Value<'js> = if ty == "pointer" {
+            NativePointer::instance(ctx.clone(), *arg)?.into_value()
+        } else if is_signed_type(ty) {
+            (*arg as i64).into_js(ctx)?
+        } else {
+            arg.into_js(ctx)?
+        };
+        call_args.push_arg(value)?;
+    }
+    let result: Value<'js> = function.call_arg(call_args)?;
+
+    if ret_void {
+        return Ok(0);
+    }
+    if ret_pointer {
+        return parse_pointer(&result);
+    }
+    if ret_signed {
+        result.get::<i64>().map(|value| value as u64)
+    } else {
+        result.get::<u64>()
+    }
 }
 
 /// Invoke a saved `onEnter` function with Frida-like `this.context` and `args`.
@@ -518,6 +615,67 @@ fn to_js_error(error: ca_core::Error) -> rquickjs::Error {
 
 fn js_error(message: impl Into<String>) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("ca", "pointer", message.into())
+}
+
+fn is_signed_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "int" | "int8" | "int16" | "int32" | "int64" | "long" | "ssize_t" | "char"
+    )
+}
+
+fn make_native_function<'js>(
+    ctx: Ctx<'js>,
+    address: Value<'js>,
+    ret_type: String,
+    arg_types: Value<'js>,
+) -> JsResult<Function<'js>> {
+    let target = usize::try_from(parse_pointer(&address)?)
+        .map_err(|_| js_error("native function address does not fit in usize"))?;
+    if matches!(ret_type.as_str(), "float" | "double") {
+        return Err(js_error(
+            "NativeFunction: float returns are not supported yet",
+        ));
+    }
+    let returns_void = ret_type == "void";
+    let returns_signed = is_signed_type(&ret_type);
+
+    let array: Array<'js> = arg_types.get()?;
+    let mut types = Vec::with_capacity(array.len());
+    for index in 0..array.len() {
+        types.push(array.get::<String>(index)?);
+    }
+
+    let call_ctx = ctx.clone();
+    Function::new(
+        ctx,
+        move |values: Rest<Value<'js>>| -> JsResult<Value<'js>> {
+            let mut raw = [0u64; 8];
+            for (index, value) in values.0.iter().enumerate().take(8) {
+                let ty = types.get(index).map(String::as_str).unwrap_or("pointer");
+                raw[index] = match ty {
+                    "pointer" => parse_pointer(value)?,
+                    "void" => 0,
+                    "float" | "double" => {
+                        return Err(js_error(
+                            "NativeFunction: float arguments are not supported yet",
+                        ))
+                    }
+                    _ if is_signed_type(ty) => value.get::<i64>()? as u64,
+                    _ => value.get::<u64>()?,
+                };
+            }
+            // SAFETY: the caller supplied the function address and signature.
+            let result = unsafe { native::call(target, &raw) }.map_err(to_js_error)?;
+            if returns_void {
+                Ok(Value::new_undefined(call_ctx.clone()))
+            } else if returns_signed {
+                (result as i64).into_js(&call_ctx)
+            } else {
+                result.into_js(&call_ctx)
+            }
+        },
+    )
 }
 
 fn lookup_export<'js>(ctx: Ctx<'js>, module: Value<'js>, symbol: String) -> JsResult<Value<'js>> {

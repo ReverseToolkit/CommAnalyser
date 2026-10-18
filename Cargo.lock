@@ -115,6 +115,7 @@ dependencies = [
  "ca-core",
  "ca-gum",
  "goblin",
+ "libc",
  "rquickjs",
  "thiserror",
 ]

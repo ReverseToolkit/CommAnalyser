@@ -112,6 +112,19 @@ fn run(name: &str) -> std::io::Result<()> {
                     None => json!({"ok": false, "error": "QuickJS unavailable"}),
                 }
             }
+            "call_int1" => {
+                let address = request.get("address").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let arg = request.get("arg").and_then(Value::as_i64).unwrap_or(0) as u64;
+                if address == 0 {
+                    json!({"ok": false, "error": "null callback"})
+                } else {
+                    // SAFETY: the caller passes a NativeCallback stub with this ABI.
+                    let function: unsafe extern "C" fn(u64) -> u64 =
+                        unsafe { std::mem::transmute(address) };
+                    let result = unsafe { function(arg) };
+                    json!({"ok": true, "result": result})
+                }
+            }
             "call_getpid" => {
                 let mut last = 0;
                 for _ in 0..5 {

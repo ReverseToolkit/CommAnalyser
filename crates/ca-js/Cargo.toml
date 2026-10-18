@@ -10,6 +10,7 @@ rust-version.workspace = true
 ca-core.workspace = true
 ca-gum.workspace = true
 goblin = "0.10"
+libc.workspace = true
 rquickjs.workspace = true
 thiserror.workspace = true
 

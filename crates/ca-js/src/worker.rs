@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use rquickjs::{Function, Persistent};
@@ -51,6 +52,21 @@ pub(crate) struct HookBridge {
     pub(crate) tx: Sender<Job>,
 }
 
+pub(crate) struct CallbackEntry {
+    pub(crate) function: Persistent<Function<'static>>,
+    pub(crate) arg_types: Vec<String>,
+    pub(crate) ret_void: bool,
+    pub(crate) ret_signed: bool,
+    pub(crate) ret_pointer: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct CallbackTable {
+    pub(crate) entries: Vec<CallbackEntry>,
+}
+
+static JS_TX: OnceLock<Sender<Job>> = OnceLock::new();
+
 pub(crate) enum Job {
     Eval {
         code: String,
@@ -67,6 +83,11 @@ pub(crate) enum Job {
         target: usize,
         regs: SavedRegs,
         reply: Sender<SavedRegs>,
+    },
+    Callback {
+        id: usize,
+        args: [u64; 8],
+        reply: Sender<u64>,
     },
     Shutdown,
 }
@@ -110,8 +131,10 @@ impl Drop for JsWorker {
 
 fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>) {
     JS_THREAD.with(|flag| flag.set(true));
+    let _ = JS_TX.set(tx.clone());
     let hooks = Rc::new(RefCell::new(HookTable::default()));
-    let runtime = match ScriptRuntime::new_with_hooks(tx, hooks.clone()) {
+    let callbacks = Rc::new(RefCell::new(CallbackTable::default()));
+    let runtime = match ScriptRuntime::new_with_hooks(tx, hooks.clone(), callbacks) {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("[ca-js] failed to create runtime: {err}");
@@ -139,6 +162,9 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>) {
                 reply,
             } => {
                 let _ = reply.send(runtime.run_leave(group, target, regs));
+            }
+            Job::Callback { id, args, reply } => {
+                let _ = reply.send(runtime.run_callback(id, args));
             }
             Job::Shutdown => break,
         }
@@ -209,6 +235,31 @@ pub(crate) unsafe extern "C" fn hook_leave(regs: *mut SavedRegs, data: *mut std:
     HOOK_ACTIVE.with(|flag| flag.set(false));
 }
 
+/// Dispatcher embedded in every NativeCallback stub.
+pub(crate) extern "C" fn callback_dispatch(id: usize, args: *const u64) -> u64 {
+    if args.is_null() || is_js_thread() {
+        return 0;
+    }
+    let Some(tx) = JS_TX.get() else {
+        return 0;
+    };
+    let mut raw = [0u64; 8];
+    // SAFETY: the callback stub guarantees a pointer to eight x-registers.
+    unsafe { std::ptr::copy_nonoverlapping(args, raw.as_mut_ptr(), 8) };
+    let (reply, response) = mpsc::channel();
+    if tx
+        .send(Job::Callback {
+            id,
+            args: raw,
+            reply,
+        })
+        .is_err()
+    {
+        return 0;
+    }
+    response.recv_timeout(Duration::from_secs(5)).unwrap_or(0)
+}
+
 pub(crate) fn make_bridge(group: usize, target: usize, tx: Sender<Job>) -> *mut HookBridge {
     Box::into_raw(Box::new(HookBridge { group, target, tx }))
 }
@@ -222,5 +273,7 @@ mod tests {
         let worker = JsWorker::spawn().unwrap();
         assert_eq!(worker.eval("6 * 7").unwrap(), "42");
         assert_eq!(worker.eval("typeof Interceptor").unwrap(), "object");
+        assert_eq!(worker.eval("typeof NativeFunction").unwrap(), "function");
+        assert_eq!(worker.eval("typeof NativeCallback").unwrap(), "function");
     }
 }

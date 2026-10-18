@@ -17,24 +17,39 @@ use rquickjs::{CatchResultExt, Context, Function, Runtime};
 
 pub use worker::JsWorker;
 
-use worker::{HookTable, Job};
+use worker::{CallbackTable, HookTable, Job};
 
 pub struct ScriptRuntime {
-    rt: Runtime,
+    // Drop order matters: JS values in the tables and the context must be
+    // released before the runtime.  `rt` is therefore last.
     ctx: Context,
     hooks: Rc<RefCell<HookTable>>,
+    callbacks: Rc<RefCell<CallbackTable>>,
+    rt: Runtime,
 }
 
 impl ScriptRuntime {
     pub fn new() -> Result<Self> {
-        Self::new_inner(None, Rc::new(RefCell::new(HookTable::default())))
+        Self::new_inner(
+            None,
+            Rc::new(RefCell::new(HookTable::default())),
+            Rc::new(RefCell::new(CallbackTable::default())),
+        )
     }
 
-    pub(crate) fn new_with_hooks(tx: Sender<Job>, hooks: Rc<RefCell<HookTable>>) -> Result<Self> {
-        Self::new_inner(Some(tx), hooks)
+    pub(crate) fn new_with_hooks(
+        tx: Sender<Job>,
+        hooks: Rc<RefCell<HookTable>>,
+        callbacks: Rc<RefCell<CallbackTable>>,
+    ) -> Result<Self> {
+        Self::new_inner(Some(tx), hooks, callbacks)
     }
 
-    fn new_inner(tx: Option<Sender<Job>>, hooks: Rc<RefCell<HookTable>>) -> Result<Self> {
+    fn new_inner(
+        tx: Option<Sender<Job>>,
+        hooks: Rc<RefCell<HookTable>>,
+        callbacks: Rc<RefCell<CallbackTable>>,
+    ) -> Result<Self> {
         let rt = Runtime::new().map_err(js_error)?;
         let ctx = Context::full(&rt).map_err(js_error)?;
 
@@ -56,14 +71,19 @@ impl ScriptRuntime {
             )
             .map_err(js_error)?;
             match tx {
-                Some(tx) => api::install_with_hooks(&ctx, tx, hooks.clone()),
+                Some(tx) => api::install_with_hooks(&ctx, tx, hooks.clone(), callbacks.clone()),
                 None => api::install(&ctx),
             }
             .map_err(js_error)?;
             Ok(())
         })?;
 
-        Ok(Self { rt, ctx, hooks })
+        Ok(Self {
+            ctx,
+            hooks,
+            callbacks,
+            rt,
+        })
     }
 
     /// Evaluate a script/expression and return `String(value)`.
@@ -130,6 +150,33 @@ impl ScriptRuntime {
         });
         regs
     }
+
+    pub(crate) fn run_callback(&self, id: usize, args: [u64; 8]) -> u64 {
+        let entry = self.callbacks.borrow().entries.get(id).map(|entry| {
+            (
+                entry.function.clone(),
+                entry.arg_types.clone(),
+                entry.ret_void,
+                entry.ret_signed,
+                entry.ret_pointer,
+            )
+        });
+        let Some((function, arg_types, ret_void, ret_signed, ret_pointer)) = entry else {
+            return 0;
+        };
+        self.ctx.with(|ctx| {
+            api::invoke_callback(
+                &ctx,
+                function,
+                &arg_types,
+                ret_void,
+                ret_signed,
+                ret_pointer,
+                args,
+            )
+            .unwrap_or(0)
+        })
+    }
 }
 
 fn js_error(error: rquickjs::Error) -> Error {
@@ -138,6 +185,15 @@ fn js_error(error: rquickjs::Error) -> Error {
 
 fn js_caught_error(error: rquickjs::CaughtError<'_>) -> Error {
     Error::Parse(format!("quickjs: {error}"))
+}
+
+impl Drop for ScriptRuntime {
+    fn drop(&mut self) {
+        // Break persistent-function references before JS_FreeRuntime checks
+        // that the GC object list is empty.
+        self.hooks.borrow_mut().groups.clear();
+        self.callbacks.borrow_mut().entries.clear();
+    }
 }
 
 #[cfg(test)]

@@ -54,6 +54,9 @@ cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
 - **M2e (done)**: grouped listeners, `onLeave` via a shared return stub, and
   `retval.replace`; validated in `sleep` and Settings.
   Details: [`docs/06-m2e.md`](docs/06-m2e.md).
+- **M2f/M2g (done)**: `NativeFunction` + `NativeCallback` via hand-written
+  ARM64 stubs (no libffi), signed/pointer args, IFUNC export fix.
+  Details: [`docs/07-m2f.md`](docs/07-m2f.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 
