@@ -1,0 +1,19 @@
+[package]
+name = "agent"
+description = "In-process agent payload for CommAnalyser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "agent"
+crate-type = ["cdylib"]
+
+[dependencies]
+runtime.workspace = true
+gum.workspace = true
+art.workspace = true
+js.workspace = true
+serde_json.workspace = true
+libc.workspace = true

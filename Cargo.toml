@@ -10,13 +10,13 @@ authors = ["CommAnalyser"]
 rust-version = "1.85"
 
 [workspace.dependencies]
-ca-core = { path = "crates/ca-core" }
-ca-arch-arm64 = { path = "crates/ca-arch-arm64" }
-ca-gum = { path = "crates/ca-gum" }
-ca-art = { path = "crates/ca-art" }
-ca-js = { path = "crates/ca-js" }
-ca-inject = { path = "crates/ca-inject" }
-ca-qbdi = { path = "crates/ca-qbdi" }
+runtime = { path = "crates/runtime" }
+arch-arm64 = { path = "crates/arch-arm64" }
+gum = { path = "crates/gum" }
+art = { path = "crates/art" }
+js = { path = "crates/js" }
+inject = { path = "crates/inject" }
+qbdi = { path = "crates/qbdi" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

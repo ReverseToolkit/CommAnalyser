@@ -1,0 +1,11 @@
+[package]
+name = "arch-arm64"
+description = "ARM64 instruction classification, code writing and prologue relocation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+runtime.workspace = true
+thiserror.workspace = true

@@ -8,15 +8,15 @@ ARM64 Android dynamic instrumentation framework (Rust).
 
 ## Layout
 
-- `crates/ca-core` — process/maps/modules/ranges.
-- `crates/ca-arch-arm64` — instruction classification, writer, relocator.
-- `crates/ca-gum` — Memory/Module/Process/Interceptor primitives.
-- `crates/ca-js` — QuickJS runtime (rquickjs).
-- `crates/ca-art` — ART engine (planned, M3).
-- `crates/ca-qbdi` — QBDI native API (planned, M4).
-- `crates/ca-inject` — ptrace/remote-call/memfd loader.
-- `crates/ca-agent` — in-process payload (`cdylib`).
-- `crates/ca-daemon` / `crates/ca-cli` — device daemon and host CLI.
+- `crates/runtime` — process/maps/modules/ranges.
+- `crates/arch-arm64` — instruction classification, writer, relocator.
+- `crates/gum` — Memory/Module/Process/Interceptor primitives.
+- `crates/js` — QuickJS runtime (rquickjs).
+- `crates/art` — ART engine (planned, M3).
+- `crates/qbdi` — QBDI native API (planned, M4).
+- `crates/inject` — ptrace/remote-call/memfd loader.
+- `crates/agent` — in-process payload (`cdylib`).
+- `crates/daemon` / `crates/cli` — device daemon and host CLI.
 
 ## Build
 
@@ -30,7 +30,7 @@ Android cross-compile (M1+):
 ```bash
 export NDK=/root/Android/Sdk/ndk/29.0.14206865
 export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
+cargo build --target aarch64-linux-android -p agent -p daemon -p cli
 ```
 
 ## Status
@@ -76,14 +76,14 @@ cargo test --workspace
 cargo build --workspace
 
 # device side (root shell)
-adb push target/aarch64-linux-android/debug/ca-daemon /data/local/tmp/
-adb push target/aarch64-linux-android/debug/libca_agent.so /data/local/tmp/
-adb shell 'chmod 755 /data/local/tmp/ca-daemon; /data/local/tmp/ca-daemon --addr 127.0.0.1:17321 &'
+adb push target/aarch64-linux-android/debug/daemon /data/local/tmp/
+adb push target/aarch64-linux-android/debug/libagent.so /data/local/tmp/
+adb shell 'chmod 755 /data/local/tmp/daemon; /data/local/tmp/daemon --addr 127.0.0.1:17321 &'
 adb forward tcp:17321 tcp:17321
-./target/debug/ca --addr 127.0.0.1:17321 ps
-./target/debug/ca --addr 127.0.0.1:17321 inject <pid> --agent /data/local/tmp/libca_agent.so
-./target/debug/ca --addr 127.0.0.1:17321 eval <pid> '1+2'
-./target/debug/ca --addr 127.0.0.1:17321 agent <pid> hook_getpid
+./target/debug/comm-analyser --addr 127.0.0.1:17321 ps
+./target/debug/comm-analyser --addr 127.0.0.1:17321 inject <pid> --agent /data/local/tmp/libagent.so
+./target/debug/comm-analyser --addr 127.0.0.1:17321 eval <pid> '1+2'
+./target/debug/comm-analyser --addr 127.0.0.1:17321 agent <pid> hook_getpid
 ```
 
 QuickJS cross-compile needs libclang + the Android sysroot:
@@ -101,10 +101,10 @@ Line-delimited JSON over TCP:
 {"op":"ping"}
 {"op":"version"}
 {"op":"ps"}
-{"op":"inject","pid":1234,"agent":"/data/local/tmp/libca_agent.so"}
+{"op":"inject","pid":1234,"agent":"/data/local/tmp/libagent.so"}
 ```
 
-`ca --addr 127.0.0.1:17321 ps` prints the process list.
+`comm-analyser --addr 127.0.0.1:17321 ps` prints the process list.
 
 ## Non-goals (v0)
 
