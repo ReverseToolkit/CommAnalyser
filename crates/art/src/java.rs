@@ -1730,3 +1730,17 @@ pub fn helper_key_event() -> Result<String> {
         Ok(format!("ok keyCode={code}"))
     })
 }
+
+pub fn android_version() -> Result<String> {
+    let class = JavaClass::find("android.os.Build$VERSION")?;
+    let field = class
+        .info
+        .fields
+        .iter()
+        .find(|field| field.name == "RELEASE" && field.is_static)
+        .ok_or_else(|| Error::NotFound("Build.VERSION.RELEASE".into()))?;
+    match class.get_static_field(field)? {
+        JavaValue::String(value) => Ok(value),
+        _ => Err(Error::Parse("Build.VERSION.RELEASE is not a String".into())),
+    }
+}

@@ -230,6 +230,9 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
     java.set("available", true)?;
     java.set("perform", Func::from(perform))?;
     java.set("performNow", Func::from(perform))?;
+    if let Ok(version) = art::java::android_version() {
+        java.set("androidVersion", version)?;
+    }
     java.set("use", Func::from(use_class))?;
     java.set("array", Func::from(make_array))?;
     java.set("cast", Func::from(cast))?;
