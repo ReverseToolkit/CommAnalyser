@@ -4,6 +4,7 @@
 //! constructors, keeps global references, and marshals the common
 //! int/long/boolean/String/object signatures.  Hooking lives in `lib.rs`.
 
+use std::cell::RefCell;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -17,6 +18,14 @@ use jni::sys::{jint, jsize, jvalue, JavaVM as RawJavaVM};
 use jni::{Env, JavaVM};
 
 use runtime::{Error, Result};
+
+thread_local! {
+    static LAST_EXCEPTION: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+pub fn last_exception() -> String {
+    LAST_EXCEPTION.with(|slot| slot.borrow().clone())
+}
 
 type GetCreatedJavaVms = unsafe extern "C" fn(*mut *mut RawJavaVM, jsize, *mut jsize) -> jint;
 
@@ -94,6 +103,7 @@ pub struct CtorInfo {
     pub id: JMethodID,
     pub params: Vec<Kind>,
     pub signature: String,
+    pub is_public: bool,
 }
 
 pub struct ClassInfo {
@@ -159,7 +169,14 @@ impl JavaClass {
             let (raw, _strings) = marshal(env, &ctor.params, args)?;
             // SAFETY: the constructor ID and the argument kinds were obtained
             // from the same class and match the supplied values.
-            let object = unsafe { env.new_object_unchecked(&self.class, ctor.id, &raw)? };
+            let object = match unsafe { env.new_object_unchecked(&self.class, ctor.id, &raw) } {
+                Ok(object) => object,
+                Err(error) => {
+                    let message = exception_text(env);
+                    LAST_EXCEPTION.with(|slot| *slot.borrow_mut() = message);
+                    return Err(error);
+                }
+            };
             let global = env.new_global_ref(&object)?;
             Ok(JavaObject {
                 info: self.info.clone(),
@@ -213,6 +230,29 @@ impl JavaObject {
             convert(env, &method.ret, value)
         })
     }
+}
+
+fn exception_text(env: &mut Env<'_>) -> String {
+    let Some(throwable) = env.exception_occurred() else {
+        return "no pending Java exception".to_owned();
+    };
+    let signature = match RuntimeMethodSignature::from_str("()Ljava/lang/String;") {
+        Ok(signature) => signature,
+        Err(_) => return "pending Java exception".to_owned(),
+    };
+    let name = JNIString::new("toString");
+    let Ok(value) = env.call_method(&throwable, &*name, signature.method_signature(), &[]) else {
+        return "pending Java exception".to_owned();
+    };
+    let Ok(object) = value.l() else {
+        return "pending Java exception".to_owned();
+    };
+    if object.is_null() {
+        return "pending Java exception".to_owned();
+    }
+    // SAFETY: Throwable.toString() returns java.lang.String.
+    let string = unsafe { JString::from_raw(env, object.as_raw()) };
+    jstring_to_string(env, &string).unwrap_or_else(|_| "pending Java exception".to_owned())
 }
 
 fn created_java_vm() -> Result<*mut RawJavaVM> {
@@ -296,6 +336,8 @@ fn reflect(
             .iter()
             .map(|class_obj| class_kind(env, class_obj))
             .collect::<jni::errors::Result<Vec<_>>>()?;
+        let modifiers = int_call(env, &ctor, "getModifiers")?;
+        let is_public = modifiers & 0x0001 != 0;
         let signature = format!("({})V", descriptors(&params));
         let init = JNIString::new("<init>");
         let signature_c = RuntimeMethodSignature::from_str(&signature)?;
@@ -304,6 +346,7 @@ fn reflect(
             id,
             params,
             signature,
+            is_public,
         });
     }
 
@@ -636,4 +679,22 @@ pub fn call_bit_count() -> Result<i64> {
         JavaValue::Int(value) => Ok(i64::from(value)),
         _ => Err(Error::Parse("Integer.bitCount returned non-int".into())),
     }
+}
+
+/// Diagnostic: list StringBuilder constructors and their parameter kinds.
+pub fn ctor_list() -> Result<String> {
+    let class = JavaClass::find("java.lang.StringBuilder")?;
+    let ctors: Vec<_> = class
+        .info
+        .ctors
+        .iter()
+        .map(|ctor| {
+            serde_json::json!({
+                "signature": ctor.signature,
+                "public": ctor.is_public,
+                "params": format!("{:?}", ctor.params),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({"ok": true, "ctors": ctors}).to_string())
 }

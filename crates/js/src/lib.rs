@@ -196,13 +196,19 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn run_java_impl(&self, id: usize, args: [u64; 8]) -> u64 {
-        let entry = self.java_hooks.borrow().entries.get(id).map(|entry| {
-            (
-                entry.function.clone(),
-                entry.class.clone(),
-                entry.method.clone(),
-            )
-        });
+        let entry = self
+            .java_hooks
+            .borrow()
+            .entries
+            .get(id)
+            .and_then(|entry| entry.as_ref())
+            .map(|entry| {
+                (
+                    entry.function.clone(),
+                    entry.class.clone(),
+                    entry.method.clone(),
+                )
+            });
         let Some((function, class, method)) = entry else {
             return 0;
         };

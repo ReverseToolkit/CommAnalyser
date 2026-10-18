@@ -72,6 +72,10 @@ cargo build --target aarch64-linux-android -p agent -p daemon -p cli
 - **M3d (partial)**: Java hook now receives `this` and int/long/bool/char/
   byte/short/String arguments; validated with `charAt` and `bitCount`.
   Details: [`docs/12-m3d.md`](docs/12-m3d.md).
+- **M3e (partial)**: `implementation = null` detaches a Java hook; public
+  constructor preference and ctor diagnostics. `$new("...")` for
+  StringBuilder/StringBuffer remains unresolved.
+  Details: [`docs/13-m3e.md`](docs/13-m3e.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 

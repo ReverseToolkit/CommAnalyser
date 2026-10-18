@@ -22,6 +22,7 @@ thread_local! {
 const HANDLE: &str = "__analyserJavaId";
 
 pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>>) -> JsResult<()> {
+    let set_hooks = java_hooks.clone();
     ctx.globals().set(
         "__analyser_java_set_impl",
         Func::from(
@@ -44,16 +45,40 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                     })
                     .cloned()
                     .ok_or_else(|| js_error("Java method not found"))?;
-                let mut table = java_hooks.borrow_mut();
+                let mut table = set_hooks.borrow_mut();
                 let id = table.entries.len();
                 let hook = art::hook::install(method.id, java_dispatch as *const () as usize, id)
                     .map_err(to_js_error)?;
-                table.entries.push(JavaHookEntry {
+                table.entries.push(Some(JavaHookEntry {
                     function: Persistent::save(&ctx, callback),
                     class,
                     method,
                     _hook: hook,
-                });
+                }));
+                Ok(())
+            },
+        ),
+    )?;
+    let detach_hooks = java_hooks.clone();
+    ctx.globals().set(
+        "__analyser_java_detach",
+        Func::from(
+            move |class_name: String,
+                  method_name: String,
+                  signature: String,
+                  is_static: bool|
+                  -> JsResult<()> {
+                let mut table = detach_hooks.borrow_mut();
+                if let Some(slot) = table.entries.iter_mut().find(|slot| {
+                    slot.as_ref().is_some_and(|entry| {
+                        entry.class.info.name == class_name
+                            && entry.method.name == method_name
+                            && entry.method.signature == signature
+                            && entry.method.is_static == is_static
+                    })
+                }) {
+                    *slot = None;
+                }
                 Ok(())
             },
         ),
@@ -69,7 +94,11 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                 get() { return fn.__impl || null; },
                 set(cb) {
                     fn.__impl = cb;
-                    __analyser_java_set_impl(className, methodName, signature, isStatic, cb);
+                    if (cb === null || cb === undefined) {
+                        __analyser_java_detach(className, methodName, signature, isStatic);
+                    } else {
+                        __analyser_java_set_impl(className, methodName, signature, isStatic, cb);
+                    }
                 }
             });
             return fn;
@@ -229,12 +258,31 @@ fn choose_ctor<'a>(class: &'a JavaClass, args: &[Value<'_>]) -> JsResult<&'a Cto
         .ctors
         .iter()
         .find(|ctor| {
-            ctor.params.len() == args.len()
+            ctor.is_public
+                && ctor.params.len() == args.len()
                 && ctor
                     .params
                     .iter()
                     .zip(args)
-                    .all(|(kind, value)| matches_kind(kind, value))
+                    .all(|(kind, value)| strong_match(kind, value))
+        })
+        .or_else(|| {
+            class.info.ctors.iter().find(|ctor| {
+                ctor.is_public
+                    && ctor.params.len() == args.len()
+                    && ctor
+                        .params
+                        .iter()
+                        .zip(args)
+                        .all(|(kind, value)| matches_kind(kind, value))
+            })
+        })
+        .or_else(|| {
+            class
+                .info
+                .ctors
+                .iter()
+                .find(|ctor| ctor.is_public && ctor.params.len() == args.len())
         })
         .or_else(|| {
             class
@@ -244,6 +292,13 @@ fn choose_ctor<'a>(class: &'a JavaClass, args: &[Value<'_>]) -> JsResult<&'a Cto
                 .find(|ctor| ctor.params.len() == args.len())
         })
         .ok_or_else(|| js_error("no matching Java constructor"))
+}
+
+fn strong_match(kind: &Kind, value: &Value<'_>) -> bool {
+    if value.is_string() {
+        return matches!(kind, Kind::Object(name) if name == "java.lang.String");
+    }
+    matches_kind(kind, value)
 }
 
 fn matches_kind(kind: &Kind, value: &Value<'_>) -> bool {

@@ -63,7 +63,9 @@ pub(crate) struct JavaHookEntry {
 
 #[derive(Default)]
 pub(crate) struct JavaHookTable {
-    pub(crate) entries: Vec<JavaHookEntry>,
+    /// Ids are stable: detaching sets the slot to `None` instead of shifting
+    /// other entries (their dispatcher stubs embed the id).
+    pub(crate) entries: Vec<Option<JavaHookEntry>>,
 }
 
 pub(crate) struct CallbackEntry {
