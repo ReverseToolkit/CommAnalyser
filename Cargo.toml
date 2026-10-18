@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["CommAnalyser"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+ca-core = { path = "crates/ca-core" }
+ca-arch-arm64 = { path = "crates/ca-arch-arm64" }
+ca-gum = { path = "crates/ca-gum" }
+ca-js = { path = "crates/ca-js" }
+ca-inject = { path = "crates/ca-inject" }
+ca-qbdi = { path = "crates/ca-qbdi" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rquickjs = { version = "0.14", default-features = false, features = ["std", "macro"] }
+
+[profile.release]
+lto = "thin"
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

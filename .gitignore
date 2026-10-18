@@ -1,0 +1,14 @@
+/target
+**/target
+*.so
+*.a
+*.dylib
+*.dll
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+/build/
+/dist/
+/docs/

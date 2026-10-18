@@ -1,0 +1,137 @@
+//! CommAnalyser host CLI (M0: ping/version/ps).
+
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::process::ExitCode;
+
+use serde_json::{json, Value};
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
+    let mut addr = "127.0.0.1:17321".to_owned();
+    let mut token: Option<String> = None;
+    let mut command: Option<String> = None;
+    let mut rest = Vec::new();
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--addr" => addr = args.next().ok_or("missing --addr value")?,
+            "--token" => token = args.next(),
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            other if command.is_none() && !other.starts_with('-') => {
+                command = Some(other.to_owned())
+            }
+            other => rest.push(other.to_owned()),
+        }
+    }
+
+    let command = command.ok_or_else(|| {
+        "usage: ca [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach>".to_owned()
+    })?;
+
+    let request = match command.as_str() {
+        "ping" => json!({"op": "ping"}),
+        "version" => json!({"op": "version"}),
+        "ps" => json!({"op": "ps"}),
+        "attach" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: ca attach <pid>")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            json!({"op": "attach", "pid": pid})
+        }
+        other => return Err(format!("unknown command: {other}")),
+    };
+
+    let mut request = request;
+    if let Some(token) = token {
+        request["token"] = Value::String(token);
+    }
+
+    let response = call(&addr, &request)?;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        let err = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("request failed");
+        return Err(err.to_owned());
+    }
+
+    match command.as_str() {
+        "ps" => {
+            if let Some(processes) = response.get("processes").and_then(Value::as_array) {
+                for p in processes {
+                    let pid = p.get("pid").and_then(Value::as_u64).unwrap_or(0);
+                    let name = p.get("name").and_then(Value::as_str).unwrap_or("");
+                    if let Err(err) = writeln!(io::stdout(), "{pid:>7}  {name}") {
+                        if err.kind() == io::ErrorKind::BrokenPipe {
+                            return Ok(());
+                        }
+                        return Err(err.to_string());
+                    }
+                }
+            }
+        }
+        "version" => {
+            let text = format!(
+                "ca-daemon {} ({})",
+                response
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                response.get("arch").and_then(Value::as_str).unwrap_or("?")
+            );
+            let _ = writeln!(io::stdout(), "{text}");
+        }
+        _ => {
+            let _ = writeln!(io::stdout(), "{response}");
+        }
+    }
+    Ok(())
+}
+
+fn call(addr: &str, request: &Value) -> Result<Value, String> {
+    let mut stream = TcpStream::connect(addr).map_err(|err| format!("connect {addr}: {err}"))?;
+    let line = serde_json::to_string(request).map_err(|err| err.to_string())?;
+    stream
+        .write_all(line.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .and_then(|_| stream.flush())
+        .map_err(|err| format!("send: {err}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .map_err(|err| format!("recv: {err}"))?;
+    if response.trim().is_empty() {
+        return Err("empty response".to_owned());
+    }
+    serde_json::from_str(&response).map_err(|err| format!("bad response: {err}"))
+}
+
+fn print_help() {
+    println!(
+        "usage: ca [--addr HOST:PORT] [--token TOKEN] <command>\n\
+         \n\
+         commands:\n\
+           ping              check daemon liveness\n\
+           version           daemon version/arch\n\
+           ps                list processes\n\
+           attach <pid>      attach to a process (M1)\n"
+    );
+}

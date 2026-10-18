@@ -1,0 +1,13 @@
+[package]
+name = "ca-js"
+description = "QuickJS runtime and Frida-compatible script API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ca-core.workspace = true
+ca-gum.workspace = true
+rquickjs.workspace = true
+thiserror.workspace = true

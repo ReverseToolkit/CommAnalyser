@@ -1,0 +1,11 @@
+[package]
+name = "ca-core"
+description = "CommAnalyser core: process, memory maps, modules, ranges"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true

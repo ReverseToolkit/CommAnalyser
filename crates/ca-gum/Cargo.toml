@@ -1,0 +1,13 @@
+[package]
+name = "ca-gum"
+description = "Frida-style process/memory/interceptor primitives for CommAnalyser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ca-core.workspace = true
+ca-arch-arm64.workspace = true
+libc.workspace = true
+thiserror.workspace = true

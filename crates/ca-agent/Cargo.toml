@@ -1,0 +1,15 @@
+[package]
+name = "ca-agent"
+description = "In-process agent payload for CommAnalyser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ca_agent"
+crate-type = ["cdylib"]
+
+[dependencies]
+ca-core.workspace = true
+libc.workspace = true
