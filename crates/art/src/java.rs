@@ -120,6 +120,7 @@ pub struct CtorInfo {
 
 pub struct ClassInfo {
     pub name: String,
+    pub super_name: Option<String>,
     pub methods: Vec<MethodInfo>,
     pub ctors: Vec<CtorInfo>,
     pub fields: Vec<FieldInfo>,
@@ -266,6 +267,32 @@ impl JavaClass {
                 // field.
                 unsafe { env.set_static_field_unchecked(&self.class, id, value) }
             })
+        })
+    }
+
+    pub fn call_super(
+        &self,
+        object: &JavaObject,
+        method: &MethodInfo,
+        args: &[JavaArg],
+    ) -> Result<JavaValue> {
+        let MethodId::Instance(id) = method.id else {
+            return Err(Error::Parse("super method is not instance".into()));
+        };
+        let vm = JavaVm::get()?;
+        vm.with_env(|env| {
+            let (raw, _strings) = marshal(env, &method.params, args)?;
+            // SAFETY: nonvirtual call with the declaring super class.
+            let value = unsafe {
+                env.call_nonvirtual_method_unchecked(
+                    &object.object,
+                    &self.class,
+                    id,
+                    return_type(&method.ret),
+                    &raw,
+                )?
+            };
+            convert(env, &method.ret, value)
         })
     }
 
@@ -547,6 +574,24 @@ fn app_class_loader<'a>(env: &mut Env<'a>) -> jni::errors::Result<JObject<'a>> {
     .l()
 }
 
+fn superclass_name(env: &mut Env<'_>, class: &JClass<'_>) -> jni::errors::Result<Option<String>> {
+    let Some(super_class) = env.get_superclass(class)? else {
+        return Ok(None);
+    };
+    let method_name = JNIString::from("getName");
+    let signature = RuntimeMethodSignature::from_str("()Ljava/lang/String;")?;
+    let name = env.call_method(
+        &super_class,
+        &*method_name,
+        signature.method_signature(),
+        &[],
+    )?;
+    let object = name.l()?;
+    // SAFETY: getName is declared to return java.lang.String.
+    let string = unsafe { JString::from_raw(env, object.as_raw()) };
+    Ok(Some(jstring_to_string(env, &string)?))
+}
+
 fn reflect(
     env: &mut Env<'_>,
     class: &JClass<'_>,
@@ -661,6 +706,7 @@ fn reflect(
 
     Ok(ClassInfo {
         name,
+        super_name: superclass_name(env, class)?,
         methods,
         ctors,
         fields,

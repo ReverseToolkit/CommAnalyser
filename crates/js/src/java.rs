@@ -332,6 +332,29 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
         )?;
         wrapper.set(name, function)?;
     }
+    if let Some(super_name) = class.info.super_name.clone() {
+        if let Ok(super_class) = JavaClass::find(&super_name) {
+            let super_wrapper = Object::new(ctx.clone())?;
+            super_wrapper.set(HANDLE, id)?;
+            super_wrapper.set("$className", super_class.info.name.clone())?;
+            for (name, methods) in method_groups(&super_class.info) {
+                if methods[0].is_static {
+                    continue;
+                }
+                let function = method_function(
+                    ctx.clone(),
+                    super_class.clone(),
+                    Target::Super {
+                        object: object.clone(),
+                        class: super_class.clone(),
+                    },
+                    methods,
+                )?;
+                super_wrapper.set(name, function)?;
+            }
+            wrapper.set("$super", super_wrapper)?;
+        }
+    }
     for field in class
         .info
         .fields
@@ -422,6 +445,10 @@ fn method_groups(info: &ClassInfo) -> BTreeMap<String, Vec<MethodInfo>> {
 enum Target {
     Static,
     Instance(Rc<JavaObject>),
+    Super {
+        object: Rc<JavaObject>,
+        class: Rc<JavaClass>,
+    },
     Prototype,
 }
 
@@ -445,6 +472,7 @@ fn method_function<'js>(
             let value = match &target {
                 Target::Static => call_class.call_static(method, &java_args),
                 Target::Instance(object) => object.call(method, &java_args),
+                Target::Super { object, class } => class.call_super(object, method, &java_args),
                 Target::Prototype => {
                     return Err(js_error(
                         "instance method called on the class object; call it on an instance",
