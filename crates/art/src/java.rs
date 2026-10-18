@@ -143,7 +143,7 @@ impl JavaObject {
 
     pub fn is_same_object(&self, other: &JavaObject) -> Result<bool> {
         let vm = JavaVm::get()?;
-        vm.with_env(|env| Ok(env.is_same_object(&self.object, &other.object)?))
+        vm.with_env(|env| env.is_same_object(&self.object, &other.object))
     }
 
     pub fn recast(&self, info: Rc<ClassInfo>) -> Result<JavaObject> {
