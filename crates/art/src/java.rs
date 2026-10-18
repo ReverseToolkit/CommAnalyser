@@ -8,7 +8,7 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use jni::ids::{JMethodID, JStaticMethodID};
+use jni::ids::{JFieldID, JMethodID, JStaticFieldID, JStaticMethodID};
 use jni::objects::{Global, JClass, JObject, JObjectArray, JString};
 use jni::refs::Reference as _;
 use jni::signature::{JavaType, Primitive, RuntimeMethodSignature};
@@ -90,6 +90,21 @@ pub struct MethodInfo {
     pub ret: Kind,
 }
 
+#[derive(Clone, Copy)]
+pub enum FieldId {
+    Instance(JFieldID),
+    Static(JStaticFieldID),
+}
+
+#[derive(Clone)]
+pub struct FieldInfo {
+    pub name: String,
+    pub id: FieldId,
+    pub kind: Kind,
+    pub is_static: bool,
+    pub is_public: bool,
+}
+
 #[derive(Clone)]
 pub struct CtorInfo {
     pub id: JMethodID,
@@ -102,6 +117,7 @@ pub struct ClassInfo {
     pub name: String,
     pub methods: Vec<MethodInfo>,
     pub ctors: Vec<CtorInfo>,
+    pub fields: Vec<FieldInfo>,
 }
 
 pub struct JavaClass {
@@ -185,6 +201,23 @@ impl JavaClass {
                 info: self.info.clone(),
                 object: global,
             })
+        })
+    }
+
+    pub fn get_static_field(&self, field: &FieldInfo) -> Result<JavaValue> {
+        let vm = JavaVm::get()?;
+        vm.with_env(|env| {
+            let FieldId::Static(id) = field.id else {
+                return Err(jni::errors::Error::JniCall(
+                    jni::errors::JniError::InvalidArguments,
+                ));
+            };
+            // SAFETY: the field id came from this class and the return type
+            // matches the reflected field type.
+            let value = unsafe {
+                env.get_static_field_unchecked(&self.class, id, return_type(&field.kind))?
+            };
+            convert(env, &field.kind, value)
         })
     }
 
@@ -463,10 +496,46 @@ fn reflect(
         });
     }
 
+    let mut fields = Vec::new();
+    let fields_array = object_call(
+        env,
+        class,
+        "getDeclaredFields",
+        "()[Ljava/lang/reflect/Field;",
+    )?;
+    for field in array_elements(env, &fields_array)? {
+        let field_name = string_call(env, &field, "getName")?.unwrap_or_default();
+        let type_obj = object_call(env, &field, "getType", "()Ljava/lang/Class;")?;
+        let kind = class_kind(env, &type_obj)?;
+        let modifiers = int_call(env, &field, "getModifiers")?;
+        let is_static = modifiers & 0x0008 != 0;
+        let is_public = modifiers & 0x0001 != 0;
+        let signature = descriptor(&kind);
+        let name_c = JNIString::new(&field_name);
+        let signature_c = jni::signature::RuntimeFieldSignature::from_str(&signature)?;
+        let id = if is_static {
+            FieldId::Static(env.get_static_field_id(
+                class,
+                &*name_c,
+                signature_c.field_signature(),
+            )?)
+        } else {
+            FieldId::Instance(env.get_field_id(class, &*name_c, signature_c.field_signature())?)
+        };
+        fields.push(FieldInfo {
+            name: field_name,
+            id,
+            kind,
+            is_static,
+            is_public,
+        });
+    }
+
     Ok(ClassInfo {
         name,
         methods,
         ctors,
+        fields,
     })
 }
 

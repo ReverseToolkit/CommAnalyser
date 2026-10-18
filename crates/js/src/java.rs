@@ -13,7 +13,9 @@ use rquickjs::prelude::Func;
 use rquickjs::{Array, Ctx, Function, IntoJs, Object, Persistent, Result as JsResult, Value};
 
 use crate::worker::{java_dispatch, JavaHookEntry, JavaHookTable};
-use art::java::{ClassInfo, CtorInfo, JavaArg, JavaClass, JavaObject, JavaValue, Kind, MethodInfo};
+use art::java::{
+    ClassInfo, CtorInfo, FieldInfo, JavaArg, JavaClass, JavaObject, JavaValue, Kind, MethodInfo,
+};
 
 thread_local! {
     static OBJECTS: RefCell<Vec<Rc<JavaObject>>> = const { RefCell::new(Vec::new()) };
@@ -88,6 +90,14 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
         globalThis.__analyser_call_impl = function (fn, thisObj, args) {
             return fn.apply(thisObj, args);
         };
+        globalThis.__analyser_make_java_field = function (getter) {
+            const field = {};
+            Object.defineProperty(field, 'value', {
+                enumerable: true,
+                get: getter
+            });
+            return field;
+        };
         globalThis.__analyser_make_java_method = function (fn, className, methodName, signature, isStatic) {
             Object.defineProperty(fn, 'implementation', {
                 configurable: true,
@@ -154,6 +164,17 @@ fn class_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>) -> JsResult<Object<'js
         let function = method_function(ctx.clone(), class.clone(), target, methods)?;
         wrapper.set(name, function)?;
     }
+    for field in class
+        .info
+        .fields
+        .iter()
+        .filter(|field| field.is_static && field.is_public)
+    {
+        wrapper.set(
+            field.name.clone(),
+            field_object(ctx.clone(), class.clone(), field.clone())?,
+        )?;
+    }
     Ok(wrapper)
 }
 
@@ -176,6 +197,21 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
         wrapper.set(name, function)?;
     }
     Ok(wrapper)
+}
+
+fn field_object<'js>(
+    ctx: Ctx<'js>,
+    class: Rc<JavaClass>,
+    field: FieldInfo,
+) -> JsResult<Object<'js>> {
+    let call_ctx = ctx.clone();
+    let call_class = class.clone();
+    let getter = Function::new(ctx.clone(), move || -> JsResult<Value<'js>> {
+        let value = call_class.get_static_field(&field).map_err(to_js_error)?;
+        value_to_js(call_ctx.clone(), call_class.clone(), value)
+    })?;
+    let wrap: Function<'js> = ctx.globals().get("__analyser_make_java_field")?;
+    wrap.call((getter,))
 }
 
 fn method_groups(info: &ClassInfo) -> BTreeMap<String, Vec<MethodInfo>> {

@@ -83,6 +83,9 @@ cargo build --target aarch64-linux-android -p agent -p daemon -p cli
   preserving the JS-selected constructor; constructors now use the
   high-level signature-based `NewObject`.
   Details: [`docs/15-m3g.md`](docs/15-m3g.md).
+- **M3h (partial)**: `Java.use(...).FIELD.value` for public static fields
+  (`Integer.MAX_VALUE`, `Build.MODEL`).
+  Details: [`docs/16-m3h.md`](docs/16-m3h.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 
