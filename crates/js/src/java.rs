@@ -21,6 +21,7 @@ use art::java::{
 
 thread_local! {
     static OBJECTS: RefCell<Vec<Rc<JavaObject>>> = const { RefCell::new(Vec::new()) };
+    static THROWABLE_CLASS: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 const HANDLE: &str = "__analyserJavaId";
