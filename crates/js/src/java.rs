@@ -772,16 +772,45 @@ fn original_args(
 }
 
 fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsResult<Value<'js>> {
-    if type_name != "int" {
-        return Err(js_error("Java.array currently supports only 'int'"));
-    }
-    let mut ints = Vec::with_capacity(values.len());
-    for index in 0..values.len() {
-        let value: Value<'js> = values.get(index)?;
-        ints.push(value.get::<i32>()?);
-    }
-    let object = art::java::new_int_array(&ints).map_err(to_js_error)?;
-    let class = JavaClass::find("[I").map_err(to_js_error)?;
+    let (object, descriptor) = if type_name == "java.lang.String" {
+        let mut strings = Vec::with_capacity(values.len());
+        for index in 0..values.len() {
+            let value: Value<'js> = values.get(index)?;
+            strings.push(value.get::<String>()?);
+        }
+        (
+            art::java::new_string_array(&strings).map_err(to_js_error)?,
+            "[Ljava/lang/String;",
+        )
+    } else {
+        let mut numbers = Vec::with_capacity(values.len());
+        for index in 0..values.len() {
+            let value: Value<'js> = values.get(index)?;
+            numbers.push(if type_name == "boolean" {
+                if value.get::<bool>()? {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                value.get::<f64>()?
+            });
+        }
+        let object = art::java::new_primitive_array(&type_name, &numbers).map_err(to_js_error)?;
+        let descriptor = match type_name.as_str() {
+            "int" => "[I",
+            "byte" => "[B",
+            "char" => "[C",
+            "short" => "[S",
+            "long" => "[J",
+            "float" => "[F",
+            "double" => "[D",
+            "boolean" => "[Z",
+            _ => return Err(js_error("unsupported Java.array type")),
+        };
+        (object, descriptor)
+    };
+    let class = JavaClass::find(descriptor).map_err(to_js_error)?;
     let id = register(object);
     Ok(instance_object(ctx, class, id)?.into_value())
 }

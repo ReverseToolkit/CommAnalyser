@@ -1277,3 +1277,49 @@ pub fn cast_global_handle(info: Rc<ClassInfo>, handle: usize) -> Result<JavaObje
         Ok(JavaObject::from_global(info, global))
     })
 }
+
+/// Create a primitive array from `f64` values, narrowing per `kind`.
+pub fn new_primitive_array(kind: &str, values: &[f64]) -> Result<JavaObject> {
+    macro_rules! build {
+        ($desc:literal, $new:ident, $ty:ty, $convert:expr) => {{
+            let class = JavaClass::find($desc)?;
+            let converted: Vec<$ty> = values.iter().map($convert).collect();
+            let vm = JavaVm::get()?;
+            vm.with_env(|env| {
+                let array = env.$new(converted.len())?;
+                array.set_region(env, 0, &converted)?;
+                let object: &JObject<'_> = array.as_ref();
+                let global = env.new_global_ref(object)?;
+                Ok(JavaObject::from_global(class.info.clone(), global))
+            })
+        }};
+    }
+    match kind {
+        "int" => build!("[I", new_int_array, i32, |value| *value as i32),
+        "byte" => build!("[B", new_byte_array, i8, |value| *value as i8),
+        "char" => build!("[C", new_char_array, u16, |value| *value as u16),
+        "short" => build!("[S", new_short_array, i16, |value| *value as i16),
+        "long" => build!("[J", new_long_array, i64, |value| *value as i64),
+        "float" => build!("[F", new_float_array, f32, |value| *value as f32),
+        "double" => build!("[D", new_double_array, f64, |value| *value),
+        "boolean" => build!("[Z", new_boolean_array, bool, |value| *value != 0.0),
+        _ => Err(Error::Parse(format!("Java.array type {kind}"))),
+    }
+}
+
+pub fn new_string_array(values: &[String]) -> Result<JavaObject> {
+    let class = JavaClass::find("[Ljava/lang/String;")?;
+    let len = i32::try_from(values.len()).map_err(|_| Error::Parse("String[] too large".into()))?;
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        let element_class = jni::strings::JNIString::from("java/lang/String");
+        let array = env.new_object_array(len, element_class, JObject::null())?;
+        for (index, value) in values.iter().enumerate() {
+            let string = env.new_string(value)?;
+            array.set_element(env, index, &string)?;
+        }
+        let object: &JObject<'_> = array.as_ref();
+        let global = env.new_global_ref(object)?;
+        Ok(JavaObject::from_global(class.info.clone(), global))
+    })
+}
