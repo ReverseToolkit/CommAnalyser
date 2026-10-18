@@ -1517,3 +1517,26 @@ pub fn jni_new_global(env: usize, handle: usize) -> Result<usize> {
     }
     Ok(global as usize)
 }
+
+/// Create an object array `[L<class>;` from existing JavaObject handles.
+pub fn new_object_array_from_objects(
+    class_name: &str,
+    values: &[Rc<JavaObject>],
+) -> Result<JavaObject> {
+    let element_name = class_name.replace('.', "/");
+    let array_descriptor = format!("[L{element_name};");
+    let array_class = JavaClass::find(&array_descriptor)?;
+    let len =
+        i32::try_from(values.len()).map_err(|_| Error::Parse("object array too large".into()))?;
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        let element_class = jni::strings::JNIString::from(element_name.as_str());
+        let array = env.new_object_array(len, element_class, JObject::null())?;
+        for (index, value) in values.iter().enumerate() {
+            array.set_element(env, index, &value.object)?;
+        }
+        let object: &JObject<'_> = array.as_ref();
+        let global = env.new_global_ref(object)?;
+        Ok(JavaObject::from_global(array_class.info.clone(), global))
+    })
+}

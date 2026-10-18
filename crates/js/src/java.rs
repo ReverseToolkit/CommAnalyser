@@ -232,6 +232,8 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
     java.set("use", Func::from(use_class))?;
     java.set("array", Func::from(make_array))?;
     java.set("cast", Func::from(cast))?;
+    java.set("retain", Func::from(retain))?;
+    java.set("release", Func::from(release))?;
     ctx.globals().set("Java", java)?;
     Ok(())
 }
@@ -868,6 +870,12 @@ fn original_args(
         .collect()
 }
 
+fn retain<'js>(_ctx: Ctx<'js>, value: Value<'js>) -> JsResult<Value<'js>> {
+    Ok(value)
+}
+
+fn release(_value: Value<'_>) {}
+
 fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsResult<Value<'js>> {
     let (object, descriptor) = if type_name == "java.lang.String" {
         let mut strings = Vec::with_capacity(values.len());
@@ -878,6 +886,22 @@ fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsRe
         (
             art::java::new_string_array(&strings).map_err(to_js_error)?,
             "[Ljava/lang/String;",
+        )
+    } else if !matches!(
+        type_name.as_str(),
+        "int" | "byte" | "char" | "short" | "long" | "float" | "double" | "boolean"
+    ) {
+        let mut objects = Vec::with_capacity(values.len());
+        for index in 0..values.len() {
+            let value: Value<'js> = values.get(index)?;
+            let id = java_id(&value).ok_or_else(|| js_error("Java.array expects Java objects"))?;
+            objects.push(get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?);
+        }
+        let descriptor = format!("[L{};", type_name.replace('.', "/"));
+        (
+            art::java::new_object_array_from_objects(&type_name, &objects).map_err(to_js_error)?,
+            // Keep descriptor owned until after wrapping.
+            Box::leak(descriptor.into_boxed_str()) as &'static str,
         )
     } else {
         let mut numbers = Vec::with_capacity(values.len());
