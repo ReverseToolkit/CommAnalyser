@@ -142,10 +142,14 @@ fn run(name: &str) -> std::io::Result<()> {
                 Ok(value) => json!({"ok": true, "value": format!("{value:#x}")}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
-            "java_last_exception" => json!({
-                "ok": true,
-                "value": art::java::last_exception(),
-            }),
+            "java_ctor_helper" => match art::java::helper_ctor() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_ctor_highlevel" => match art::java::high_level_ctor() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
             "java_ctors" => match art::java::ctor_list() {
                 Ok(text) => serde_json::from_str::<Value>(&text)
                     .unwrap_or_else(|_| json!({"ok": true, "raw": text})),

@@ -79,6 +79,10 @@ cargo build --target aarch64-linux-android -p agent -p daemon -p cli
 - **M3f (done)**: `Java.use` falls back to the app `ClassLoader`, so Settings
   and settingslib classes load from the APK.
   Details: [`docs/14-m3f.md`](docs/14-m3f.md).
+- **M3g (done)**: fixed `$new("...")` for StringBuilder/StringBuffer by
+  preserving the JS-selected constructor; constructors now use the
+  high-level signature-based `NewObject`.
+  Details: [`docs/15-m3g.md`](docs/15-m3g.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 

@@ -136,7 +136,9 @@ fn class_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>) -> JsResult<Object<'js
             move |args: Rest<Value<'js>>| -> JsResult<Value<'js>> {
                 let ctor = choose_ctor(&ctor_class, &args.0)?;
                 let java_args = convert_args(&args.0, &ctor.params)?;
-                let object = ctor_class.new_object(&java_args).map_err(to_js_error)?;
+                let object = ctor_class
+                    .new_object_with(ctor, &java_args)
+                    .map_err(to_js_error)?;
                 let id = register(object);
                 Ok(instance_object(ctor_ctx.clone(), ctor_class.clone(), id)?.into_value())
             },
@@ -445,4 +447,23 @@ fn to_js_error(error: runtime::Error) -> rquickjs::Error {
 
 fn js_error(message: impl Into<String>) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("comm-analyser", "java", message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rquickjs::{Context, Runtime};
+
+    #[test]
+    fn js_string_matches_java_string() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let value: Value = "abc".into_js(&ctx).unwrap();
+            assert!(matches_kind(
+                &Kind::Object("java.lang.String".into()),
+                &value
+            ));
+        });
+    }
 }

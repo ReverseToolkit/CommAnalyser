@@ -4,7 +4,6 @@
 //! constructors, keeps global references, and marshals the common
 //! int/long/boolean/String/object signatures.  Hooking lives in `lib.rs`.
 
-use std::cell::RefCell;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -19,14 +18,6 @@ use jni::JValue;
 use jni::{Env, JavaVM};
 
 use runtime::{Error, Result};
-
-thread_local! {
-    static LAST_EXCEPTION: RefCell<String> = const { RefCell::new(String::new()) };
-}
-
-pub fn last_exception() -> String {
-    LAST_EXCEPTION.with(|slot| slot.borrow().clone())
-}
 
 type GetCreatedJavaVms = unsafe extern "C" fn(*mut *mut RawJavaVM, jsize, *mut jsize) -> jint;
 
@@ -166,27 +157,29 @@ impl JavaClass {
     }
 
     pub fn new_object(&self, args: &[JavaArg]) -> Result<JavaObject> {
+        let ctor = self
+            .info
+            .ctors
+            .iter()
+            .find(|ctor| ctor.params.len() == args.len())
+            .ok_or_else(|| Error::NotFound("matching Java constructor".into()))?;
+        self.new_object_with(ctor, args)
+    }
+
+    /// Construct using an already-selected constructor.  The JS `$new`
+    /// overload selection must be preserved; re-selecting by arity alone picks
+    /// `(I)V` for `StringBuilder("abc")`.
+    pub fn new_object_with(&self, ctor: &CtorInfo, args: &[JavaArg]) -> Result<JavaObject> {
         let vm = JavaVm::get()?;
         vm.with_env(|env| {
-            let ctor = self
-                .info
-                .ctors
-                .iter()
-                .find(|ctor| ctor.params.len() == args.len())
-                .ok_or(jni::errors::Error::JniCall(
-                    jni::errors::JniError::InvalidArguments,
-                ))?;
-            let (raw, _strings) = marshal(env, &ctor.params, args)?;
-            // SAFETY: the constructor ID and the argument kinds were obtained
-            // from the same class and match the supplied values.
-            let object = match unsafe { env.new_object_unchecked(&self.class, ctor.id, &raw) } {
-                Ok(object) => object,
-                Err(error) => {
-                    let message = exception_text(env);
-                    LAST_EXCEPTION.with(|slot| *slot.borrow_mut() = message);
-                    return Err(error);
-                }
-            };
+            let signature = RuntimeMethodSignature::from_str(&ctor.signature)?;
+            let object = new_object_with_values(
+                env,
+                &self.class,
+                signature.method_signature(),
+                &ctor.params,
+                args,
+            )?;
             let global = env.new_global_ref(&object)?;
             Ok(JavaObject {
                 info: self.info.clone(),
@@ -242,27 +235,77 @@ impl JavaObject {
     }
 }
 
-fn exception_text(env: &mut Env<'_>) -> String {
-    let Some(throwable) = env.exception_occurred() else {
-        return "no pending Java exception".to_owned();
-    };
-    let signature = match RuntimeMethodSignature::from_str("()Ljava/lang/String;") {
-        Ok(signature) => signature,
-        Err(_) => return "pending Java exception".to_owned(),
-    };
-    let name = JNIString::new("toString");
-    let Ok(value) = env.call_method(&throwable, &*name, signature.method_signature(), &[]) else {
-        return "pending Java exception".to_owned();
-    };
-    let Ok(object) = value.l() else {
-        return "pending Java exception".to_owned();
-    };
-    if object.is_null() {
-        return "pending Java exception".to_owned();
+enum ArgSlot {
+    Boolean(bool),
+    Byte(i8),
+    Char(u16),
+    Short(i16),
+    Int(i32),
+    Long(i64),
+    Object(usize),
+}
+
+fn new_object_with_values<'a>(
+    env: &mut Env<'a>,
+    class: &JClass<'a>,
+    signature: jni::signature::MethodSignature<'_, '_>,
+    params: &[Kind],
+    args: &[JavaArg],
+) -> jni::errors::Result<JObject<'a>> {
+    if params.len() != args.len() {
+        return Err(jni::errors::Error::JniCall(
+            jni::errors::JniError::InvalidArguments,
+        ));
     }
-    // SAFETY: Throwable.toString() returns java.lang.String.
-    let string = unsafe { JString::from_raw(env, object.as_raw()) };
-    jstring_to_string(env, &string).unwrap_or_else(|_| "pending Java exception".to_owned())
+    let mut objects: Vec<JObject<'a>> = Vec::new();
+    let mut slots = Vec::with_capacity(args.len());
+    for (kind, arg) in params.iter().zip(args) {
+        let slot = match (kind, arg) {
+            (Kind::Boolean, JavaArg::Boolean(value)) => ArgSlot::Boolean(*value),
+            (Kind::Byte, JavaArg::Int(value)) => ArgSlot::Byte(*value as i8),
+            (Kind::Char, JavaArg::Int(value)) => ArgSlot::Char(*value as u16),
+            (Kind::Short, JavaArg::Int(value)) => ArgSlot::Short(*value as i16),
+            (Kind::Int, JavaArg::Int(value)) => ArgSlot::Int(*value),
+            (Kind::Long, JavaArg::Long(value)) => ArgSlot::Long(*value),
+            (Kind::Object(_), JavaArg::String(value)) => {
+                let string = env.new_string(value)?;
+                objects.push(JObject::from(string));
+                ArgSlot::Object(objects.len() - 1)
+            }
+            (Kind::Object(_), JavaArg::Object(object)) => {
+                // SAFETY: the global reference is valid for this call.
+                let local = unsafe { JObject::from_raw(env, object.as_obj().as_raw()) };
+                objects.push(local);
+                ArgSlot::Object(objects.len() - 1)
+            }
+            (Kind::Object(_), JavaArg::Null) => {
+                // SAFETY: a null object reference is valid for a reference
+                // parameter.
+                let local = unsafe { JObject::from_raw(env, ptr::null_mut()) };
+                objects.push(local);
+                ArgSlot::Object(objects.len() - 1)
+            }
+            _ => {
+                return Err(jni::errors::Error::JniCall(
+                    jni::errors::JniError::InvalidArguments,
+                ))
+            }
+        };
+        slots.push(slot);
+    }
+    let values: Vec<JValue<'_>> = slots
+        .iter()
+        .map(|slot| match slot {
+            ArgSlot::Boolean(value) => JValue::Bool(*value),
+            ArgSlot::Byte(value) => JValue::Byte(*value),
+            ArgSlot::Char(value) => JValue::Char(*value),
+            ArgSlot::Short(value) => JValue::Short(*value),
+            ArgSlot::Int(value) => JValue::Int(*value),
+            ArgSlot::Long(value) => JValue::Long(*value),
+            ArgSlot::Object(index) => JValue::Object(&objects[*index]),
+        })
+        .collect();
+    env.new_object(class, signature, &values)
 }
 
 fn created_java_vm() -> Result<*mut RawJavaVM> {
@@ -772,4 +815,42 @@ pub fn ctor_list() -> Result<String> {
         })
         .collect();
     Ok(serde_json::json!({"ok": true, "ctors": ctors}).to_string())
+}
+
+/// Diagnostic: construct StringBuilder("abc") through the high-level
+/// `Env::new_object` path (which re-resolves the constructor by signature).
+pub fn high_level_ctor() -> Result<String> {
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        let class = env.find_class(&*JNIString::new("java/lang/StringBuilder"))?;
+        let text = env.new_string("abc")?;
+        let text = JObject::from(text);
+        let sig = RuntimeMethodSignature::from_str("(Ljava/lang/String;)V")?;
+        let object = env.new_object(&class, sig.method_signature(), &[JValue::Object(&text)])?;
+        let method_name = JNIString::new("length");
+        let method_sig = RuntimeMethodSignature::from_str("()I")?;
+        let length = env
+            .call_method(&object, &*method_name, method_sig.method_signature(), &[])?
+            .i()?;
+        Ok(format!("ok length={length}"))
+    })
+}
+
+/// Diagnostic: call the same helper used by `new_object` with an explicit
+/// `(String)V` constructor.
+pub fn helper_ctor() -> Result<String> {
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        let class = env.find_class(&*JNIString::new("java/lang/StringBuilder"))?;
+        let sig = RuntimeMethodSignature::from_str("(Ljava/lang/String;)V")?;
+        let params = [Kind::Object("java.lang.String".to_owned())];
+        let args = [JavaArg::String("abc".to_owned())];
+        let object = new_object_with_values(env, &class, sig.method_signature(), &params, &args)?;
+        let name = JNIString::new("length");
+        let len_sig = RuntimeMethodSignature::from_str("()I")?;
+        let length = env
+            .call_method(&object, &*name, len_sig.method_signature(), &[])?
+            .i()?;
+        Ok(format!("ok length={length}"))
+    })
 }
