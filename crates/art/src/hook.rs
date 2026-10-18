@@ -18,10 +18,21 @@ const ENTRYPOINT_OFFSET: usize = 24;
 pub struct JavaHook {
     art_method: usize,
     original: usize,
+    stub: usize,
     active: bool,
 }
 
 impl JavaHook {
+    /// Temporarily route calls back to the original entrypoint.
+    pub fn suspend(&self) {
+        write_pointer(self.art_method + ENTRYPOINT_OFFSET, self.original);
+    }
+
+    /// Reinstall the hook stub after an original() call.
+    pub fn resume(&self) {
+        write_pointer(self.art_method + ENTRYPOINT_OFFSET, self.stub);
+    }
+
     pub fn detach(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
@@ -53,6 +64,7 @@ pub fn install(method: MethodId, dispatcher: usize, id: usize) -> Result<JavaHoo
     Ok(JavaHook {
         art_method,
         original,
+        stub,
         active: true,
     })
 }

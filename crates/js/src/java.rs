@@ -79,7 +79,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                     function: Persistent::save(&ctx, callback),
                     class,
                     method,
-                    _hook: hook,
+                    hook: Rc::new(RefCell::new(hook)),
                 }));
                 Ok(())
             },
@@ -482,6 +482,7 @@ pub(crate) fn invoke_impl<'js>(
     method: &MethodInfo,
     args: [u64; 8],
     this_global: bool,
+    hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
 ) -> JsResult<u64> {
     let start = if method.is_static { 1 } else { 2 };
     let this_value: Value<'js> = if method.is_static {
@@ -495,6 +496,13 @@ pub(crate) fn invoke_impl<'js>(
         .map_err(to_js_error)?;
         let id = register(object);
         let this = instance_object(ctx.clone(), class.clone(), id)?;
+        if let Some(hook) = hook {
+            let method_function: Function<'js> = this.get(method.name.clone())?;
+            method_function.set(
+                "original",
+                original_function(ctx.clone(), class.clone(), method.clone(), hook, args)?,
+            )?;
+        }
         this.into_value()
     };
 
@@ -535,6 +543,48 @@ pub(crate) fn invoke_impl<'js>(
             Err(js_error("unsupported Java hook return type"))
         }
     }
+}
+
+fn original_function<'js>(
+    ctx: Ctx<'js>,
+    class: Rc<JavaClass>,
+    method: MethodInfo,
+    hook: Rc<RefCell<art::hook::JavaHook>>,
+    raw: [u64; 8],
+) -> JsResult<Function<'js>> {
+    let call_ctx = ctx.clone();
+    Function::new(ctx, move || -> JsResult<Value<'js>> {
+        let object = art::java::object_from_global_handle(class.info.clone(), raw[1] as usize)
+            .map_err(to_js_error)?;
+        let args = original_args(&method, &raw);
+        hook.borrow().suspend();
+        let result = object.call(&method, &args);
+        hook.borrow().resume();
+        value_to_js(
+            call_ctx.clone(),
+            class.clone(),
+            result.map_err(to_js_error)?,
+        )
+    })
+}
+
+fn original_args(method: &MethodInfo, raw: &[u64; 8]) -> Vec<JavaArg> {
+    let start = if method.is_static { 1 } else { 2 };
+    method
+        .params
+        .iter()
+        .enumerate()
+        .map(|(slot, kind)| match kind {
+            Kind::Boolean => JavaArg::Boolean(raw[start + slot] != 0),
+            Kind::Byte | Kind::Char | Kind::Short | Kind::Int => {
+                JavaArg::Int(raw[start + slot] as i32)
+            }
+            Kind::Long => JavaArg::Long(raw[start + slot] as i64),
+            Kind::Object(_) | Kind::Array(_) | Kind::Float | Kind::Double | Kind::Void => {
+                JavaArg::Null
+            }
+        })
+        .collect()
 }
 
 fn value_to_js<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, value: JavaValue) -> JsResult<Value<'js>> {

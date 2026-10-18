@@ -195,7 +195,13 @@ impl ScriptRuntime {
         })
     }
 
-    pub(crate) fn run_java_impl(&self, id: usize, args: [u64; 8], this_global: bool) -> u64 {
+    pub(crate) fn run_java_impl(
+        &self,
+        id: usize,
+        args: [u64; 8],
+        this_global: bool,
+        hook: Option<std::rc::Rc<std::cell::RefCell<art::hook::JavaHook>>>,
+    ) -> u64 {
         let entry = self
             .java_hooks
             .borrow()
@@ -216,7 +222,8 @@ impl ScriptRuntime {
             let Ok(function) = function.restore(&ctx) else {
                 return 0;
             };
-            crate::java::invoke_impl(&ctx, function, class, &method, args, this_global).unwrap_or(0)
+            crate::java::invoke_impl(&ctx, function, class, &method, args, this_global, hook)
+                .unwrap_or(0)
         })
     }
 

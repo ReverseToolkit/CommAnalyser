@@ -59,7 +59,7 @@ pub(crate) struct JavaHookEntry {
     pub(crate) class: Rc<JavaClass>,
     pub(crate) method: MethodInfo,
     // Held so the entrypoint is restored when the table is dropped.
-    pub(crate) _hook: JavaHook,
+    pub(crate) hook: Rc<RefCell<JavaHook>>,
 }
 
 #[derive(Default)]
@@ -177,14 +177,19 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
     let hooks = Rc::new(RefCell::new(HookTable::default()));
     let callbacks = Rc::new(RefCell::new(CallbackTable::default()));
     let java_hooks = Rc::new(RefCell::new(JavaHookTable::default()));
-    let runtime =
-        match ScriptRuntime::new_with_hooks(tx, hooks.clone(), callbacks, java_hooks, event_tx) {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                eprintln!("[js] failed to create runtime: {err}");
-                return;
-            }
-        };
+    let runtime = match ScriptRuntime::new_with_hooks(
+        tx,
+        hooks.clone(),
+        callbacks,
+        java_hooks.clone(),
+        event_tx,
+    ) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("[js] failed to create runtime: {err}");
+            return;
+        }
+    };
 
     while let Ok(job) = rx.recv() {
         match job {
@@ -219,7 +224,12 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
                 this_global,
                 reply,
             } => {
-                let _ = reply.send(runtime.run_java_impl(id, args, this_global));
+                let hook = java_hooks
+                    .borrow()
+                    .entries
+                    .get(id)
+                    .and_then(|entry| entry.as_ref().map(|entry| entry.hook.clone()));
+                let _ = reply.send(runtime.run_java_impl(id, args, this_global, hook));
             }
             Job::Shutdown => break,
         }
