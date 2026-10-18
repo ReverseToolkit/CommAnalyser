@@ -614,26 +614,18 @@ fn choose_ctor<'a>(class: &'a JavaClass, args: &[Value<'_>]) -> JsResult<&'a Cto
         .info
         .ctors
         .iter()
-        .find(|ctor| {
-            ctor.is_public
-                && ctor.params.len() == args.len()
-                && ctor
-                    .params
-                    .iter()
-                    .zip(args)
-                    .all(|(kind, value)| strong_match(kind, value))
+        .filter(|ctor| ctor.is_public && ctor.params.len() == args.len())
+        .filter_map(|ctor| {
+            let score: i32 = ctor
+                .params
+                .iter()
+                .zip(args)
+                .map(|(kind, value)| match_score(kind, value))
+                .try_fold(0, |total, score| score.map(|score| total + score))?;
+            Some((score, ctor))
         })
-        .or_else(|| {
-            class.info.ctors.iter().find(|ctor| {
-                ctor.is_public
-                    && ctor.params.len() == args.len()
-                    && ctor
-                        .params
-                        .iter()
-                        .zip(args)
-                        .all(|(kind, value)| matches_kind(kind, value))
-            })
-        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, ctor)| ctor)
         .or_else(|| {
             class
                 .info
@@ -651,13 +643,7 @@ fn choose_ctor<'a>(class: &'a JavaClass, args: &[Value<'_>]) -> JsResult<&'a Cto
         .ok_or_else(|| js_error("no matching Java constructor"))
 }
 
-fn strong_match(kind: &Kind, value: &Value<'_>) -> bool {
-    if value.is_string() {
-        return matches!(kind, Kind::Object(name) if name == "java.lang.String");
-    }
-    matches_kind(kind, value)
-}
-
+#[cfg(test)]
 fn matches_kind(kind: &Kind, value: &Value<'_>) -> bool {
     match kind {
         Kind::Boolean => value.is_bool(),
