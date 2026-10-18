@@ -32,6 +32,22 @@ export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
 cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
 ```
 
+## M0 status (2026-10-18)
+
+- Workspace builds on host; `cargo test --workspace` passes 37 tests.
+- Android cross-compile works for `ca-agent` (cdylib), `ca-daemon`, `ca-cli`
+  with NDK 29.0.14206865 / `aarch64-linux-android24`.
+- Device validation on `282eb4e4` (Android 15, arm64): pushed `ca-daemon`,
+  started it on `127.0.0.1:17321`, then ran
+  `ca ping` / `ca version` / `ca ps` over `adb forward`.
+- Implemented so far: `/proc` maps + module aggregation, ARM64 instruction
+  classification, absolute-branch writer, B/BL prologue relocation,
+  QuickJS eval/console embedding, daemon/CLI JSON protocol.
+- Placeholders (explicitly `Unsupported`): Interceptor, NativeFunction,
+  ptrace attach, ART, QBDI link.
+
+Next: M1 (ptrace attach + PIC loader + memfd + agent control channel).
+
 ## Protocol (M0)
 
 Line-delimited JSON over TCP:
