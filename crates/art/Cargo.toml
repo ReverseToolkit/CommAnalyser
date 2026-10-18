@@ -10,6 +10,7 @@ rust-version.workspace = true
 runtime.workspace = true
 arch-arm64.workspace = true
 goblin = "0.10"
+lzma-rust2 = "0.21"
 jni = { version = "0.22", default-features = false }
 libc.workspace = true
 serde_json.workspace = true

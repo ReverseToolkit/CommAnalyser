@@ -142,6 +142,32 @@ fn run(name: &str) -> std::io::Result<()> {
                 Ok(value) => json!({"ok": true, "value": format!("{value:#x}")}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
+            "java_ensure_call" => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(art::java::ensure_plugin_call());
+                });
+                match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(Ok(value)) => json!({ "ok": true, "value": value }),
+                    Ok(Err(error)) => json!({ "ok": false, "error": error.to_string() }),
+                    Err(_) => json!({ "ok": false, "error": "EnsurePluginLoaded timed out" }),
+                }
+            }
+            "java_ensure_symbol" => {
+                let format = |result: Result<usize, String>| match result {
+                    Ok(value) => format!("{value:#x}"),
+                    Err(error) => error,
+                };
+                let base = format(art::libart_base().map_err(|error| error.to_string()));
+                let symbol =
+                    format(art::java::ensure_plugin_symbol().map_err(|error| error.to_string()));
+                let runtime =
+                    format(art::java::runtime_pointer().map_err(|error| error.to_string()));
+                let loader = format(
+                    art::java::runtime_system_class_loader().map_err(|error| error.to_string()),
+                );
+                json!({ "base": base, "symbol": symbol, "runtime": runtime, "class_loader": loader })
+            }
             "java_key_event" => match art::java::helper_key_event() {
                 Ok(text) => json!({ "ok": true, "value": text }),
                 Err(error) => json!({ "ok": false, "error": error.to_string() }),

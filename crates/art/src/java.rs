@@ -1331,7 +1331,58 @@ fn resolve_libart_symbol(name: &str) -> Option<usize> {
             return Some(base + symbol.st_value as usize);
         }
     }
+    resolve_libart_debug_symbol(base, name)
+}
+
+fn resolve_libart_debug_symbol(base: usize, name: &str) -> Option<usize> {
+    use std::io::Read;
+    let bytes = std::fs::read("/apex/com.android.art/lib64/libart.so").ok()?;
+    let elf = goblin::elf::Elf::parse(&bytes).ok()?;
+    let section = elf
+        .section_headers
+        .iter()
+        .find(|section| elf.shdr_strtab.get_at(section.sh_name) == Some(".gnu_debugdata"))?;
+    let start = section.sh_offset as usize;
+    let end = start.checked_add(section.sh_size as usize)?;
+    let compressed = bytes.get(start..end)?;
+    let mut decompressed = Vec::new();
+    let mut reader = lzma_rust2::XzReader::new(compressed, false);
+    reader.read_to_end(&mut decompressed).ok()?;
+    let mini = goblin::elf::Elf::parse(&decompressed).ok()?;
+    for symbol in mini.syms.iter() {
+        if mini.strtab.get_at(symbol.st_name) == Some(name) && symbol.st_value != 0 {
+            return Some(base + symbol.st_value as usize);
+        }
+    }
     None
+}
+
+pub fn ensure_plugin_symbol() -> Result<usize> {
+    resolve_libart_symbol(
+        "_ZN3art7Runtime18EnsurePluginLoadedEPKcPNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEE",
+    )
+    .ok_or_else(|| Error::NotFound("Runtime::EnsurePluginLoaded".into()))
+}
+
+pub fn runtime_pointer() -> Result<usize> {
+    let symbol = resolve_libart_symbol("_ZN3art7Runtime9instance_E")
+        .ok_or_else(|| Error::NotFound("Runtime::instance_".into()))?;
+    // SAFETY: Runtime::instance_ is a data symbol holding Runtime*.
+    let runtime = unsafe { ptr::read_unaligned(symbol as *const usize) };
+    if runtime == 0 {
+        return Err(Error::NotFound("Runtime".into()));
+    }
+    Ok(runtime)
+}
+
+pub fn runtime_system_class_loader() -> Result<usize> {
+    let runtime = runtime_pointer()?;
+    let symbol = resolve_libart_symbol("_ZNK3art7Runtime20GetSystemClassLoaderEv")
+        .ok_or_else(|| Error::NotFound("Runtime::GetSystemClassLoader".into()))?;
+    type GetLoader = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+    let get_loader: GetLoader = unsafe { std::mem::transmute(symbol) };
+    // SAFETY: runtime is the live ART Runtime and the getter only reads.
+    Ok(unsafe { get_loader(runtime as *mut c_void) } as usize)
 }
 
 static JNI_ENV_OFFSET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1743,4 +1794,44 @@ pub fn android_version() -> Result<String> {
         JavaValue::String(value) => Ok(value),
         _ => Err(Error::Parse("Build.VERSION.RELEASE is not a String".into())),
     }
+}
+
+pub fn ensure_plugin_call() -> Result<bool> {
+    let vm = JavaVm::get()?;
+    let raw_vm = vm.vm_raw();
+    // SAFETY: JavaVM points at JNIInvokeInterface.
+    let table = unsafe { *(raw_vm as *mut *const usize) };
+    let get_env: unsafe extern "C" fn(
+        *mut RawJavaVM,
+        *mut *mut c_void,
+        jni::sys::jint,
+    ) -> jni::sys::jint = unsafe { std::mem::transmute(*table.add(3)) };
+    let attach: unsafe extern "C" fn(
+        *mut RawJavaVM,
+        *mut *mut c_void,
+        *mut c_void,
+    ) -> jni::sys::jint = unsafe { std::mem::transmute(*table.add(4)) };
+    let mut jni_env = std::ptr::null_mut();
+    if unsafe { get_env(raw_vm, &mut jni_env, 0x0001_0006) } != 0 {
+        let status = unsafe { attach(raw_vm, &mut jni_env, std::ptr::null_mut()) };
+        if status != 0 {
+            return Err(Error::Parse(format!("AttachCurrentThread: {status}")));
+        }
+    }
+    let runtime = runtime_pointer()?;
+    let symbol = ensure_plugin_symbol()?;
+    type Ensure =
+        unsafe extern "C" fn(*mut c_void, *const std::os::raw::c_char, *mut c_void) -> bool;
+    let ensure: Ensure = unsafe { std::mem::transmute(symbol) };
+    let plugin = std::ffi::CString::new("libopenjdkjvmti.so")
+        .map_err(|_| Error::Parse("plugin name".into()))?;
+    // SAFETY: null error pointer is allowed by Runtime::EnsurePluginLoaded.
+    let result = unsafe {
+        ensure(
+            runtime as *mut c_void,
+            plugin.as_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    Ok(result)
 }
