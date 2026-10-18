@@ -238,16 +238,23 @@ impl JavaClass {
     }
 
     pub fn call_static(&self, method: &MethodInfo, args: &[JavaArg]) -> Result<JavaValue> {
+        let MethodId::Static(id) = method.id else {
+            return Err(Error::Parse("method is not static".into()));
+        };
+        self.call_static_with_id(method, id, args)
+    }
+
+    pub fn call_static_with_id(
+        &self,
+        method: &MethodInfo,
+        id: JStaticMethodID,
+        args: &[JavaArg],
+    ) -> Result<JavaValue> {
         let vm = JavaVm::get()?;
         vm.with_env(|env| {
             let (raw, _strings) = marshal(env, &method.params, args)?;
-            // SAFETY: method.id came from this class and the return type is
-            // the one declared by the method.
-            let MethodId::Static(id) = method.id else {
-                return Err(jni::errors::Error::JniCall(
-                    jni::errors::JniError::InvalidArguments,
-                ));
-            };
+            // SAFETY: the id points at this method (or a clone with the same
+            // declaring class), and the return type is the declared one.
             let value = unsafe {
                 env.call_static_method_unchecked(&self.class, id, return_type(&method.ret), &raw)?
             };
@@ -298,16 +305,23 @@ impl JavaObject {
     }
 
     pub fn call(&self, method: &MethodInfo, args: &[JavaArg]) -> Result<JavaValue> {
+        let MethodId::Instance(id) = method.id else {
+            return Err(Error::Parse("method is not an instance method".into()));
+        };
+        self.call_with_id(method, id, args)
+    }
+
+    pub fn call_with_id(
+        &self,
+        method: &MethodInfo,
+        id: JMethodID,
+        args: &[JavaArg],
+    ) -> Result<JavaValue> {
         let vm = JavaVm::get()?;
         vm.with_env(|env| {
             let (raw, _strings) = marshal(env, &method.params, args)?;
-            // SAFETY: method.id came from the object's class and the return
-            // type is the one declared by the method.
-            let MethodId::Instance(id) = method.id else {
-                return Err(jni::errors::Error::JniCall(
-                    jni::errors::JniError::InvalidArguments,
-                ));
-            };
+            // SAFETY: the id points at this method (or a clone with the same
+            // declaring class), and the return type is the declared one.
             let value = unsafe {
                 env.call_method_unchecked(&self.object, id, return_type(&method.ret), &raw)?
             };
@@ -878,13 +892,23 @@ pub fn hook_install_test() -> Result<String> {
     .to_string())
 }
 
+/// Quick-compiled Java frames pass raw `mirror::Object*` references, while JNI
+/// APIs expect an indirect reference handle.  ART's `JNIEnvExt::NewLocalRef`
+/// performs that conversion.
+fn raw_object_to_local<'a>(env: &mut Env<'a>, raw: usize) -> jni::errors::Result<JObject<'a>> {
+    // The quick ABI passes object references that ART also accepts as jobject
+    // handles for the common case.  A full raw mirror::Object* -> local-ref
+    // conversion needs ART's thread-local reference table and is not enabled
+    // yet; see docs/18-m3j.md.
+    // SAFETY: the caller passes a reference from the current Java frame.
+    Ok(unsafe { JObject::from_raw(env, raw as jni::sys::jobject) })
+}
+
 /// Wrap a raw JNI object pointer as a `JavaObject` with the given class info.
 pub fn object_from_raw(info: Rc<ClassInfo>, raw: usize) -> Result<JavaObject> {
     let vm = JavaVm::get()?;
     vm.with_env(|env| {
-        // SAFETY: the caller received this raw reference as a Java hook
-        // argument, so it is valid for the current native frame.
-        let object = unsafe { JObject::from_raw(env, raw as jni::sys::jobject) };
+        let object = raw_object_to_local(env, raw)?;
         let global = env.new_global_ref(&object)?;
         Ok(JavaObject::from_global(info, global))
     })
@@ -897,9 +921,9 @@ pub fn string_from_raw(raw: usize) -> Result<Option<String>> {
     }
     let vm = JavaVm::get()?;
     vm.with_env(|env| {
-        // SAFETY: the caller received this raw reference as a Java hook
-        // argument, so it is valid for the current native frame.
-        let object = unsafe { JString::from_raw(env, raw as jni::sys::jstring) };
+        let object = raw_object_to_local(env, raw)?;
+        // SAFETY: the caller passed a raw java.lang.String reference.
+        let object = unsafe { JString::from_raw(env, object.as_raw()) };
         Ok(Some(jstring_to_string(env, &object)?))
     })
 }
@@ -1004,4 +1028,26 @@ pub fn helper_ctor() -> Result<String> {
             .i()?;
         Ok(format!("ok length={length}"))
     })
+}
+
+/// Diagnostic for raw-object reference resolution.
+pub fn ref_debug() -> Result<String> {
+    let base = crate::libart_base()?;
+    let path = "/apex/com.android.art/lib64/libart.so";
+    let bytes = std::fs::read(path).map_err(Error::Io)?;
+    let elf = goblin::elf::Elf::parse(&bytes)
+        .map_err(|err| Error::Parse(format!("libart ELF: {err}")))?;
+    let name = "_ZN3art9JNIEnvExt11NewLocalRefEPNS_6mirror6ObjectE";
+    let symbol = elf
+        .dynsyms
+        .iter()
+        .find(|symbol| elf.dynstrtab.get_at(symbol.st_name) == Some(name));
+    Ok(serde_json::json!({
+        "ok": true,
+        "base": format!("{base:#x}"),
+        "file_size": bytes.len(),
+        "dynsym_count": elf.dynsyms.len(),
+        "symbol": symbol.map(|symbol| format!("{:#x}", symbol.st_value)),
+    })
+    .to_string())
 }

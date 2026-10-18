@@ -155,6 +155,11 @@ fn run(name: &str) -> std::io::Result<()> {
                     .unwrap_or_else(|_| json!({"ok": true, "raw": text})),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
+            "java_ref_debug" => match art::java::ref_debug() {
+                Ok(text) => serde_json::from_str::<Value>(&text)
+                    .unwrap_or_else(|_| json!({"ok": true, "raw": text})),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
             "java_char_at" => match art::java::call_char_at() {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),

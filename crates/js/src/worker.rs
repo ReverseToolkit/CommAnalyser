@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use rquickjs::{Function, Persistent};
 
+use art::hook::JavaHook;
 use art::java::{JavaClass, MethodInfo};
 use gum::{InlineHook, SavedRegs};
 use runtime::{Error, Result};
@@ -57,8 +58,8 @@ pub(crate) struct JavaHookEntry {
     pub(crate) function: Persistent<Function<'static>>,
     pub(crate) class: Rc<JavaClass>,
     pub(crate) method: MethodInfo,
-    // Held only so the entrypoint is restored when the table is dropped.
-    pub(crate) _hook: art::hook::JavaHook,
+    // Held so the entrypoint is restored when the table is dropped.
+    pub(crate) _hook: JavaHook,
 }
 
 #[derive(Default)]

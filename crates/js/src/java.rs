@@ -464,7 +464,8 @@ pub(crate) fn invoke_impl<'js>(
         let object = art::java::object_from_raw(class.info.clone(), args[1] as usize)
             .map_err(to_js_error)?;
         let id = register(object);
-        instance_object(ctx.clone(), class.clone(), id)?.into_value()
+        let this = instance_object(ctx.clone(), class.clone(), id)?;
+        this.into_value()
     };
 
     let call_args = Array::new(ctx.clone())?;

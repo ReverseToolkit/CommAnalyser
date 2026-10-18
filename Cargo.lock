@@ -42,6 +42,7 @@ name = "art"
 version = "0.1.0"
 dependencies = [
  "arch-arm64",
+ "goblin",
  "jni",
  "libc",
  "runtime",

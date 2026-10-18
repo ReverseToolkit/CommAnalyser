@@ -89,6 +89,10 @@ cargo build --target aarch64-linux-android -p agent -p daemon -p cli
 - **M3i (done)**: instance/static Java fields with getter and setter
   (`Build.MODEL.value`, `Message.what.value`).
   Details: [`docs/17-m3i.md`](docs/17-m3i.md).
+- **M3j (blocked)**: `original()` attempted via ArtMethod clone and
+  suspend/resume; blocked on quick-ABI raw object → JNI reference conversion.
+  Stable hooks were restored.
+  Details: [`docs/18-m3j.md`](docs/18-m3j.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 
