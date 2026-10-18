@@ -27,6 +27,7 @@ const HANDLE: &str = "__analyserJavaId";
 struct HookMeta {
     is_static: bool,
     params: Vec<Kind>,
+    ret: Kind,
 }
 
 static HOOK_META: OnceLock<Mutex<HashMap<usize, HookMeta>>> = OnceLock::new();
@@ -41,6 +42,14 @@ pub(crate) fn hook_meta_for(id: usize) -> Option<(bool, Vec<Kind>)> {
     Some((entry.is_static, entry.params.clone()))
 }
 
+pub(crate) fn hook_returns_object(id: usize) -> bool {
+    let Ok(meta) = hook_meta().lock() else {
+        return false;
+    };
+    meta.get(&id)
+        .is_some_and(|entry| matches!(entry.ret, Kind::Object(_) | Kind::Array(_)))
+}
+
 fn register_hook(id: usize, method: &MethodInfo) {
     if let Ok(mut meta) = hook_meta().lock() {
         meta.insert(
@@ -48,6 +57,7 @@ fn register_hook(id: usize, method: &MethodInfo) {
             HookMeta {
                 is_static: method.is_static,
                 params: method.params.clone(),
+                ret: method.ret.clone(),
             },
         );
     }
@@ -576,9 +586,28 @@ pub(crate) fn invoke_impl<'js>(
         Kind::Boolean => Ok(u64::from(result.get::<bool>()?)),
         Kind::Byte | Kind::Char | Kind::Short | Kind::Int => Ok(result.get::<i64>()? as u64),
         Kind::Long => Ok(result.get::<i64>()? as u64),
-        Kind::Object(_) | Kind::Array(_) | Kind::Float | Kind::Double => {
-            Err(js_error("unsupported Java hook return type"))
+        Kind::Object(name) | Kind::Array(name) => {
+            if result.is_null() {
+                return Ok(0);
+            }
+            if result.is_string() {
+                let value: String = result.get()?;
+                return art::java::new_string_global(&value)
+                    .map(|handle| handle as u64)
+                    .map_err(to_js_error);
+            }
+            if let Some(id) = java_id(&result) {
+                let object =
+                    get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
+                return object
+                    .clone_global_handle()
+                    .map(|handle| handle as u64)
+                    .map_err(to_js_error);
+            }
+            let _ = name;
+            Err(js_error("unsupported Java hook return value"))
         }
+        Kind::Float | Kind::Double => Err(js_error("unsupported Java hook return type")),
     }
 }
 

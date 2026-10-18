@@ -327,7 +327,11 @@ pub(crate) extern "C" fn callback_dispatch(id: usize, args: *const u64) -> u64 {
     {
         return 0;
     }
-    response.recv_timeout(Duration::from_secs(5)).unwrap_or(0)
+    let mut value = response.recv_timeout(Duration::from_secs(5)).unwrap_or(0);
+    if value != 0 && crate::java::hook_returns_object(id) {
+        value = art::soa::global_to_raw(value as usize).unwrap_or(0) as u64;
+    }
+    value
 }
 
 /// Dispatcher embedded in every Java method trampoline.
@@ -378,7 +382,11 @@ pub(crate) extern "C" fn java_dispatch(id: usize, args: *const u64) -> u64 {
     {
         return 0;
     }
-    response.recv_timeout(Duration::from_secs(5)).unwrap_or(0)
+    let mut value = response.recv_timeout(Duration::from_secs(5)).unwrap_or(0);
+    if value != 0 && crate::java::hook_returns_object(id) {
+        value = art::soa::global_to_raw(value as usize).unwrap_or(0) as u64;
+    }
+    value
 }
 
 pub(crate) fn make_bridge(group: usize, target: usize, tx: Sender<Job>) -> *mut HookBridge {

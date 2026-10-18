@@ -69,6 +69,35 @@ pub fn words() -> Vec<u32> {
     unsafe { std::slice::from_raw_parts(target as *const u32, 256).to_vec() }
 }
 
+type DecodeGlobalJObject = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+type CurrentThread = unsafe extern "C" fn() -> *mut c_void;
+
+/// Turn a JNI global reference back into a quick-ABI raw object pointer.
+///
+/// Runs on the hooking Java thread, which is Runnable at this point.
+pub fn global_to_raw(handle: usize) -> Result<usize> {
+    if handle == 0 {
+        return Ok(0);
+    }
+    let decode_address = resolve_libart_symbol("_ZNK3art6Thread19DecodeGlobalJObjectEP8_jobject")
+        .ok_or_else(|| Error::NotFound("Thread::DecodeGlobalJObject".into()))?;
+    let current_address = resolve_libart_symbol("_ZN3art6Thread14CurrentFromGdbEv")
+        .ok_or_else(|| Error::NotFound("Thread::Current".into()))?;
+    // SAFETY: both addresses come from libart's dynamic symbol table.
+    let decode: DecodeGlobalJObject = unsafe { std::mem::transmute(decode_address) };
+    let current: CurrentThread = unsafe { std::mem::transmute(current_address) };
+    let thread = unsafe { current() };
+    if thread.is_null() {
+        return Err(Error::NotFound("current ART thread".into()));
+    }
+    // SAFETY: thread is current and handle is a live global reference.
+    let raw = unsafe { decode(thread, handle as *mut c_void) };
+    if raw.is_null() {
+        return Err(Error::Parse("DecodeGlobalJObject returned null".into()));
+    }
+    Ok(raw as usize)
+}
+
 pub fn debug_state() -> (usize, usize, usize, usize, usize) {
     (
         TARGET.load(Ordering::Relaxed),

@@ -134,6 +134,20 @@ pub struct JavaObject {
     object: Global<JObject<'static>>,
 }
 
+impl JavaObject {
+    pub fn clone_global_handle(&self) -> Result<usize> {
+        clone_global_handle(self.object.as_raw() as usize)
+    }
+}
+
+pub fn new_string_global(value: &str) -> Result<usize> {
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        let string = env.new_string(value)?;
+        Ok(env.new_global_ref(&string)?.into_raw() as usize)
+    })
+}
+
 pub enum JavaArg {
     Boolean(bool),
     Int(i32),
@@ -1122,6 +1136,35 @@ pub fn call_index_of() -> Result<i64> {
         JavaValue::Int(value) => Ok(i64::from(value)),
         _ => Err(Error::Parse(
             "StringBuilder.indexOf returned non-int".into(),
+        )),
+    }
+}
+
+/// Test helper: `new StringBuilder("abc").toString()`.
+pub fn call_to_string() -> Result<String> {
+    let class = JavaClass::find("java.lang.StringBuilder")?;
+    let object = class.new_object(&[])?;
+    let append = class
+        .info
+        .methods
+        .iter()
+        .find(|method| {
+            method.name == "append"
+                && method.signature == "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
+        })
+        .ok_or_else(|| Error::NotFound("StringBuilder.append(String)".into()))?;
+    let _ = object.call(append, &[JavaArg::String("abc".into())])?;
+    let to_string = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "toString" && method.params.is_empty())
+        .ok_or_else(|| Error::NotFound("StringBuilder.toString".into()))?;
+    match object.call(to_string, &[])? {
+        JavaValue::String(value) => Ok(value),
+        JavaValue::Object(_) => Ok("<object>".into()),
+        _ => Err(Error::Parse(
+            "StringBuilder.toString returned non-string".into(),
         )),
     }
 }
