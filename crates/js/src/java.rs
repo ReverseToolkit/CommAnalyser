@@ -1079,8 +1079,6 @@ fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsRe
 }
 
 fn cast<'js>(ctx: Ctx<'js>, value: Value<'js>, klass: Value<'js>) -> JsResult<Value<'js>> {
-    let id = java_id(&value).ok_or_else(|| js_error("Java.cast expects a Java object"))?;
-    let object = get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
     let class_name = if let Some(name) = klass.as_string() {
         name.to_string()?
     } else if let Some(wrapper) = klass.as_object() {
@@ -1089,6 +1087,15 @@ fn cast<'js>(ctx: Ctx<'js>, value: Value<'js>, klass: Value<'js>) -> JsResult<Va
         return Err(js_error("Java.cast expects a class wrapper or name"));
     };
     let class = JavaClass::find(&class_name).map_err(to_js_error)?;
+    let object = if let Some(id) = java_id(&value) {
+        get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?
+    } else {
+        let handle = crate::api::parse_pointer(&value)?;
+        Rc::new(
+            art::java::object_from_global_handle(class.info.clone(), handle as usize)
+                .map_err(to_js_error)?,
+        )
+    };
     if !class.is_instance(&object).map_err(to_js_error)? {
         return Err(js_error(format!(
             "Cast from '{}' to '{}' isn't possible",

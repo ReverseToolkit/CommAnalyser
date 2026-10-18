@@ -569,7 +569,7 @@ fn thread_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
     Ok(obj)
 }
 
-fn parse_pointer(value: &Value<'_>) -> JsResult<u64> {
+pub(crate) fn parse_pointer(value: &Value<'_>) -> JsResult<u64> {
     if value.is_string() {
         let text: String = value.get()?;
         return parse_hex_or_dec(&text);
