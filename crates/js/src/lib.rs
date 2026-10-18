@@ -204,6 +204,7 @@ impl ScriptRuntime {
         globals: u8,
         hook: Option<std::rc::Rc<std::cell::RefCell<art::hook::JavaHook>>>,
     ) -> crate::worker::DispatchResult {
+        let jni_mode = crate::java::hook_jni_mode(id);
         let entry = self
             .java_hooks
             .borrow()
@@ -234,6 +235,7 @@ impl ScriptRuntime {
                     fargs,
                     globals,
                     hook,
+                    jni_mode,
                 },
             ) {
                 Ok((x0, d0)) => crate::worker::DispatchResult { x0, d0 },

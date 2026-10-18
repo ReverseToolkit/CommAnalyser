@@ -1474,3 +1474,28 @@ pub fn clear_pending_exception() -> Result<()> {
         Ok(())
     })
 }
+
+pub fn object_from_jni_handle(info: Rc<ClassInfo>, handle: usize) -> Result<JavaObject> {
+    if handle == 0 {
+        return Err(Error::Parse("null JNI object".into()));
+    }
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        // SAFETY: handle is a borrowed local/global reference.
+        let object = unsafe { JObject::from_raw(env, handle as jni::sys::jobject) };
+        let global = env.new_global_ref(&object)?;
+        Ok(JavaObject::from_global(info, global))
+    })
+}
+
+pub fn string_from_jni_handle(handle: usize) -> Result<Option<String>> {
+    if handle == 0 {
+        return Ok(None);
+    }
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        // SAFETY: handle is a borrowed local/global string reference.
+        let string = unsafe { JString::from_raw(env, handle as jni::sys::jstring) };
+        Ok(Some(jstring_to_string(env, &string)?))
+    })
+}

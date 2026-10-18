@@ -28,6 +28,7 @@ struct HookMeta {
     is_static: bool,
     params: Vec<Kind>,
     ret: Kind,
+    jni_mode: bool,
 }
 
 static HOOK_META: OnceLock<Mutex<HashMap<usize, HookMeta>>> = OnceLock::new();
@@ -42,6 +43,14 @@ pub(crate) fn hook_meta_for(id: usize) -> Option<(bool, Vec<Kind>)> {
     let meta = hook_meta().lock().ok()?;
     let entry = meta.get(&id)?;
     Some((entry.is_static, entry.params.clone()))
+}
+
+pub(crate) fn hook_jni_mode(id: usize) -> bool {
+    hook_meta()
+        .lock()
+        .ok()
+        .and_then(|meta| meta.get(&id).map(|entry| entry.jni_mode))
+        .unwrap_or(false)
 }
 
 pub(crate) fn set_java_error(message: String) {
@@ -69,7 +78,7 @@ pub(crate) fn hook_returns_object(id: usize) -> bool {
         .is_some_and(|entry| matches!(entry.ret, Kind::Object(_) | Kind::Array(_)))
 }
 
-fn register_hook(id: usize, method: &MethodInfo) {
+fn register_hook(id: usize, method: &MethodInfo, jni_mode: bool) {
     if let Ok(mut meta) = hook_meta().lock() {
         meta.insert(
             id,
@@ -77,6 +86,7 @@ fn register_hook(id: usize, method: &MethodInfo) {
                 is_static: method.is_static,
                 params: method.params.clone(),
                 ret: method.ret.clone(),
+                jni_mode,
             },
         );
     }
@@ -116,7 +126,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                 let id = table.entries.len();
                 let hook = art::hook::install(method.id, java_dispatch as *const () as usize, id)
                     .map_err(to_js_error)?;
-                register_hook(id, &method);
+                register_hook(id, &method, hook.is_native_mode());
                 table.entries.push(Some(JavaHookEntry {
                     function: Persistent::save(&ctx, callback),
                     class,
@@ -540,6 +550,7 @@ pub(crate) struct HookCall {
     pub(crate) fargs: [u64; 8],
     pub(crate) globals: u8,
     pub(crate) hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
+    pub(crate) jni_mode: bool,
 }
 
 struct OriginalCall {
@@ -561,8 +572,15 @@ pub(crate) fn invoke_impl<'js>(
         fargs,
         globals,
         hook,
+        jni_mode,
     } = call;
-    let start = if method.is_static { 1 } else { 2 };
+    let start = if jni_mode {
+        2
+    } else if method.is_static {
+        1
+    } else {
+        2
+    };
     let this_value: Value<'js> = if method.is_static {
         let this = class_object(ctx.clone(), class.clone())?;
         if let Some(hook) = hook.clone() {
@@ -585,7 +603,9 @@ pub(crate) fn invoke_impl<'js>(
         }
         this.into_value()
     } else {
-        let object = if globals & (1 << 1) != 0 {
+        let object = if jni_mode {
+            art::java::object_from_jni_handle(class.info.clone(), args[1] as usize)
+        } else if globals & (1 << 1) != 0 {
             art::java::object_from_global_handle(class.info.clone(), args[1] as usize)
         } else {
             art::java::object_from_raw(class.info.clone(), args[1] as usize)
@@ -623,7 +643,9 @@ pub(crate) fn invoke_impl<'js>(
             Kind::Byte | Kind::Char | Kind::Short | Kind::Int => (raw as i32).into_js(ctx)?,
             Kind::Long => (raw as i64).into_js(ctx)?,
             Kind::Object(name) if name == "java.lang.String" => {
-                let value = if globals & (1 << (start + slot)) != 0 {
+                let value = if jni_mode {
+                    art::java::string_from_jni_handle(raw as usize)
+                } else if globals & (1 << (start + slot)) != 0 {
                     art::java::string_from_global_handle(raw as usize)
                 } else {
                     art::java::string_from_raw(raw as usize)
@@ -635,14 +657,18 @@ pub(crate) fn invoke_impl<'js>(
                 }
             }
             Kind::Object(name) => {
-                let (info, global) = if globals & (1 << (start + slot)) != 0 {
+                let (info, source) = if jni_mode || globals & (1 << (start + slot)) != 0 {
                     let param_class = JavaClass::find(name).map_err(to_js_error)?;
-                    (param_class.info.clone(), true)
+                    (param_class.info.clone(), 2)
                 } else {
-                    (class.info.clone(), false)
+                    (class.info.clone(), 1)
                 };
-                let object = if global {
-                    art::java::object_from_global_handle(info, raw as usize)
+                let object = if source == 2 {
+                    if jni_mode {
+                        art::java::object_from_jni_handle(info, raw as usize)
+                    } else {
+                        art::java::object_from_global_handle(info, raw as usize)
+                    }
                 } else {
                     art::java::object_from_raw(info, raw as usize)
                 }
