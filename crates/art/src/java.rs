@@ -1257,7 +1257,7 @@ pub fn new_int_array(values: &[i32]) -> Result<JavaObject> {
     let vm = JavaVm::get()?;
     vm.with_env(|env| {
         let array = env.new_int_array(values.len())?;
-        env.set_int_array_region(&array, 0, values)?;
+        array.set_region(env, 0, values)?;
         let object: &JObject<'_> = array.as_ref();
         let global = env.new_global_ref(object)?;
         Ok(JavaObject::from_global(class.info.clone(), global))
