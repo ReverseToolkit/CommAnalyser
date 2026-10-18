@@ -45,6 +45,9 @@ cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
   QuickJS eval.  Validated `hook_getpid` (5 hits, clean detach) and
   `eval 1+2` inside both `sleep` and `com.android.settings`.
   Details: [`docs/03-m2.md`](docs/03-m2.md).
+- **M2c (done)**: QuickJS Frida-style `NativePointer` / `Memory` /
+  `Process` / `Module` / `Thread`; validated against `sleep` and Settings.
+  Details: [`docs/04-m2c.md`](docs/04-m2c.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 
