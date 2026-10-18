@@ -15,6 +15,7 @@ use jni::refs::Reference as _;
 use jni::signature::{JavaType, Primitive, RuntimeMethodSignature};
 use jni::strings::JNIString;
 use jni::sys::{jint, jsize, jvalue, JavaVM as RawJavaVM};
+use jni::JValue;
 use jni::{Env, JavaVM};
 
 use runtime::{Error, Result};
@@ -145,7 +146,16 @@ impl JavaClass {
         let vm = JavaVm::get()?;
         vm.with_env(|env| {
             let slash_name = JNIString::new(name.replace('.', "/"));
-            let local = env.find_class(&*slash_name)?;
+            let local = match env.find_class(&*slash_name) {
+                Ok(local) => local,
+                Err(error) => {
+                    // FindClass on a native-attached thread only sees the boot
+                    // class loader.  Fall back to the app's ClassLoader.
+                    env.exception_clear();
+                    let _ = error;
+                    find_via_app_loader(env, name)?
+                }
+            };
             let global = env.new_global_ref(&local)?;
             let info = reflect(env, &local, name)?;
             Ok(Rc::new(Self {
@@ -271,6 +281,66 @@ fn created_java_vm() -> Result<*mut RawJavaVM> {
         return Err(Error::NotFound("no created JavaVM".into()));
     }
     Ok(vm)
+}
+
+fn find_via_app_loader<'a>(env: &mut Env<'a>, name: &str) -> jni::errors::Result<JClass<'a>> {
+    let loader = app_class_loader(env)?;
+    let class_name = env.new_string(name)?;
+    let class_name = JObject::from(class_name);
+    let signature = RuntimeMethodSignature::from_str("(Ljava/lang/String;)Ljava/lang/Class;")?;
+    let name = JNIString::new("loadClass");
+    let value = env.call_method(
+        &loader,
+        &*name,
+        signature.method_signature(),
+        &[JValue::Object(&class_name)],
+    )?;
+    let class = value.l()?;
+    if class.is_null() {
+        return Err(jni::errors::Error::NullPtr("loadClass returned null"));
+    }
+    // SAFETY: loadClass returns java.lang.Class.
+    Ok(unsafe { JClass::from_raw(env, class.as_raw()) })
+}
+
+fn app_class_loader<'a>(env: &mut Env<'a>) -> jni::errors::Result<JObject<'a>> {
+    let activity_thread = env.find_class(&*JNIString::new("android/app/ActivityThread"))?;
+    let current_app_sig = RuntimeMethodSignature::from_str("()Landroid/app/Application;")?;
+    let current_app = JNIString::new("currentApplication");
+    let app = env
+        .call_static_method(
+            &activity_thread,
+            &*current_app,
+            current_app_sig.method_signature(),
+            &[],
+        )?
+        .l()?;
+    let loader_sig = RuntimeMethodSignature::from_str("()Ljava/lang/ClassLoader;")?;
+    let get_loader = JNIString::new("getClassLoader");
+    if !app.is_null() {
+        return env
+            .call_method(&app, &*get_loader, loader_sig.method_signature(), &[])?
+            .l();
+    }
+    let thread = env.find_class(&*JNIString::new("java/lang/Thread"))?;
+    let current_thread_sig = RuntimeMethodSignature::from_str("()Ljava/lang/Thread;")?;
+    let current_thread = JNIString::new("currentThread");
+    let thread = env
+        .call_static_method(
+            &thread,
+            &*current_thread,
+            current_thread_sig.method_signature(),
+            &[],
+        )?
+        .l()?;
+    let context_loader = JNIString::new("getContextClassLoader");
+    env.call_method(
+        &thread,
+        &*context_loader,
+        loader_sig.method_signature(),
+        &[],
+    )?
+    .l()
 }
 
 fn reflect(
@@ -691,6 +761,11 @@ pub fn ctor_list() -> Result<String> {
         .map(|ctor| {
             serde_json::json!({
                 "signature": ctor.signature,
+                "id": format!("{:#x}", ctor.id.into_raw() as usize),
+                "entry": format!(
+                    "{:#x}",
+                    unsafe { ptr::read_unaligned((ctor.id.into_raw() as usize + 24) as *const usize) }
+                ),
                 "public": ctor.is_public,
                 "params": format!("{:?}", ctor.params),
             })

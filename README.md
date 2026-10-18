@@ -76,6 +76,9 @@ cargo build --target aarch64-linux-android -p agent -p daemon -p cli
   constructor preference and ctor diagnostics. `$new("...")` for
   StringBuilder/StringBuffer remains unresolved.
   Details: [`docs/13-m3e.md`](docs/13-m3e.md).
+- **M3f (done)**: `Java.use` falls back to the app `ClassLoader`, so Settings
+  and settingslib classes load from the APK.
+  Details: [`docs/14-m3f.md`](docs/14-m3f.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 
