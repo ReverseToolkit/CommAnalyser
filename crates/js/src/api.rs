@@ -36,7 +36,7 @@ impl NativePointer {
         Self { value }
     }
 
-    fn instance<'js>(ctx: Ctx<'js>, value: u64) -> JsResult<Class<'js, Self>> {
+    pub(crate) fn instance<'js>(ctx: Ctx<'js>, value: u64) -> JsResult<Class<'js, Self>> {
         Class::instance(ctx, Self::new_value(value))
     }
 }

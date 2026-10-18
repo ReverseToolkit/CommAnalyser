@@ -332,8 +332,12 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
     let wrapper = Object::new(ctx.clone())?;
     wrapper.set(HANDLE, id)?;
     wrapper.set("$className", class.info.name.clone())?;
-
+    wrapper.set("$n", class.info.name.clone())?;
     let object = get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
+    wrapper.set(
+        "$h",
+        crate::api::NativePointer::instance(ctx.clone(), object.as_obj().as_raw() as usize as u64)?,
+    )?;
     let same_object = object.clone();
     wrapper.set(
         "$isSameObject",
