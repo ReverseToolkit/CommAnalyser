@@ -28,7 +28,6 @@ pub struct JavaHook {
     stub: usize,
     original_flags: u32,
     original_data: usize,
-    native_trampoline: usize,
     native_mode: bool,
     active: bool,
 }
@@ -99,7 +98,6 @@ pub fn install(method: MethodId, dispatcher: usize, id: usize) -> Result<JavaHoo
         stub,
         original_flags,
         original_data,
-        native_trampoline,
         native_mode,
         active: true,
     };
