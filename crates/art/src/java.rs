@@ -152,6 +152,8 @@ pub enum JavaArg {
     Boolean(bool),
     Int(i32),
     Long(i64),
+    Float(f32),
+    Double(f64),
     String(String),
     Object(Rc<JavaObject>),
     Null,
@@ -162,6 +164,8 @@ pub enum JavaValue {
     Boolean(bool),
     Int(i32),
     Long(i64),
+    Float(f32),
+    Double(f64),
     String(String),
     Object(Global<JObject<'static>>),
 }
@@ -779,6 +783,8 @@ fn marshal<'a>(
             (Kind::Char, JavaArg::Int(value)) => jvalue { c: *value as u16 },
             (Kind::Short, JavaArg::Int(value)) => jvalue { s: *value as i16 },
             (Kind::Long, JavaArg::Long(value)) => jvalue { j: *value },
+            (Kind::Float, JavaArg::Float(value)) => jvalue { f: *value },
+            (Kind::Double, JavaArg::Double(value)) => jvalue { d: *value },
             (Kind::Object(_), JavaArg::String(value)) => {
                 let string = env.new_string(value)?;
                 let raw = string.as_raw();
@@ -834,11 +840,8 @@ fn convert<'a>(
                 _ => JavaValue::Object(env.new_global_ref(&object)?),
             }
         }
-        Kind::Float | Kind::Double => {
-            return Err(jni::errors::Error::JniCall(
-                jni::errors::JniError::InvalidArguments,
-            ))
-        }
+        Kind::Float => JavaValue::Float(value.f()?),
+        Kind::Double => JavaValue::Double(value.d()?),
     })
 }
 
@@ -1166,5 +1169,80 @@ pub fn call_to_string() -> Result<String> {
         _ => Err(Error::Parse(
             "StringBuilder.toString returned non-string".into(),
         )),
+    }
+}
+
+/// Test helper: `Math.abs(-2.5f)`.
+pub fn call_math_abs_float() -> Result<f32> {
+    let class = JavaClass::find("java.lang.Math")?;
+    let method = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "abs" && method.signature == "(F)F")
+        .ok_or_else(|| Error::NotFound("Math.abs(float)".into()))?;
+    match class.call_static(method, &[JavaArg::Float(-2.5)])? {
+        JavaValue::Float(value) => Ok(value),
+        _ => Err(Error::Parse("Math.abs float returned non-float".into())),
+    }
+}
+
+/// Test helper: `Float.intBitsToFloat(0x40200000)`.
+pub fn call_float_from_bits() -> Result<f32> {
+    let class = JavaClass::find("java.lang.Float")?;
+    let method = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "intBitsToFloat" && method.signature == "(I)F")
+        .ok_or_else(|| Error::NotFound("Float.intBitsToFloat".into()))?;
+    match class.call_static(method, &[JavaArg::Int(0x4020_0000)])? {
+        JavaValue::Float(value) => Ok(value),
+        _ => Err(Error::Parse("intBitsToFloat returned non-float".into())),
+    }
+}
+
+/// Test helper: `Float.floatToRawIntBits(2.5f)`.
+pub fn call_float_to_bits() -> Result<i64> {
+    let class = JavaClass::find("java.lang.Float")?;
+    let method = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "floatToRawIntBits" && method.signature == "(F)I")
+        .ok_or_else(|| Error::NotFound("Float.floatToRawIntBits".into()))?;
+    match class.call_static(method, &[JavaArg::Float(2.5)])? {
+        JavaValue::Int(value) => Ok(i64::from(value)),
+        _ => Err(Error::Parse("floatToRawIntBits returned non-int".into())),
+    }
+}
+
+/// Test helper: `Double.longBitsToDouble(0x4004000000000000L)`.
+pub fn call_double_from_bits() -> Result<f64> {
+    let class = JavaClass::find("java.lang.Double")?;
+    let method = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "longBitsToDouble" && method.signature == "(J)D")
+        .ok_or_else(|| Error::NotFound("Double.longBitsToDouble".into()))?;
+    match class.call_static(method, &[JavaArg::Long(0x4004_0000_0000_0000)])? {
+        JavaValue::Double(value) => Ok(value),
+        _ => Err(Error::Parse("longBitsToDouble returned non-double".into())),
+    }
+}
+
+/// Test helper: `Double.doubleToRawLongBits(2.5)`.
+pub fn call_double_to_bits() -> Result<i64> {
+    let class = JavaClass::find("java.lang.Double")?;
+    let method = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "doubleToRawLongBits" && method.signature == "(D)J")
+        .ok_or_else(|| Error::NotFound("Double.doubleToRawLongBits".into()))?;
+    match class.call_static(method, &[JavaArg::Double(2.5)])? {
+        JavaValue::Long(value) => Ok(value),
+        _ => Err(Error::Parse("doubleToRawLongBits returned non-long".into())),
     }
 }

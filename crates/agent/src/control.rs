@@ -171,6 +171,26 @@ fn run(name: &str) -> std::io::Result<()> {
                     "converted": format!("{converted:#x}"),
                 })
             }
+            "java_double_from_bits" => match art::java::call_double_from_bits() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_double_to_bits" => match art::java::call_double_to_bits() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_float_from_bits" => match art::java::call_float_from_bits() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_float_to_bits" => match art::java::call_float_to_bits() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_math_abs" => match art::java::call_math_abs_float() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
             "java_to_string" => match art::java::call_to_string() {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),

@@ -84,6 +84,13 @@ pub(crate) struct CallbackTable {
 
 static JS_TX: OnceLock<Sender<Job>> = OnceLock::new();
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DispatchResult {
+    pub(crate) x0: u64,
+    pub(crate) d0: u64,
+}
+
 pub(crate) enum Job {
     Eval {
         code: String,
@@ -114,8 +121,9 @@ pub(crate) enum Job {
     JavaImpl {
         id: usize,
         args: [u64; 8],
+        fargs: [u64; 8],
         globals: u8,
-        reply: Sender<u64>,
+        reply: Sender<DispatchResult>,
     },
     Shutdown,
 }
@@ -221,6 +229,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
             Job::JavaImpl {
                 id,
                 args,
+                fargs,
                 globals,
                 reply,
             } => {
@@ -229,7 +238,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
                     .entries
                     .get(id)
                     .and_then(|entry| entry.as_ref().map(|entry| entry.hook.clone()));
-                let _ = reply.send(runtime.run_java_impl(id, args, globals, hook));
+                let _ = reply.send(runtime.run_java_impl(id, args, fargs, globals, hook));
             }
             Job::Shutdown => break,
         }
@@ -335,17 +344,26 @@ pub(crate) extern "C" fn callback_dispatch(id: usize, args: *const u64) -> u64 {
 }
 
 /// Dispatcher embedded in every Java method trampoline.
-pub(crate) extern "C" fn java_dispatch(id: usize, args: *const u64) -> u64 {
+pub(crate) extern "C" fn java_dispatch(
+    id: usize,
+    args: *const u64,
+    fargs: *const u64,
+) -> DispatchResult {
     if is_js_thread() {
-        return 0;
+        return DispatchResult::default();
     }
     let Some(tx) = JS_TX.get() else {
-        return 0;
+        return DispatchResult::default();
     };
     let mut saved = [0u64; 8];
     if !args.is_null() {
         // SAFETY: the hook stub passes a pointer to its saved x0-x7.
         unsafe { std::ptr::copy_nonoverlapping(args, saved.as_mut_ptr(), 8) };
+    }
+    let mut float_args = [0u64; 8];
+    if !fargs.is_null() {
+        // SAFETY: the hook stub passes a pointer to its saved d0-d7.
+        unsafe { std::ptr::copy_nonoverlapping(fargs, float_args.as_mut_ptr(), 8) };
     }
     let mut globals = 0u8;
     if let Some((is_static, params)) = crate::java::hook_meta_for(id) {
@@ -375,18 +393,21 @@ pub(crate) extern "C" fn java_dispatch(id: usize, args: *const u64) -> u64 {
         .send(Job::JavaImpl {
             id,
             args: saved,
+            fargs: float_args,
             globals,
             reply,
         })
         .is_err()
     {
-        return 0;
+        return DispatchResult::default();
     }
-    let mut value = response.recv_timeout(Duration::from_secs(5)).unwrap_or(0);
-    if value != 0 && crate::java::hook_returns_object(id) {
-        value = art::soa::global_to_raw(value as usize).unwrap_or(0) as u64;
+    let mut result = response
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    if result.x0 != 0 && crate::java::hook_returns_object(id) {
+        result.x0 = art::soa::global_to_raw(result.x0 as usize).unwrap_or(0) as u64;
     }
-    value
+    result
 }
 
 pub(crate) fn make_bridge(group: usize, target: usize, tx: Sender<Job>) -> *mut HookBridge {

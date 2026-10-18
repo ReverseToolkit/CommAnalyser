@@ -504,9 +504,10 @@ pub(crate) fn invoke_impl<'js>(
     class: Rc<JavaClass>,
     method: &MethodInfo,
     args: [u64; 8],
+    fargs: [u64; 8],
     globals: u8,
     hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
-) -> JsResult<u64> {
+) -> JsResult<(u64, u64)> {
     let start = if method.is_static { 1 } else { 2 };
     let this_value: Value<'js> = if method.is_static {
         Value::new_undefined(ctx.clone())
@@ -530,6 +531,7 @@ pub(crate) fn invoke_impl<'js>(
                     hook,
                     id,
                     args,
+                    fargs,
                     globals,
                 )?,
             )?;
@@ -538,6 +540,7 @@ pub(crate) fn invoke_impl<'js>(
     };
 
     let call_args = Array::new(ctx.clone())?;
+    let mut fp_index = 0;
     for (slot, kind) in method.params.iter().enumerate() {
         let raw = args[start + slot];
         let value: Value<'js> = match kind {
@@ -572,7 +575,17 @@ pub(crate) fn invoke_impl<'js>(
                 let id = register(object);
                 instance_object(ctx.clone(), class.clone(), id)?.into_value()
             }
-            Kind::Array(_) | Kind::Void | Kind::Float | Kind::Double => {
+            Kind::Float => {
+                let value = f32::from_bits(fargs[fp_index] as u32);
+                fp_index += 1;
+                value.into_js(ctx)?
+            }
+            Kind::Double => {
+                let value = f64::from_bits(fargs[fp_index]);
+                fp_index += 1;
+                value.into_js(ctx)?
+            }
+            Kind::Array(_) | Kind::Void => {
                 return Err(js_error("unsupported Java hook argument type"))
             }
         };
@@ -582,18 +595,23 @@ pub(crate) fn invoke_impl<'js>(
     let call: Function<'js> = ctx.globals().get("__analyser_call_impl")?;
     let result: Value<'js> = call.call((function, this_value, call_args))?;
     match &method.ret {
-        Kind::Void => Ok(0),
-        Kind::Boolean => Ok(u64::from(result.get::<bool>()?)),
-        Kind::Byte | Kind::Char | Kind::Short | Kind::Int => Ok(result.get::<i64>()? as u64),
-        Kind::Long => Ok(result.get::<i64>()? as u64),
+        Kind::Void => Ok((0, 0)),
+        Kind::Boolean => Ok((u64::from(result.get::<bool>()?), 0)),
+        Kind::Byte | Kind::Char | Kind::Short | Kind::Int => Ok((result.get::<i64>()? as u64, 0)),
+        Kind::Long => Ok((result.get::<i64>()? as u64, 0)),
+        Kind::Float => {
+            let value = result.get::<f64>()? as f32;
+            Ok((0, u64::from(value.to_bits())))
+        }
+        Kind::Double => Ok((0, result.get::<f64>()?.to_bits())),
         Kind::Object(name) | Kind::Array(name) => {
             if result.is_null() {
-                return Ok(0);
+                return Ok((0, 0));
             }
             if result.is_string() {
                 let value: String = result.get()?;
                 return art::java::new_string_global(&value)
-                    .map(|handle| handle as u64)
+                    .map(|handle| (handle as u64, 0))
                     .map_err(to_js_error);
             }
             if let Some(id) = java_id(&result) {
@@ -601,7 +619,7 @@ pub(crate) fn invoke_impl<'js>(
                     get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
                 return object
                     .clone_global_handle()
-                    .map(|handle| handle as u64)
+                    .map(|handle| (handle as u64, 0))
                     .map_err(to_js_error);
             }
             let _ = name;
@@ -618,12 +636,13 @@ fn original_function<'js>(
     hook: Rc<RefCell<art::hook::JavaHook>>,
     this_id: u32,
     raw: [u64; 8],
+    fargs: [u64; 8],
     globals: u8,
 ) -> JsResult<Function<'js>> {
     let call_ctx = ctx.clone();
     Function::new(ctx, move || -> JsResult<Value<'js>> {
         let object = get_object(this_id).ok_or_else(|| js_error("invalid Java object handle"))?;
-        let args = original_args(&method, &raw, globals)?;
+        let args = original_args(&method, &raw, &fargs, globals)?;
         hook.borrow().suspend();
         let result = object.call(&method, &args);
         hook.borrow().resume();
@@ -635,8 +654,14 @@ fn original_function<'js>(
     })
 }
 
-fn original_args(method: &MethodInfo, raw: &[u64; 8], globals: u8) -> JsResult<Vec<JavaArg>> {
+fn original_args(
+    method: &MethodInfo,
+    raw: &[u64; 8],
+    fargs: &[u64; 8],
+    globals: u8,
+) -> JsResult<Vec<JavaArg>> {
     let start = if method.is_static { 1 } else { 2 };
+    let mut fp_index = 0;
     method
         .params
         .iter()
@@ -650,6 +675,16 @@ fn original_args(method: &MethodInfo, raw: &[u64; 8], globals: u8) -> JsResult<V
                     JavaArg::Int(raw[register] as i32)
                 }
                 Kind::Long => JavaArg::Long(raw[register] as i64),
+                Kind::Float => {
+                    let value = f32::from_bits(fargs[fp_index] as u32);
+                    fp_index += 1;
+                    JavaArg::Float(value)
+                }
+                Kind::Double => {
+                    let value = f64::from_bits(fargs[fp_index]);
+                    fp_index += 1;
+                    JavaArg::Double(value)
+                }
                 Kind::Object(name) if name == "java.lang.String" && is_global => {
                     match art::java::string_from_global_handle(raw[register] as usize)
                         .map_err(to_js_error)?
@@ -681,6 +716,8 @@ fn value_to_js<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, value: JavaValue) -> Js
         JavaValue::Boolean(value) => value.into_js(&ctx),
         JavaValue::Int(value) => value.into_js(&ctx),
         JavaValue::Long(value) => value.into_js(&ctx),
+        JavaValue::Float(value) => value.into_js(&ctx),
+        JavaValue::Double(value) => value.into_js(&ctx),
         JavaValue::String(value) => value.into_js(&ctx),
         JavaValue::Object(global) => {
             let object = JavaObject::from_global(class.info.clone(), global);

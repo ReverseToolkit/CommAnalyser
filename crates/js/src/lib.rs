@@ -199,9 +199,10 @@ impl ScriptRuntime {
         &self,
         id: usize,
         args: [u64; 8],
+        fargs: [u64; 8],
         globals: u8,
         hook: Option<std::rc::Rc<std::cell::RefCell<art::hook::JavaHook>>>,
-    ) -> u64 {
+    ) -> crate::worker::DispatchResult {
         let entry = self
             .java_hooks
             .borrow()
@@ -216,14 +217,18 @@ impl ScriptRuntime {
                 )
             });
         let Some((function, class, method)) = entry else {
-            return 0;
+            return crate::worker::DispatchResult::default();
         };
         self.ctx.with(|ctx| {
             let Ok(function) = function.restore(&ctx) else {
-                return 0;
+                return crate::worker::DispatchResult::default();
             };
-            crate::java::invoke_impl(&ctx, function, class, &method, args, globals, hook)
-                .unwrap_or(0)
+            match crate::java::invoke_impl(
+                &ctx, function, class, &method, args, fargs, globals, hook,
+            ) {
+                Ok((x0, d0)) => crate::worker::DispatchResult { x0, d0 },
+                Err(_) => crate::worker::DispatchResult::default(),
+            }
         })
     }
 

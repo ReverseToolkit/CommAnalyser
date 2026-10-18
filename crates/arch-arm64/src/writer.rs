@@ -209,6 +209,20 @@ impl CodeWriter {
     }
 
     /// `STR Xt, [Xn, #imm]` (unsigned offset, imm multiple of 8).
+    pub fn stp_d(&mut self, rt: u8, rt2: u8, rn: u8, offset: i64) {
+        let imm = (offset / 8) as u32 & 0x7F;
+        let word =
+            0x6D00_0000 | (imm << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt as u32;
+        self.put(word);
+    }
+
+    pub fn ldp_d(&mut self, rt: u8, rt2: u8, rn: u8, offset: i64) {
+        let imm = (offset / 8) as u32 & 0x7F;
+        let word =
+            0x6D40_0000 | (imm << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt as u32;
+        self.put(word);
+    }
+
     pub fn str_imm(&mut self, rt: u8, rn: u8, offset: u32) {
         debug_assert!(offset % 8 == 0 && offset < 32768);
         self.put(0xF900_0000 | ((offset / 8) << 10) | ((rn as u32) << 5) | rt as u32);
