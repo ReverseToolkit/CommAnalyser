@@ -498,16 +498,33 @@ fn to_arg(value: &Value<'_>, kind: &Kind) -> JsResult<JavaArg> {
     }
 }
 
+pub(crate) struct HookCall {
+    pub(crate) args: [u64; 8],
+    pub(crate) fargs: [u64; 8],
+    pub(crate) globals: u8,
+    pub(crate) hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
+}
+
+struct OriginalCall {
+    this_id: u32,
+    raw: [u64; 8],
+    fargs: [u64; 8],
+    globals: u8,
+}
+
 pub(crate) fn invoke_impl<'js>(
     ctx: &Ctx<'js>,
     function: Function<'js>,
     class: Rc<JavaClass>,
     method: &MethodInfo,
-    args: [u64; 8],
-    fargs: [u64; 8],
-    globals: u8,
-    hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
+    call: HookCall,
 ) -> JsResult<(u64, u64)> {
+    let HookCall {
+        args,
+        fargs,
+        globals,
+        hook,
+    } = call;
     let start = if method.is_static { 1 } else { 2 };
     let this_value: Value<'js> = if method.is_static {
         Value::new_undefined(ctx.clone())
@@ -529,10 +546,12 @@ pub(crate) fn invoke_impl<'js>(
                     class.clone(),
                     method.clone(),
                     hook,
-                    id,
-                    args,
-                    fargs,
-                    globals,
+                    OriginalCall {
+                        this_id: id,
+                        raw: args,
+                        fargs,
+                        globals,
+                    },
                 )?,
             )?;
         }
@@ -625,7 +644,6 @@ pub(crate) fn invoke_impl<'js>(
             let _ = name;
             Err(js_error("unsupported Java hook return value"))
         }
-        Kind::Float | Kind::Double => Err(js_error("unsupported Java hook return type")),
     }
 }
 
@@ -634,11 +652,14 @@ fn original_function<'js>(
     class: Rc<JavaClass>,
     method: MethodInfo,
     hook: Rc<RefCell<art::hook::JavaHook>>,
-    this_id: u32,
-    raw: [u64; 8],
-    fargs: [u64; 8],
-    globals: u8,
+    call: OriginalCall,
 ) -> JsResult<Function<'js>> {
+    let OriginalCall {
+        this_id,
+        raw,
+        fargs,
+        globals,
+    } = call;
     let call_ctx = ctx.clone();
     Function::new(ctx, move || -> JsResult<Value<'js>> {
         let object = get_object(this_id).ok_or_else(|| js_error("invalid Java object handle"))?;
@@ -702,9 +723,7 @@ fn original_args(
                     .map_err(to_js_error)?;
                     JavaArg::Object(Rc::new(object))
                 }
-                Kind::Object(_) | Kind::Array(_) | Kind::Float | Kind::Double | Kind::Void => {
-                    JavaArg::Null
-                }
+                Kind::Object(_) | Kind::Array(_) | Kind::Void => JavaArg::Null,
             })
         })
         .collect()

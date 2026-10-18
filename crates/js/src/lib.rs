@@ -224,7 +224,16 @@ impl ScriptRuntime {
                 return crate::worker::DispatchResult::default();
             };
             match crate::java::invoke_impl(
-                &ctx, function, class, &method, args, fargs, globals, hook,
+                &ctx,
+                function,
+                class,
+                &method,
+                crate::java::HookCall {
+                    args,
+                    fargs,
+                    globals,
+                    hook,
+                },
             ) {
                 Ok((x0, d0)) => crate::worker::DispatchResult { x0, d0 },
                 Err(_) => crate::worker::DispatchResult::default(),
