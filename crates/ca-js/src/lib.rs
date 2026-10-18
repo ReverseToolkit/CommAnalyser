@@ -34,6 +34,7 @@ impl ScriptRuntime {
             None,
             Rc::new(RefCell::new(HookTable::default())),
             Rc::new(RefCell::new(CallbackTable::default())),
+            None,
         )
     }
 
@@ -41,14 +42,16 @@ impl ScriptRuntime {
         tx: Sender<Job>,
         hooks: Rc<RefCell<HookTable>>,
         callbacks: Rc<RefCell<CallbackTable>>,
+        event_tx: Sender<String>,
     ) -> Result<Self> {
-        Self::new_inner(Some(tx), hooks, callbacks)
+        Self::new_inner(Some(tx), hooks, callbacks, Some(event_tx))
     }
 
     fn new_inner(
         tx: Option<Sender<Job>>,
         hooks: Rc<RefCell<HookTable>>,
         callbacks: Rc<RefCell<CallbackTable>>,
+        event_tx: Option<Sender<String>>,
     ) -> Result<Self> {
         let rt = Runtime::new().map_err(js_error)?;
         let ctx = Context::full(&rt).map_err(js_error)?;
@@ -67,12 +70,15 @@ impl ScriptRuntime {
                     error: (...args) => print(args.map(String).join(' ')),
                 };
                 globalThis.__ca_string = v => String(v);
+                globalThis.rpc = { exports: {} };
                 "#,
             )
             .map_err(js_error)?;
-            match tx {
-                Some(tx) => api::install_with_hooks(&ctx, tx, hooks.clone(), callbacks.clone()),
-                None => api::install(&ctx),
+            match (tx, event_tx) {
+                (Some(tx), Some(event_tx)) => {
+                    api::install_with_hooks(&ctx, tx, hooks.clone(), callbacks.clone(), event_tx)
+                }
+                _ => api::install(&ctx),
             }
             .map_err(js_error)?;
             Ok(())
@@ -176,6 +182,12 @@ impl ScriptRuntime {
             )
             .unwrap_or(0)
         })
+    }
+
+    pub(crate) fn run_rpc(&self, name: &str, args: &str) -> Result<String> {
+        self.ctx
+            .with(|ctx| api::invoke_rpc(&ctx, name, args))
+            .map_err(|err| Error::Parse(format!("rpc: {err}")))
     }
 }
 

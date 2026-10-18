@@ -57,6 +57,9 @@ cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
 - **M2f/M2g (done)**: `NativeFunction` + `NativeCallback` via hand-written
   ARM64 stubs (no libffi), signed/pointer args, IFUNC export fix.
   Details: [`docs/07-m2f.md`](docs/07-m2f.md).
+- **M2h (done)**: `send` and `rpc.exports` over the agent channel,
+  validated in `sleep` and Settings.
+  Details: [`docs/08-m2h.md`](docs/08-m2h.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 

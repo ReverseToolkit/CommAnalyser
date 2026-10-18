@@ -9,6 +9,7 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -61,10 +62,26 @@ fn connect_abstract(name: &str) -> std::io::Result<UnixStream> {
 
 fn run(name: &str) -> std::io::Result<()> {
     let stream = connect_abstract(name)?;
-    let mut writer = stream.try_clone()?;
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let mut reader = BufReader::new(stream);
 
-    let worker = match JsWorker::spawn() {
+    let (event_tx, event_rx) = mpsc::channel::<String>();
+    let event_writer = writer.clone();
+    std::thread::spawn(move || {
+        for line in event_rx {
+            let Ok(mut output) = event_writer.lock() else {
+                break;
+            };
+            if output.write_all(line.as_bytes()).is_err()
+                || output.write_all(b"\n").is_err()
+                || output.flush().is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let worker = match JsWorker::spawn(event_tx) {
         Ok(worker) => Some(worker),
         Err(err) => {
             eprintln!("[ca-agent] QuickJS init failed: {err}");
@@ -78,8 +95,11 @@ fn run(name: &str) -> std::io::Result<()> {
         "abi": crate::ca_agent_abi_version(),
         "quickjs": worker.is_some(),
     });
-    writeln!(writer, "{hello}")?;
-    writer.flush()?;
+    {
+        let mut output = writer.lock().expect("agent writer poisoned");
+        writeln!(output, "{hello}")?;
+        output.flush()?;
+    }
 
     let mut line = String::new();
     loop {
@@ -91,8 +111,9 @@ fn run(name: &str) -> std::io::Result<()> {
             Ok(value) => value,
             Err(err) => {
                 let response = json!({"ok": false, "error": format!("bad json: {err}")});
-                writeln!(writer, "{response}")?;
-                writer.flush()?;
+                let mut output = writer.lock().expect("agent writer poisoned");
+                writeln!(output, "{response}")?;
+                output.flush()?;
                 continue;
             }
         };
@@ -107,6 +128,23 @@ fn run(name: &str) -> std::io::Result<()> {
                 match worker.as_ref() {
                     Some(worker) => match worker.eval(code) {
                         Ok(value) => json!({"ok": true, "value": value}),
+                        Err(err) => json!({"ok": false, "error": err.to_string()}),
+                    },
+                    None => json!({"ok": false, "error": "QuickJS unavailable"}),
+                }
+            }
+            "rpc" => {
+                let name = request.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = request
+                    .get("args")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "[]".to_owned());
+                match worker.as_ref() {
+                    Some(worker) => match worker.rpc(name, &args) {
+                        Ok(text) => match serde_json::from_str::<Value>(&text) {
+                            Ok(value) => json!({"ok": true, "value": value}),
+                            Err(_) => json!({"ok": true, "value": text}),
+                        },
                         Err(err) => json!({"ok": false, "error": err.to_string()}),
                     },
                     None => json!({"ok": false, "error": "QuickJS unavailable"}),
@@ -137,8 +175,9 @@ fn run(name: &str) -> std::io::Result<()> {
             other => json!({"ok": false, "error": format!("unknown command: {other}")}),
         };
 
-        writeln!(writer, "{response}")?;
-        writer.flush()?;
+        let mut output = writer.lock().expect("agent writer poisoned");
+        writeln!(output, "{response}")?;
+        output.flush()?;
     }
     Ok(())
 }

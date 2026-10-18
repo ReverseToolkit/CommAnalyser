@@ -26,6 +26,18 @@ fn agents() -> &'static Mutex<HashMap<u32, AgentChannel>> {
     AGENTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn messages() -> &'static Mutex<Vec<Value>> {
+    static MESSAGES: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
+    MESSAGES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn take_messages() -> Vec<Value> {
+    messages()
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default()
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
@@ -142,8 +154,29 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
             let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
             let command = request.get("command").and_then(Value::as_str).unwrap_or("");
             match agent_command(pid, command) {
-                Ok(response) => json!({"ok": true, "pid": pid, "response": response}).to_string(),
+                Ok(response) => json!({
+                    "ok": true,
+                    "pid": pid,
+                    "response": response,
+                    "messages": take_messages(),
+                })
+                .to_string(),
                 Err(err) => error_response(format!("agent: {err}")),
+            }
+        }
+        "rpc" => {
+            let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let name = request.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = request.get("args").cloned().unwrap_or_else(|| json!([]));
+            match agent_request(pid, &json!({"op": "rpc", "name": name, "args": args})) {
+                Ok(response) => json!({
+                    "ok": true,
+                    "pid": pid,
+                    "response": response,
+                    "messages": take_messages(),
+                })
+                .to_string(),
+                Err(err) => error_response(format!("rpc: {err}")),
             }
         }
         "call" => {
@@ -154,7 +187,13 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
                 pid,
                 &json!({"op": "call_int1", "address": address, "arg": arg}),
             ) {
-                Ok(response) => json!({"ok": true, "pid": pid, "response": response}).to_string(),
+                Ok(response) => json!({
+                    "ok": true,
+                    "pid": pid,
+                    "response": response,
+                    "messages": take_messages(),
+                })
+                .to_string(),
                 Err(err) => error_response(format!("call: {err}")),
             }
         }
@@ -162,7 +201,13 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
             let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
             let code = request.get("code").and_then(Value::as_str).unwrap_or("");
             match agent_request(pid, &json!({"op": "eval", "code": code})) {
-                Ok(response) => json!({"ok": true, "pid": pid, "response": response}).to_string(),
+                Ok(response) => json!({
+                    "ok": true,
+                    "pid": pid,
+                    "response": response,
+                    "messages": take_messages(),
+                })
+                .to_string(),
                 Err(err) => error_response(format!("eval: {err}")),
             }
         }
@@ -252,16 +297,26 @@ fn agent_request(pid: u32, request: &Value) -> Result<Value, String> {
         .and_then(|_| channel.writer.flush())
         .map_err(|err| format!("send: {err}"))?;
 
-    let mut response = String::new();
-    let n = channel
-        .reader
-        .read_line(&mut response)
-        .map_err(|err| format!("recv: {err}"))?;
-    if n == 0 {
-        registry.remove(&pid);
-        return Err("agent closed the channel".to_owned());
+    loop {
+        let mut response = String::new();
+        let n = channel
+            .reader
+            .read_line(&mut response)
+            .map_err(|err| format!("recv: {err}"))?;
+        if n == 0 {
+            registry.remove(&pid);
+            return Err("agent closed the channel".to_owned());
+        }
+        let value: Value = serde_json::from_str(response.trim())
+            .unwrap_or_else(|_| json!({"raw": response.trim()}));
+        if value.get("op").and_then(Value::as_str) == Some("send") {
+            if let Ok(mut queue) = messages().lock() {
+                queue.push(value.get("payload").cloned().unwrap_or(Value::Null));
+            }
+            continue;
+        }
+        return Ok(value);
     }
-    Ok(serde_json::from_str(response.trim()).unwrap_or_else(|_| json!({"raw": response.trim()})))
 }
 
 fn error_response(message: String) -> String {

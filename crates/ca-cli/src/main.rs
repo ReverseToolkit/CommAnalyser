@@ -39,7 +39,7 @@ fn run() -> Result<(), String> {
     }
 
     let command = command.ok_or_else(|| {
-        "usage: ca [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|agent|eval|call>"
+        "usage: ca [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|agent|eval|call|rpc>"
             .to_owned()
     })?;
 
@@ -77,6 +77,23 @@ fn run() -> Result<(), String> {
                 .map_err(|_| "invalid pid".to_owned())?;
             let command = rest.get(1).ok_or("usage: ca agent <pid> <command>")?;
             json!({"op": "agent", "pid": pid, "command": command})
+        }
+        "rpc" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: ca rpc <pid> <name> [json-args]")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let name = rest
+                .get(1)
+                .ok_or("usage: ca rpc <pid> <name> [json-args]")?;
+            let args = rest
+                .get(2)
+                .map(|text| serde_json::from_str::<Value>(text))
+                .transpose()
+                .map_err(|err| format!("invalid args: {err}"))?
+                .unwrap_or_else(|| json!([]));
+            json!({"op": "rpc", "pid": pid, "name": name, "args": args})
         }
         "call" => {
             let pid = rest
@@ -128,6 +145,12 @@ fn run() -> Result<(), String> {
         return Err(err.to_owned());
     }
 
+    if let Some(messages) = response.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            eprintln!("[send] {message}");
+        }
+    }
+
     match command.as_str() {
         "ps" => {
             if let Some(processes) = response.get("processes").and_then(Value::as_array) {
@@ -153,6 +176,14 @@ fn run() -> Result<(), String> {
                 response.get("arch").and_then(Value::as_str).unwrap_or("?")
             );
             let _ = writeln!(io::stdout(), "{text}");
+        }
+        "rpc" => {
+            let value = response
+                .get("response")
+                .and_then(|response| response.get("value"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let _ = writeln!(io::stdout(), "{value}");
         }
         _ => {
             let _ = writeln!(io::stdout(), "{response}");

@@ -89,6 +89,11 @@ pub(crate) enum Job {
         args: [u64; 8],
         reply: Sender<u64>,
     },
+    Rpc {
+        name: String,
+        args: String,
+        reply: Sender<Result<String>>,
+    },
     Shutdown,
 }
 
@@ -99,14 +104,28 @@ pub struct JsWorker {
 }
 
 impl JsWorker {
-    pub fn spawn() -> Result<Self> {
+    pub fn spawn(event_tx: Sender<String>) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let worker_tx = tx.clone();
         std::thread::Builder::new()
             .name("ca-js".to_owned())
-            .spawn(move || worker_loop(rx, worker_tx))
+            .spawn(move || worker_loop(rx, worker_tx, event_tx))
             .map_err(Error::Io)?;
         Ok(Self { tx })
+    }
+
+    pub fn rpc(&self, name: &str, args: &str) -> Result<String> {
+        let (reply, response) = mpsc::channel();
+        self.tx
+            .send(Job::Rpc {
+                name: name.to_owned(),
+                args: args.to_owned(),
+                reply,
+            })
+            .map_err(|_| Error::Unsupported("JS worker stopped"))?;
+        response
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| Error::Unsupported("JS worker timed out"))?
     }
 
     pub fn eval(&self, code: &str) -> Result<String> {
@@ -129,12 +148,12 @@ impl Drop for JsWorker {
     }
 }
 
-fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>) {
+fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
     JS_THREAD.with(|flag| flag.set(true));
     let _ = JS_TX.set(tx.clone());
     let hooks = Rc::new(RefCell::new(HookTable::default()));
     let callbacks = Rc::new(RefCell::new(CallbackTable::default()));
-    let runtime = match ScriptRuntime::new_with_hooks(tx, hooks.clone(), callbacks) {
+    let runtime = match ScriptRuntime::new_with_hooks(tx, hooks.clone(), callbacks, event_tx) {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("[ca-js] failed to create runtime: {err}");
@@ -165,6 +184,9 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>) {
             }
             Job::Callback { id, args, reply } => {
                 let _ = reply.send(runtime.run_callback(id, args));
+            }
+            Job::Rpc { name, args, reply } => {
+                let _ = reply.send(runtime.run_rpc(&name, &args));
             }
             Job::Shutdown => break,
         }
@@ -270,10 +292,15 @@ mod tests {
 
     #[test]
     fn evaluates_on_worker() {
-        let worker = JsWorker::spawn().unwrap();
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
         assert_eq!(worker.eval("6 * 7").unwrap(), "42");
         assert_eq!(worker.eval("typeof Interceptor").unwrap(), "object");
         assert_eq!(worker.eval("typeof NativeFunction").unwrap(), "function");
         assert_eq!(worker.eval("typeof NativeCallback").unwrap(), "function");
+        worker
+            .eval("rpc.exports.add = (a, b) => a + b; send({hello: 1}); 'ok'")
+            .unwrap();
+        assert_eq!(worker.rpc("add", "[1, 2]").unwrap(), "3");
     }
 }

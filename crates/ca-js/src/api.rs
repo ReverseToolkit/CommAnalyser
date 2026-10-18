@@ -191,8 +191,22 @@ pub(crate) fn install_with_hooks<'js>(
     tx: Sender<Job>,
     hooks: Rc<RefCell<HookTable>>,
     callbacks: Rc<RefCell<CallbackTable>>,
+    event_tx: Sender<String>,
 ) -> JsResult<()> {
     install(ctx)?;
+    ctx.globals().set(
+        "__ca_send",
+        Func::from(move |text: String| {
+            let _ = event_tx.send(text);
+        }),
+    )?;
+    ctx.eval::<(), _>(
+        r#"
+        globalThis.send = function (payload) {
+            __ca_send(JSON.stringify({ op: 'send', payload: payload }));
+        };
+        "#,
+    )?;
 
     let interceptor = Object::new(ctx.clone())?;
     interceptor.set(
@@ -689,6 +703,27 @@ fn lookup_export<'js>(ctx: Ctx<'js>, module: Value<'js>, symbol: String) -> JsRe
         None => Ok(Value::new_null(ctx)),
     }
 }
+pub(crate) fn invoke_rpc<'js>(ctx: &Ctx<'js>, name: &str, args_json: &str) -> JsResult<String> {
+    let rpc: Object<'js> = ctx.globals().get("rpc")?;
+    let exports: Object<'js> = rpc.get("exports")?;
+    let function: Function<'js> = exports.get(name)?;
+
+    let parse: Function<'js> = ctx.eval("JSON.parse")?;
+    let args_value: Value<'js> = parse.call((args_json,))?;
+    let array: Array<'js> = args_value.get()?;
+
+    let mut call_args = Args::new(ctx.clone(), array.len());
+    for index in 0..array.len() {
+        let value: Value<'js> = array.get(index)?;
+        call_args.push_arg(value)?;
+    }
+    let result: Value<'js> = function.call_arg(call_args)?;
+
+    let stringify: Function<'js> = ctx.eval("JSON.stringify")?;
+    let text: Option<String> = stringify.call((result,))?;
+    Ok(text.unwrap_or_else(|| "null".to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_hex_or_dec;
