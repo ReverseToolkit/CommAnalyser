@@ -3,19 +3,38 @@
 //! M0 only proves the embedding path (runtime/context/eval/console).  The
 //! Frida API objects are added incrementally in later milestones.
 
-use ca_core::{Error, Result};
 mod api;
 mod elf;
+mod worker;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::mpsc::Sender;
+
+use ca_core::{Error, Result};
+use ca_gum::SavedRegs;
 use rquickjs::{CatchResultExt, Context, Function, Runtime};
+
+pub use worker::JsWorker;
+
+use worker::{HookTable, Job};
 
 pub struct ScriptRuntime {
     rt: Runtime,
     ctx: Context,
+    hooks: Rc<RefCell<HookTable>>,
 }
 
 impl ScriptRuntime {
     pub fn new() -> Result<Self> {
+        Self::new_inner(None, Rc::new(RefCell::new(HookTable::default())))
+    }
+
+    pub(crate) fn new_with_hooks(tx: Sender<Job>, hooks: Rc<RefCell<HookTable>>) -> Result<Self> {
+        Self::new_inner(Some(tx), hooks)
+    }
+
+    fn new_inner(tx: Option<Sender<Job>>, hooks: Rc<RefCell<HookTable>>) -> Result<Self> {
         let rt = Runtime::new().map_err(js_error)?;
         let ctx = Context::full(&rt).map_err(js_error)?;
 
@@ -36,11 +55,15 @@ impl ScriptRuntime {
                 "#,
             )
             .map_err(js_error)?;
-            api::install(&ctx).map_err(js_error)?;
+            match tx {
+                Some(tx) => api::install_with_hooks(&ctx, tx, hooks.clone()),
+                None => api::install(&ctx),
+            }
+            .map_err(js_error)?;
             Ok(())
         })?;
 
-        Ok(Self { rt, ctx })
+        Ok(Self { rt, ctx, hooks })
     }
 
     /// Evaluate a script/expression and return `String(value)`.
@@ -61,6 +84,22 @@ impl ScriptRuntime {
 
     pub fn runtime(&self) -> &Runtime {
         &self.rt
+    }
+
+    pub(crate) fn run_hook(&self, id: usize, target: usize, mut regs: SavedRegs) -> SavedRegs {
+        let on_enter = self
+            .hooks
+            .borrow()
+            .listeners
+            .get(id)
+            .and_then(|listener| listener.on_enter.clone());
+        let Some(on_enter) = on_enter else {
+            return regs;
+        };
+        self.ctx.with(|ctx| {
+            let _ = api::invoke_hook(&ctx, on_enter, target, &mut regs);
+        });
+        regs
     }
 }
 

@@ -48,6 +48,9 @@ cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
 - **M2c (done)**: QuickJS Frida-style `NativePointer` / `Memory` /
   `Process` / `Module` / `Thread`; validated against `sleep` and Settings.
   Details: [`docs/04-m2c.md`](docs/04-m2c.md).
+- **M2d (done)**: dedicated JS worker + `Interceptor.attach` with synchronous
+  `onEnter`, `this.context` and `args`; validated in `sleep` and Settings.
+  Details: [`docs/05-m2d.md`](docs/05-m2d.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 

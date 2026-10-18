@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use ca_gum::InlineHook;
-use ca_js::ScriptRuntime;
+use ca_js::JsWorker;
 
 fn connect_abstract(name: &str) -> std::io::Result<UnixStream> {
     if name.len() + 1 > 108 {
@@ -64,8 +64,8 @@ fn run(name: &str) -> std::io::Result<()> {
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
-    let runtime = match ScriptRuntime::new() {
-        Ok(runtime) => Some(runtime),
+    let worker = match JsWorker::spawn() {
+        Ok(worker) => Some(worker),
         Err(err) => {
             eprintln!("[ca-agent] QuickJS init failed: {err}");
             None
@@ -76,7 +76,7 @@ fn run(name: &str) -> std::io::Result<()> {
         "op": "hello",
         "pid": std::process::id(),
         "abi": crate::ca_agent_abi_version(),
-        "quickjs": runtime.is_some(),
+        "quickjs": worker.is_some(),
     });
     writeln!(writer, "{hello}")?;
     writer.flush()?;
@@ -104,13 +104,23 @@ fn run(name: &str) -> std::io::Result<()> {
             "hook_getpid" => hook_getpid(),
             "eval" => {
                 let code = request.get("code").and_then(Value::as_str).unwrap_or("");
-                match runtime.as_ref() {
-                    Some(runtime) => match runtime.eval(code) {
+                match worker.as_ref() {
+                    Some(worker) => match worker.eval(code) {
                         Ok(value) => json!({"ok": true, "value": value}),
                         Err(err) => json!({"ok": false, "error": err.to_string()}),
                     },
                     None => json!({"ok": false, "error": "QuickJS unavailable"}),
                 }
+            }
+            "call_getpid" => {
+                for _ in 0..5 {
+                    // SAFETY: plain libc call; deliberately on this (non-JS) thread
+                    // so a JS Interceptor hook can run on its own thread.
+                    unsafe {
+                        libc::getpid();
+                    }
+                }
+                json!({"ok": true, "pid": std::process::id()})
             }
             other => json!({"ok": false, "error": format!("unknown command: {other}")}),
         };

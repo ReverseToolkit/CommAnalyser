@@ -3,12 +3,23 @@
 //! The surface is intentionally small for M2: pointers, memory, process,
 //! modules and thread sleep.  Interceptor/NativeFunction are added next.
 
+use std::cell::RefCell;
+use std::ffi::c_void;
+use std::rc::Rc;
+use std::sync::mpsc::Sender;
+
 use rquickjs::class::Trace;
+use rquickjs::function::Args;
 use rquickjs::prelude::Func;
-use rquickjs::{Array, ArrayBuffer, Class, Ctx, JsLifetime, Object, Result as JsResult, Value};
+use rquickjs::{
+    Array, ArrayBuffer, Class, Ctx, Function, JsLifetime, Object, Persistent, Result as JsResult,
+    Value,
+};
 
 use ca_core::module;
-use ca_gum::{memory, process, thread};
+use ca_gum::{memory, process, thread, InlineHook, SavedRegs};
+
+use crate::worker::{hook_trampoline, make_bridge, HookListener, HookTable, Job};
 
 /// JavaScript `NativePointer`.
 #[derive(Clone, Trace, JsLifetime)]
@@ -127,6 +138,107 @@ pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     globals.set("Process", process_object(ctx)?)?;
     globals.set("Module", module_object(ctx)?)?;
     globals.set("Thread", thread_object(ctx)?)?;
+    Ok(())
+}
+
+/// Install the base API plus `Interceptor` backed by the JS worker.
+pub(crate) fn install_with_hooks<'js>(
+    ctx: &Ctx<'js>,
+    tx: Sender<Job>,
+    hooks: Rc<RefCell<HookTable>>,
+) -> JsResult<()> {
+    install(ctx)?;
+
+    let interceptor = Object::new(ctx.clone())?;
+    interceptor.set(
+        "attach",
+        Func::from(
+            move |ctx: Ctx<'js>, target: Value<'js>, callbacks: Value<'js>| -> JsResult<()> {
+                let address = usize::try_from(parse_pointer(&target)?)
+                    .map_err(|_| js_error("target address does not fit in usize"))?;
+                let callbacks: Object<'js> = callbacks.get()?;
+                let on_enter: Option<Function<'js>> = callbacks.get("onEnter")?;
+                let on_enter = on_enter.map(|function| Persistent::save(&ctx, function));
+
+                let id = {
+                    let mut table = hooks.borrow_mut();
+                    table.listeners.push(HookListener {
+                        on_enter,
+                        hook: None,
+                        bridge: std::ptr::null_mut(),
+                    });
+                    table.listeners.len() - 1
+                };
+
+                let bridge = make_bridge(id, address, tx.clone());
+                // SAFETY: bridge stays alive in HookListener; callback only uses
+                // the channel and SavedRegs.
+                let hook =
+                    unsafe { InlineHook::attach(address, hook_trampoline, bridge as *mut c_void) }
+                        .map_err(to_js_error)?;
+
+                let mut table = hooks.borrow_mut();
+                table.listeners[id].hook = Some(hook);
+                table.listeners[id].bridge = bridge;
+                Ok(())
+            },
+        ),
+    )?;
+    ctx.globals().set("Interceptor", interceptor)?;
+    Ok(())
+}
+
+/// Invoke a saved `onEnter` function with Frida-like `this.context` and `args`.
+pub(crate) fn invoke_hook<'js>(
+    ctx: &Ctx<'js>,
+    on_enter: Persistent<Function<'static>>,
+    target: usize,
+    regs: &mut SavedRegs,
+) -> JsResult<()> {
+    let on_enter = on_enter.restore(ctx)?;
+
+    let args = Array::new(ctx.clone())?;
+    for index in 0..8 {
+        args.set(index, NativePointer::instance(ctx.clone(), regs.x[index])?)?;
+    }
+
+    let context = Object::new(ctx.clone())?;
+    context.set("pc", NativePointer::instance(ctx.clone(), target as u64)?)?;
+    context.set("sp", NativePointer::instance(ctx.clone(), 0)?)?;
+    context.set("lr", NativePointer::instance(ctx.clone(), regs.lr)?)?;
+    for index in 0..8 {
+        let value = NativePointer::instance(ctx.clone(), regs.x[index])?;
+        match index {
+            0 => context.set("x0", value)?,
+            1 => context.set("x1", value)?,
+            2 => context.set("x2", value)?,
+            3 => context.set("x3", value)?,
+            4 => context.set("x4", value)?,
+            5 => context.set("x5", value)?,
+            6 => context.set("x6", value)?,
+            _ => context.set("x7", value)?,
+        }
+    }
+
+    let this = Object::new(ctx.clone())?;
+    this.set("context", context)?;
+    this.set(
+        "returnAddress",
+        NativePointer::instance(ctx.clone(), regs.lr)?,
+    )?;
+    this.set("threadId", thread::current_id())?;
+    this.set("depth", 0u32)?;
+
+    let mut call_args = Args::new(ctx.clone(), 1);
+    call_args.this(this)?;
+    call_args.push_arg(args.clone())?;
+    on_enter.call_arg::<()>(call_args)?;
+
+    for index in 0..8 {
+        if let Ok(pointer) = args.get::<Class<NativePointer>>(index) {
+            regs.x[index] = pointer.borrow().value;
+        }
+    }
     Ok(())
 }
 
