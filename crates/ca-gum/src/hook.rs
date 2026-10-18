@@ -1,13 +1,16 @@
 //! Minimal AArch64 inline hook.
 //!
 //! The trampoline saves the caller-saved argument registers, calls a Rust
-//! callback, restores the registers, executes the relocated prologue with the
-//! original SP, and jumps back after it.  This is intentionally smaller than
-//! Frida's Interceptor (no onLeave/return hijack yet) but it is enough to
-//! validate the decoder/relocator/patch path on a real device.
+//! `onEnter` callback, and executes the relocated prologue with the original
+//! SP.  When `onLeave` is present, LR is redirected to a shared return stub;
+//! the stub calls `onLeave`, lets it rewrite x0, then returns to the original
+//! caller.  This is still smaller than Frida's Interceptor but covers the
+//! common `onEnter`/`onLeave` + `retval.replace` path.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::OnceLock;
 
 use ca_arch_arm64::relocator::relocate_one;
 use ca_arch_arm64::writer::CodeWriter;
@@ -44,10 +47,22 @@ impl SavedRegs {
 
 pub type HookCallback = unsafe extern "C" fn(*mut SavedRegs, *mut c_void);
 
+struct LeaveFrame {
+    on_leave: HookCallback,
+    user_data: *mut c_void,
+    original_lr: u64,
+}
+
+thread_local! {
+    static LEAVE_FRAMES: RefCell<Vec<LeaveFrame>> = const { RefCell::new(Vec::new()) };
+}
+
 #[repr(C)]
 struct HookEntry {
-    callback: HookCallback,
+    on_enter: HookCallback,
+    on_leave: Option<HookCallback>,
     user_data: *mut c_void,
+    return_stub: usize,
 }
 
 unsafe extern "C" fn dispatch(entry: *mut HookEntry, regs: *mut SavedRegs) {
@@ -56,8 +71,39 @@ unsafe extern "C" fn dispatch(entry: *mut HookEntry, regs: *mut SavedRegs) {
     }
     // SAFETY: the trampoline embeds a pointer to a HookEntry that outlives it.
     let entry = unsafe { &*entry };
+    let original_lr = unsafe { (*regs).lr };
+
     // SAFETY: caller-provided callback and data; contract is documented on attach().
-    unsafe { (entry.callback)(regs, entry.user_data) };
+    unsafe { (entry.on_enter)(regs, entry.user_data) };
+
+    if let Some(on_leave) = entry.on_leave {
+        if entry.return_stub != 0 {
+            LEAVE_FRAMES.with(|frames| {
+                frames.borrow_mut().push(LeaveFrame {
+                    on_leave,
+                    user_data: entry.user_data,
+                    original_lr,
+                });
+            });
+            // The relocated prologue may save this LR; the function's RET will
+            // therefore land in the shared return stub.
+            unsafe { (*regs).lr = entry.return_stub as u64 };
+        }
+    }
+}
+
+unsafe extern "C" fn leave_dispatch(regs: *mut SavedRegs) {
+    if regs.is_null() {
+        return;
+    }
+    let frame = LEAVE_FRAMES.with(|frames| frames.borrow_mut().pop());
+    let Some(frame) = frame else {
+        return;
+    };
+    // SAFETY: caller-provided on_leave callback and user_data.
+    unsafe { (frame.on_leave)(regs, frame.user_data) };
+    // SAFETY: regs is the live SavedRegs passed by the return stub.
+    unsafe { (*regs).lr = frame.original_lr };
 }
 
 pub struct InlineHook {
@@ -79,13 +125,34 @@ impl InlineHook {
         callback: HookCallback,
         user_data: *mut c_void,
     ) -> Result<Self> {
+        // SAFETY: forwarded to attach_ex.
+        unsafe { Self::attach_ex(target, callback, None, user_data) }
+    }
+
+    /// Install a hook with an optional `onLeave` callback.
+    ///
+    /// # Safety
+    /// `user_data` must remain valid for as long as the hook is active.
+    pub unsafe fn attach_ex(
+        target: usize,
+        on_enter: HookCallback,
+        on_leave: Option<HookCallback>,
+        user_data: *mut c_void,
+    ) -> Result<Self> {
         if target == 0 {
             return Err(Error::Parse("hook: null target".into()));
         }
 
+        let return_stub = if on_leave.is_some() {
+            return_stub()?
+        } else {
+            0
+        };
         let entry = Box::into_raw(Box::new(HookEntry {
-            callback,
+            on_enter,
+            on_leave,
             user_data,
+            return_stub,
         }));
 
         // Skip BTI/PAC prologue instructions: leaving them in place means an
@@ -196,6 +263,65 @@ fn emit_trampoline(w: &mut CodeWriter, entry: *mut HookEntry, prologue: &[u8], r
     w.ldr_literal_x(16, 8);
     w.ret(16);
     w.put_u64(resume as u64);
+}
+
+fn return_stub() -> Result<usize> {
+    static STUB: OnceLock<usize> = OnceLock::new();
+    let address = *STUB.get_or_init(|| make_return_stub().unwrap_or(0));
+    if address == 0 {
+        return Err(Error::Unsupported("hook: cannot allocate return stub"));
+    }
+    Ok(address)
+}
+
+fn make_return_stub() -> Option<usize> {
+    let page = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if page == libc::MAP_FAILED {
+        return None;
+    }
+
+    let mut w = CodeWriter::with_capacity(256);
+    emit_return_stub(&mut w);
+    // SAFETY: page is a private mapping of at least PAGE bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(w.bytes().as_ptr(), page as *mut u8, w.len());
+    }
+    flush_icache(page as usize, w.len());
+    if protect(page as usize, PAGE, libc::PROT_READ | libc::PROT_EXEC).is_err() {
+        unsafe { libc::munmap(page, PAGE) };
+        return None;
+    }
+    Some(page as usize)
+}
+
+fn emit_return_stub(w: &mut CodeWriter) {
+    w.bti_c();
+    w.sub_sp(SAVE_SIZE);
+    for i in 0..9u8 {
+        w.stp(i * 2, i * 2 + 1, 31, (i as i64) * 16);
+    }
+    w.str_imm(18, 31, 144);
+    w.str_imm(30, 31, 152);
+
+    w.put(0x9100_03E0); // mov x0, sp
+    w.abs_bl(leave_dispatch as *const () as usize);
+
+    for i in 0..9u8 {
+        w.ldp(i * 2, i * 2 + 1, 31, (i as i64) * 16);
+    }
+    w.ldr_imm(18, 31, 144);
+    w.ldr_imm(30, 31, 152);
+    w.add_sp(SAVE_SIZE);
+    w.ret(30);
 }
 
 fn is_bti_or_pac(word: u32) -> bool {

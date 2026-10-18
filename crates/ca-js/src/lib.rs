@@ -86,18 +86,47 @@ impl ScriptRuntime {
         &self.rt
     }
 
-    pub(crate) fn run_hook(&self, id: usize, target: usize, mut regs: SavedRegs) -> SavedRegs {
-        let on_enter = self
+    pub(crate) fn run_enter(&self, group: usize, target: usize, mut regs: SavedRegs) -> SavedRegs {
+        let listeners: Vec<_> = self
             .hooks
             .borrow()
-            .listeners
-            .get(id)
-            .and_then(|listener| listener.on_enter.clone());
-        let Some(on_enter) = on_enter else {
-            return regs;
-        };
+            .groups
+            .get(group)
+            .map(|group| {
+                group
+                    .listeners
+                    .iter()
+                    .filter_map(|listener| listener.on_enter.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         self.ctx.with(|ctx| {
-            let _ = api::invoke_hook(&ctx, on_enter, target, &mut regs);
+            for on_enter in listeners {
+                let _ = api::invoke_enter(&ctx, on_enter, target, &mut regs);
+            }
+        });
+        regs
+    }
+
+    pub(crate) fn run_leave(&self, group: usize, target: usize, mut regs: SavedRegs) -> SavedRegs {
+        let listeners: Vec<_> = self
+            .hooks
+            .borrow()
+            .groups
+            .get(group)
+            .map(|group| {
+                group
+                    .listeners
+                    .iter()
+                    .rev()
+                    .filter_map(|listener| listener.on_leave.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.ctx.with(|ctx| {
+            for on_leave in listeners {
+                let _ = api::invoke_leave(&ctx, on_leave, target, &mut regs);
+            }
         });
         regs
     }

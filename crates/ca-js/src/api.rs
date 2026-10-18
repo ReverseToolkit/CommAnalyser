@@ -19,7 +19,7 @@ use rquickjs::{
 use ca_core::module;
 use ca_gum::{memory, process, thread, InlineHook, SavedRegs};
 
-use crate::worker::{hook_trampoline, make_bridge, HookListener, HookTable, Job};
+use crate::worker::{hook_enter, hook_leave, make_bridge, HookGroup, HookTable, Job, Listener};
 
 /// JavaScript `NativePointer`.
 #[derive(Clone, Trace, JsLifetime)]
@@ -119,10 +119,43 @@ impl NativePointer {
     }
 }
 
+/// JavaScript `retval` object passed to `onLeave`.
+#[derive(Clone, Trace, JsLifetime)]
+#[rquickjs::class(rename_all = "camelCase")]
+pub struct Retval {
+    value: u64,
+}
+
+#[rquickjs::methods(rename_all = "camelCase")]
+impl Retval {
+    #[qjs(constructor)]
+    pub fn new(value: Value<'_>) -> JsResult<Self> {
+        Ok(Self {
+            value: parse_pointer(&value)?,
+        })
+    }
+
+    #[qjs(get, rename = "__value")]
+    pub fn value(&self) -> u64 {
+        self.value
+    }
+
+    #[qjs(rename = "toString")]
+    pub fn as_string(&self) -> String {
+        format!("0x{:x}", self.value)
+    }
+
+    pub fn replace(&mut self, value: Value<'_>) -> JsResult<()> {
+        self.value = parse_pointer(&value)?;
+        Ok(())
+    }
+}
+
 /// Install `ptr`, `NULL`, `Memory`, `Process`, `Module`, `Thread`.
 pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     let globals = ctx.globals();
     Class::<NativePointer>::define(&globals)?;
+    Class::<Retval>::define(&globals)?;
 
     globals.set(
         "ptr",
@@ -153,34 +186,57 @@ pub(crate) fn install_with_hooks<'js>(
     interceptor.set(
         "attach",
         Func::from(
-            move |ctx: Ctx<'js>, target: Value<'js>, callbacks: Value<'js>| -> JsResult<()> {
+            move |ctx: Ctx<'js>, target: Value<'js>, callbacks: Value<'js>| -> JsResult<u32> {
                 let address = usize::try_from(parse_pointer(&target)?)
                     .map_err(|_| js_error("target address does not fit in usize"))?;
                 let callbacks: Object<'js> = callbacks.get()?;
                 let on_enter: Option<Function<'js>> = callbacks.get("onEnter")?;
-                let on_enter = on_enter.map(|function| Persistent::save(&ctx, function));
+                let on_leave: Option<Function<'js>> = callbacks.get("onLeave")?;
+                let listener = Listener {
+                    on_enter: on_enter.map(|function| Persistent::save(&ctx, function)),
+                    on_leave: on_leave.map(|function| Persistent::save(&ctx, function)),
+                };
 
-                let id = {
+                let group = {
                     let mut table = hooks.borrow_mut();
-                    table.listeners.push(HookListener {
-                        on_enter,
+                    if let Some(index) = table.groups.iter().position(|g| g.target == address) {
+                        table.groups[index].listeners.push(listener);
+                        return Ok(index as u32);
+                    }
+                    let index = table.groups.len();
+                    table.groups.push(HookGroup {
+                        target: address,
+                        listeners: vec![listener],
                         hook: None,
                         bridge: std::ptr::null_mut(),
                     });
-                    table.listeners.len() - 1
+                    index
                 };
 
-                let bridge = make_bridge(id, address, tx.clone());
-                // SAFETY: bridge stays alive in HookListener; callback only uses
-                // the channel and SavedRegs.
-                let hook =
-                    unsafe { InlineHook::attach(address, hook_trampoline, bridge as *mut c_void) }
-                        .map_err(to_js_error)?;
+                let bridge = make_bridge(group, address, tx.clone());
+                // SAFETY: bridge stays alive in HookGroup; callbacks only use the
+                // channel, SavedRegs and a stable target address.
+                let hook = unsafe {
+                    InlineHook::attach_ex(
+                        address,
+                        hook_enter,
+                        Some(hook_leave),
+                        bridge as *mut c_void,
+                    )
+                };
 
-                let mut table = hooks.borrow_mut();
-                table.listeners[id].hook = Some(hook);
-                table.listeners[id].bridge = bridge;
-                Ok(())
+                match hook {
+                    Ok(hook) => {
+                        let mut table = hooks.borrow_mut();
+                        table.groups[group].hook = Some(hook);
+                        table.groups[group].bridge = bridge;
+                        Ok(group as u32)
+                    }
+                    Err(err) => {
+                        hooks.borrow_mut().groups.pop();
+                        Err(to_js_error(err))
+                    }
+                }
             },
         ),
     )?;
@@ -189,7 +245,7 @@ pub(crate) fn install_with_hooks<'js>(
 }
 
 /// Invoke a saved `onEnter` function with Frida-like `this.context` and `args`.
-pub(crate) fn invoke_hook<'js>(
+pub(crate) fn invoke_enter<'js>(
     ctx: &Ctx<'js>,
     on_enter: Persistent<Function<'static>>,
     target: usize,
@@ -202,6 +258,41 @@ pub(crate) fn invoke_hook<'js>(
         args.set(index, NativePointer::instance(ctx.clone(), regs.x[index])?)?;
     }
 
+    let this = make_this(ctx, target, regs)?;
+    let mut call_args = Args::new(ctx.clone(), 1);
+    call_args.this(this)?;
+    call_args.push_arg(args.clone())?;
+    on_enter.call_arg::<()>(call_args)?;
+
+    for index in 0..8 {
+        if let Ok(pointer) = args.get::<Class<NativePointer>>(index) {
+            regs.x[index] = pointer.borrow().value;
+        }
+    }
+    Ok(())
+}
+
+/// Invoke a saved `onLeave` function with `retval` and `this.context`.
+pub(crate) fn invoke_leave<'js>(
+    ctx: &Ctx<'js>,
+    on_leave: Persistent<Function<'static>>,
+    target: usize,
+    regs: &mut SavedRegs,
+) -> JsResult<()> {
+    let on_leave = on_leave.restore(ctx)?;
+    let retval = Class::instance(ctx.clone(), Retval { value: regs.x[0] })?;
+
+    let this = make_this(ctx, target, regs)?;
+    let mut call_args = Args::new(ctx.clone(), 1);
+    call_args.this(this)?;
+    call_args.push_arg(retval.clone())?;
+    on_leave.call_arg::<()>(call_args)?;
+
+    regs.x[0] = retval.borrow().value;
+    Ok(())
+}
+
+fn make_this<'js>(ctx: &Ctx<'js>, target: usize, regs: &SavedRegs) -> JsResult<Object<'js>> {
     let context = Object::new(ctx.clone())?;
     context.set("pc", NativePointer::instance(ctx.clone(), target as u64)?)?;
     context.set("sp", NativePointer::instance(ctx.clone(), 0)?)?;
@@ -228,18 +319,7 @@ pub(crate) fn invoke_hook<'js>(
     )?;
     this.set("threadId", thread::current_id())?;
     this.set("depth", 0u32)?;
-
-    let mut call_args = Args::new(ctx.clone(), 1);
-    call_args.this(this)?;
-    call_args.push_arg(args.clone())?;
-    on_enter.call_arg::<()>(call_args)?;
-
-    for index in 0..8 {
-        if let Ok(pointer) = args.get::<Class<NativePointer>>(index) {
-            regs.x[index] = pointer.borrow().value;
-        }
-    }
-    Ok(())
+    Ok(this)
 }
 
 fn memory_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {

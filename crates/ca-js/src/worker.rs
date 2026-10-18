@@ -26,24 +26,29 @@ fn is_js_thread() -> bool {
     JS_THREAD.with(Cell::get)
 }
 
-/// One hook listener registered from JavaScript.
-pub(crate) struct HookListener {
+/// One listener registered by `Interceptor.attach`.
+pub(crate) struct Listener {
     pub(crate) on_enter: Option<Persistent<Function<'static>>>,
-    pub(crate) hook: Option<InlineHook>,
-    /// Raw pointer to the `HookBridge` embedded in the trampoline's user_data.
-    pub(crate) bridge: *mut HookBridge,
+    pub(crate) on_leave: Option<Persistent<Function<'static>>>,
 }
 
-/// Shared state for one installed hook.
-pub(crate) struct HookBridge {
-    pub(crate) id: usize,
+/// All listeners for one target address, plus the single inline hook.
+pub(crate) struct HookGroup {
     pub(crate) target: usize,
-    pub(crate) tx: Sender<Job>,
+    pub(crate) listeners: Vec<Listener>,
+    pub(crate) hook: Option<InlineHook>,
+    pub(crate) bridge: *mut HookBridge,
 }
 
 #[derive(Default)]
 pub(crate) struct HookTable {
-    pub(crate) listeners: Vec<HookListener>,
+    pub(crate) groups: Vec<HookGroup>,
+}
+
+pub(crate) struct HookBridge {
+    pub(crate) group: usize,
+    pub(crate) target: usize,
+    pub(crate) tx: Sender<Job>,
 }
 
 pub(crate) enum Job {
@@ -51,8 +56,14 @@ pub(crate) enum Job {
         code: String,
         reply: Sender<Result<String>>,
     },
-    Hook {
-        id: usize,
+    Enter {
+        group: usize,
+        target: usize,
+        regs: SavedRegs,
+        reply: Sender<SavedRegs>,
+    },
+    Leave {
+        group: usize,
         target: usize,
         regs: SavedRegs,
         reply: Sender<SavedRegs>,
@@ -113,21 +124,29 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>) {
             Job::Eval { code, reply } => {
                 let _ = reply.send(runtime.eval(&code));
             }
-            Job::Hook {
-                id,
+            Job::Enter {
+                group,
                 target,
                 regs,
                 reply,
             } => {
-                let _ = reply.send(runtime.run_hook(id, target, regs));
+                let _ = reply.send(runtime.run_enter(group, target, regs));
+            }
+            Job::Leave {
+                group,
+                target,
+                regs,
+                reply,
+            } => {
+                let _ = reply.send(runtime.run_leave(group, target, regs));
             }
             Job::Shutdown => break,
         }
     }
 }
 
-/// Trampoline installed into `InlineHook` for JS `Interceptor.attach`.
-pub(crate) unsafe extern "C" fn hook_trampoline(regs: *mut SavedRegs, data: *mut std::ffi::c_void) {
+/// Trampoline for `Interceptor.attach` onEnter.
+pub(crate) unsafe extern "C" fn hook_enter(regs: *mut SavedRegs, data: *mut std::ffi::c_void) {
     if regs.is_null() || data.is_null() || is_js_thread() {
         return;
     }
@@ -136,13 +155,13 @@ pub(crate) unsafe extern "C" fn hook_trampoline(regs: *mut SavedRegs, data: *mut
     }
     HOOK_ACTIVE.with(|flag| flag.set(true));
 
-    // SAFETY: `data` points to a HookBridge kept alive by HookListener.
+    // SAFETY: `data` points to a HookBridge kept alive by HookGroup.
     let bridge = unsafe { &*(data as *const HookBridge) };
     let (reply, response) = mpsc::channel();
     if bridge
         .tx
-        .send(Job::Hook {
-            id: bridge.id,
+        .send(Job::Enter {
+            group: bridge.group,
             target: bridge.target,
             regs: unsafe { *regs },
             reply,
@@ -158,8 +177,40 @@ pub(crate) unsafe extern "C" fn hook_trampoline(regs: *mut SavedRegs, data: *mut
     HOOK_ACTIVE.with(|flag| flag.set(false));
 }
 
-pub(crate) fn make_bridge(id: usize, target: usize, tx: Sender<Job>) -> *mut HookBridge {
-    Box::into_raw(Box::new(HookBridge { id, target, tx }))
+/// Trampoline for `Interceptor.attach` onLeave.
+pub(crate) unsafe extern "C" fn hook_leave(regs: *mut SavedRegs, data: *mut std::ffi::c_void) {
+    if regs.is_null() || data.is_null() || is_js_thread() {
+        return;
+    }
+    if HOOK_ACTIVE.with(Cell::get) {
+        return;
+    }
+    HOOK_ACTIVE.with(|flag| flag.set(true));
+
+    // SAFETY: `data` points to a HookBridge kept alive by HookGroup.
+    let bridge = unsafe { &*(data as *const HookBridge) };
+    let (reply, response) = mpsc::channel();
+    if bridge
+        .tx
+        .send(Job::Leave {
+            group: bridge.group,
+            target: bridge.target,
+            regs: unsafe { *regs },
+            reply,
+        })
+        .is_ok()
+    {
+        if let Ok(updated) = response.recv_timeout(Duration::from_secs(5)) {
+            // SAFETY: regs is the live SavedRegs passed by the return stub.
+            unsafe { *regs = updated };
+        }
+    }
+
+    HOOK_ACTIVE.with(|flag| flag.set(false));
+}
+
+pub(crate) fn make_bridge(group: usize, target: usize, tx: Sender<Job>) -> *mut HookBridge {
+    Box::into_raw(Box::new(HookBridge { group, target, tx }))
 }
 
 #[cfg(test)]

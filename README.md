@@ -51,6 +51,9 @@ cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
 - **M2d (done)**: dedicated JS worker + `Interceptor.attach` with synchronous
   `onEnter`, `this.context` and `args`; validated in `sleep` and Settings.
   Details: [`docs/05-m2d.md`](docs/05-m2d.md).
+- **M2e (done)**: grouped listeners, `onLeave` via a shared return stub, and
+  `retval.replace`; validated in `sleep` and Settings.
+  Details: [`docs/06-m2e.md`](docs/06-m2e.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 

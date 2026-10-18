@@ -113,14 +113,13 @@ fn run(name: &str) -> std::io::Result<()> {
                 }
             }
             "call_getpid" => {
+                let mut last = 0;
                 for _ in 0..5 {
                     // SAFETY: plain libc call; deliberately on this (non-JS) thread
                     // so a JS Interceptor hook can run on its own thread.
-                    unsafe {
-                        libc::getpid();
-                    }
+                    last = unsafe { libc::getpid() };
                 }
-                json!({"ok": true, "pid": std::process::id()})
+                json!({"ok": true, "pid": last})
             }
             other => json!({"ok": false, "error": format!("unknown command: {other}")}),
         };
