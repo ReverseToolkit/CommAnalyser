@@ -142,6 +142,14 @@ fn run(name: &str) -> std::io::Result<()> {
                 Ok(value) => json!({"ok": true, "value": format!("{value:#x}")}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
+            "java_char_at" => match art::java::call_char_at() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_bit_count" => match art::java::call_bit_count() {
+                Ok(value) => json!({"ok": true, "value": value}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
             "java_length" => match art::java::call_length() {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),

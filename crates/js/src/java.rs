@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use rquickjs::function::Rest;
 use rquickjs::prelude::Func;
-use rquickjs::{Ctx, Function, IntoJs, Object, Persistent, Result as JsResult, Value};
+use rquickjs::{Array, Ctx, Function, IntoJs, Object, Persistent, Result as JsResult, Value};
 
 use crate::worker::{java_dispatch, JavaHookEntry, JavaHookTable};
 use art::java::{ClassInfo, CtorInfo, JavaArg, JavaClass, JavaObject, JavaValue, Kind, MethodInfo};
@@ -42,6 +42,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                             && method.signature == signature
                             && method.is_static == is_static
                     })
+                    .cloned()
                     .ok_or_else(|| js_error("Java method not found"))?;
                 let mut table = java_hooks.borrow_mut();
                 let id = table.entries.len();
@@ -49,6 +50,8 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                     .map_err(to_js_error)?;
                 table.entries.push(JavaHookEntry {
                     function: Persistent::save(&ctx, callback),
+                    class,
+                    method,
                     _hook: hook,
                 });
                 Ok(())
@@ -57,6 +60,9 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
     )?;
     ctx.eval::<(), _>(
         r#"
+        globalThis.__analyser_call_impl = function (fn, thisObj, args) {
+            return fn.apply(thisObj, args);
+        };
         globalThis.__analyser_make_java_method = function (fn, className, methodName, signature, isStatic) {
             Object.defineProperty(fn, 'implementation', {
                 configurable: true,
@@ -283,6 +289,62 @@ fn to_arg(value: &Value<'_>, kind: &Kind) -> JsResult<JavaArg> {
         }
         Kind::Array(_) | Kind::Void | Kind::Float | Kind::Double => {
             Err(js_error("unsupported Java parameter type"))
+        }
+    }
+}
+
+pub(crate) fn invoke_impl<'js>(
+    ctx: &Ctx<'js>,
+    function: Function<'js>,
+    class: Rc<JavaClass>,
+    method: &MethodInfo,
+    args: [u64; 8],
+) -> JsResult<u64> {
+    let start = if method.is_static { 1 } else { 2 };
+    let this_value: Value<'js> = if method.is_static {
+        Value::new_undefined(ctx.clone())
+    } else {
+        let object = art::java::object_from_raw(class.info.clone(), args[1] as usize)
+            .map_err(to_js_error)?;
+        let id = register(object);
+        instance_object(ctx.clone(), class.clone(), id)?.into_value()
+    };
+
+    let call_args = Array::new(ctx.clone())?;
+    for (slot, kind) in method.params.iter().enumerate() {
+        let raw = args[start + slot];
+        let value: Value<'js> = match kind {
+            Kind::Boolean => (raw as u8 != 0).into_js(ctx)?,
+            Kind::Byte | Kind::Char | Kind::Short | Kind::Int => (raw as i32).into_js(ctx)?,
+            Kind::Long => (raw as i64).into_js(ctx)?,
+            Kind::Object(name) if name == "java.lang.String" => {
+                match art::java::string_from_raw(raw as usize).map_err(to_js_error)? {
+                    Some(value) => value.into_js(ctx)?,
+                    None => Value::new_null(ctx.clone()),
+                }
+            }
+            Kind::Object(_) => {
+                let object = art::java::object_from_raw(class.info.clone(), raw as usize)
+                    .map_err(to_js_error)?;
+                let id = register(object);
+                instance_object(ctx.clone(), class.clone(), id)?.into_value()
+            }
+            Kind::Array(_) | Kind::Void | Kind::Float | Kind::Double => {
+                return Err(js_error("unsupported Java hook argument type"))
+            }
+        };
+        call_args.set(slot, value)?;
+    }
+
+    let call: Function<'js> = ctx.globals().get("__analyser_call_impl")?;
+    let result: Value<'js> = call.call((function, this_value, call_args))?;
+    match &method.ret {
+        Kind::Void => Ok(0),
+        Kind::Boolean => Ok(u64::from(result.get::<bool>()?)),
+        Kind::Byte | Kind::Char | Kind::Short | Kind::Int => Ok(result.get::<i64>()? as u64),
+        Kind::Long => Ok(result.get::<i64>()? as u64),
+        Kind::Object(_) | Kind::Array(_) | Kind::Float | Kind::Double => {
+            Err(js_error("unsupported Java hook return type"))
         }
     }
 }

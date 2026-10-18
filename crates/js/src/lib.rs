@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use gum::SavedRegs;
-use rquickjs::{CatchResultExt, Context, Function, Runtime, Value};
+use rquickjs::{CatchResultExt, Context, Function, Runtime};
 use runtime::{Error, Result};
 
 pub use worker::JsWorker;
@@ -195,28 +195,22 @@ impl ScriptRuntime {
         })
     }
 
-    pub(crate) fn run_java_impl(&self, id: usize) -> u64 {
-        let function = self
-            .java_hooks
-            .borrow()
-            .entries
-            .get(id)
-            .map(|entry| entry.function.clone());
-        let Some(function) = function else {
+    pub(crate) fn run_java_impl(&self, id: usize, args: [u64; 8]) -> u64 {
+        let entry = self.java_hooks.borrow().entries.get(id).map(|entry| {
+            (
+                entry.function.clone(),
+                entry.class.clone(),
+                entry.method.clone(),
+            )
+        });
+        let Some((function, class, method)) = entry else {
             return 0;
         };
         self.ctx.with(|ctx| {
             let Ok(function) = function.restore(&ctx) else {
                 return 0;
             };
-            let Ok(value) = function.call::<_, Value>(()) else {
-                return 0;
-            };
-            value
-                .get::<i64>()
-                .map(|value| value as u64)
-                .or_else(|_| value.get::<bool>().map(u64::from))
-                .unwrap_or(0)
+            crate::java::invoke_impl(&ctx, function, class, &method, args).unwrap_or(0)
         })
     }
 

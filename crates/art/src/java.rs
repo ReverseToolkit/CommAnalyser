@@ -435,9 +435,10 @@ fn marshal<'a>(
     for (kind, arg) in params.iter().zip(args) {
         let value = match (kind, arg) {
             (Kind::Boolean, JavaArg::Boolean(value)) => jvalue { z: *value },
-            (Kind::Int | Kind::Byte | Kind::Char | Kind::Short, JavaArg::Int(value)) => {
-                jvalue { i: *value }
-            }
+            (Kind::Int, JavaArg::Int(value)) => jvalue { i: *value },
+            (Kind::Byte, JavaArg::Int(value)) => jvalue { b: *value as i8 },
+            (Kind::Char, JavaArg::Int(value)) => jvalue { c: *value as u16 },
+            (Kind::Short, JavaArg::Int(value)) => jvalue { s: *value as i16 },
             (Kind::Long, JavaArg::Long(value)) => jvalue { j: *value },
             (Kind::Object(_), JavaArg::String(value)) => {
                 let string = env.new_string(value)?;
@@ -475,7 +476,10 @@ fn convert<'a>(
     Ok(match kind {
         Kind::Void => JavaValue::Void,
         Kind::Boolean => JavaValue::Boolean(value.z()?),
-        Kind::Int | Kind::Byte | Kind::Char | Kind::Short => JavaValue::Int(value.i()?),
+        Kind::Int => JavaValue::Int(value.i()?),
+        Kind::Byte => JavaValue::Int(i32::from(value.b()?)),
+        Kind::Char => JavaValue::Int(i32::from(value.c()?)),
+        Kind::Short => JavaValue::Int(i32::from(value.s()?)),
         Kind::Long => JavaValue::Long(value.j()?),
         Kind::Object(_) | Kind::Array(_) => {
             let object = value.l()?;
@@ -565,4 +569,71 @@ pub fn hook_install_test() -> Result<String> {
         "value": value,
     })
     .to_string())
+}
+
+/// Wrap a raw JNI object pointer as a `JavaObject` with the given class info.
+pub fn object_from_raw(info: Rc<ClassInfo>, raw: usize) -> Result<JavaObject> {
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        // SAFETY: the caller received this raw reference as a Java hook
+        // argument, so it is valid for the current native frame.
+        let object = unsafe { JObject::from_raw(env, raw as jni::sys::jobject) };
+        let global = env.new_global_ref(&object)?;
+        Ok(JavaObject::from_global(info, global))
+    })
+}
+
+/// Read a raw `java.lang.String` argument.
+pub fn string_from_raw(raw: usize) -> Result<Option<String>> {
+    if raw == 0 {
+        return Ok(None);
+    }
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        // SAFETY: the caller received this raw reference as a Java hook
+        // argument, so it is valid for the current native frame.
+        let object = unsafe { JString::from_raw(env, raw as jni::sys::jstring) };
+        Ok(Some(jstring_to_string(env, &object)?))
+    })
+}
+
+/// Test helper: `new StringBuilder("A").charAt(0)`.
+pub fn call_char_at() -> Result<i64> {
+    let class = JavaClass::find("java.lang.StringBuilder")?;
+    let object = class.new_object(&[])?;
+    let append = class
+        .info
+        .methods
+        .iter()
+        .find(|method| {
+            method.name == "append"
+                && method.signature == "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
+        })
+        .ok_or_else(|| Error::NotFound("StringBuilder.append(String)".into()))?;
+    let _ = object.call(append, &[JavaArg::String("A".into())])?;
+    let char_at = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "charAt" && method.params.len() == 1)
+        .ok_or_else(|| Error::NotFound("StringBuilder.charAt(int)".into()))?;
+    match object.call(char_at, &[JavaArg::Int(0)])? {
+        JavaValue::Int(value) => Ok(i64::from(value)),
+        _ => Err(Error::Parse("StringBuilder.charAt returned non-int".into())),
+    }
+}
+
+/// Test helper: `Integer.bitCount(5)`.
+pub fn call_bit_count() -> Result<i64> {
+    let class = JavaClass::find("java.lang.Integer")?;
+    let method = class
+        .info
+        .methods
+        .iter()
+        .find(|method| method.name == "bitCount" && method.params.len() == 1 && method.is_static)
+        .ok_or_else(|| Error::NotFound("Integer.bitCount(int)".into()))?;
+    match class.call_static(method, &[JavaArg::Int(5)])? {
+        JavaValue::Int(value) => Ok(i64::from(value)),
+        _ => Err(Error::Parse("Integer.bitCount returned non-int".into())),
+    }
 }

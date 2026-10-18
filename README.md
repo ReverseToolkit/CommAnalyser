@@ -69,6 +69,9 @@ cargo build --target aarch64-linux-android -p agent -p daemon -p cli
 - **M3c (partial)**: Java `implementation` via ArtMethod entrypoint hooks and
   the QuickJS worker; validated by replacing `StringBuilder.length()`.
   Details: [`docs/11-m3c.md`](docs/11-m3c.md).
+- **M3d (partial)**: Java hook now receives `this` and int/long/bool/char/
+  byte/short/String arguments; validated with `charAt` and `bitCount`.
+  Details: [`docs/12-m3d.md`](docs/12-m3d.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 

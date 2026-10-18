@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use rquickjs::{Function, Persistent};
 
+use art::java::{JavaClass, MethodInfo};
 use gum::{InlineHook, SavedRegs};
 use runtime::{Error, Result};
 
@@ -54,6 +55,8 @@ pub(crate) struct HookBridge {
 
 pub(crate) struct JavaHookEntry {
     pub(crate) function: Persistent<Function<'static>>,
+    pub(crate) class: Rc<JavaClass>,
+    pub(crate) method: MethodInfo,
     // Held only so the entrypoint is restored when the table is dropped.
     pub(crate) _hook: art::hook::JavaHook,
 }
@@ -107,6 +110,7 @@ pub(crate) enum Job {
     },
     JavaImpl {
         id: usize,
+        args: [u64; 8],
         reply: Sender<u64>,
     },
     Shutdown,
@@ -205,8 +209,8 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
             Job::Rpc { name, args, reply } => {
                 let _ = reply.send(runtime.run_rpc(&name, &args));
             }
-            Job::JavaImpl { id, reply } => {
-                let _ = reply.send(runtime.run_java_impl(id));
+            Job::JavaImpl { id, args, reply } => {
+                let _ = reply.send(runtime.run_java_impl(id, args));
             }
             Job::Shutdown => break,
         }
@@ -308,15 +312,27 @@ pub(crate) extern "C" fn callback_dispatch(id: usize, args: *const u64) -> u64 {
 }
 
 /// Dispatcher embedded in every Java method trampoline.
-pub(crate) extern "C" fn java_dispatch(id: usize) -> u64 {
+pub(crate) extern "C" fn java_dispatch(id: usize, args: *const u64) -> u64 {
     if is_js_thread() {
         return 0;
     }
     let Some(tx) = JS_TX.get() else {
         return 0;
     };
+    let mut saved = [0u64; 8];
+    if !args.is_null() {
+        // SAFETY: the hook stub passes a pointer to its saved x0-x7.
+        unsafe { std::ptr::copy_nonoverlapping(args, saved.as_mut_ptr(), 8) };
+    }
     let (reply, response) = mpsc::channel();
-    if tx.send(Job::JavaImpl { id, reply }).is_err() {
+    if tx
+        .send(Job::JavaImpl {
+            id,
+            args: saved,
+            reply,
+        })
+        .is_err()
+    {
         return 0;
     }
     response.recv_timeout(Duration::from_secs(5)).unwrap_or(0)

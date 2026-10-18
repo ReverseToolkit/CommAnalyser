@@ -72,14 +72,19 @@ fn make_stub(dispatcher: usize, id: usize) -> Result<usize> {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
 
-    let mut w = CodeWriter::with_capacity(128);
+    let mut w = CodeWriter::with_capacity(160);
     w.bti_c();
-    w.sub_sp(32);
-    w.stp(29, 30, 31, 16);
+    w.sub_sp(96);
+    w.stp(29, 30, 31, 80);
+    w.stp(0, 1, 31, 0);
+    w.stp(2, 3, 31, 16);
+    w.stp(4, 5, 31, 32);
+    w.stp(6, 7, 31, 48);
     w.abs_addr(0, id as u64);
+    w.put(0x9100_03E1); // add x1, sp, #0 (saved x0-x7)
     w.abs_bl(dispatcher);
-    w.ldp(29, 30, 31, 16);
-    w.add_sp(32);
+    w.ldp(29, 30, 31, 80);
+    w.add_sp(96);
     w.ret(30);
 
     // SAFETY: the page is a private mapping of at least PAGE bytes.
