@@ -233,7 +233,6 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
     java.set("array", Func::from(make_array))?;
     java.set("cast", Func::from(cast))?;
     java.set("retain", Func::from(retain))?;
-    java.set("release", Func::from(release))?;
     ctx.globals().set("Java", java)?;
     Ok(())
 }
@@ -870,11 +869,14 @@ fn original_args(
         .collect()
 }
 
-fn retain<'js>(_ctx: Ctx<'js>, value: Value<'js>) -> JsResult<Value<'js>> {
-    Ok(value)
+fn retain<'js>(ctx: Ctx<'js>, value: Value<'js>) -> JsResult<Value<'js>> {
+    let id = java_id(&value).ok_or_else(|| js_error("Java.retain expects a Java object"))?;
+    let object = get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
+    let cloned = object.recast(object.info.clone()).map_err(to_js_error)?;
+    let class = JavaClass::find(&object.info.name).map_err(to_js_error)?;
+    let id = register(cloned);
+    Ok(instance_object(ctx, class, id)?.into_value())
 }
-
-fn release(_value: Value<'_>) {}
 
 fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsResult<Value<'js>> {
     let (object, descriptor) = if type_name == "java.lang.String" {
@@ -936,10 +938,23 @@ fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsRe
     Ok(instance_object(ctx, class, id)?.into_value())
 }
 
-fn cast<'js>(ctx: Ctx<'js>, value: Value<'js>, class_name: String) -> JsResult<Value<'js>> {
+fn cast<'js>(ctx: Ctx<'js>, value: Value<'js>, klass: Value<'js>) -> JsResult<Value<'js>> {
     let id = java_id(&value).ok_or_else(|| js_error("Java.cast expects a Java object"))?;
     let object = get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
+    let class_name = if let Some(name) = klass.as_string() {
+        name.to_string()?
+    } else if let Some(wrapper) = klass.as_object() {
+        wrapper.get::<&str, String>("$className")?
+    } else {
+        return Err(js_error("Java.cast expects a class wrapper or name"));
+    };
     let class = JavaClass::find(&class_name).map_err(to_js_error)?;
+    if !class.is_instance(&object).map_err(to_js_error)? {
+        return Err(js_error(format!(
+            "Cast from '{}' to '{}' isn't possible",
+            object.info.name, class_name
+        )));
+    }
     let casted = object.recast(class.info.clone()).map_err(to_js_error)?;
     let id = register(casted);
     Ok(instance_object(ctx, class, id)?.into_value())

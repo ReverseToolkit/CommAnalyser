@@ -176,6 +176,11 @@ pub enum JavaValue {
 }
 
 impl JavaClass {
+    pub fn is_instance(&self, object: &JavaObject) -> Result<bool> {
+        let vm = JavaVm::get()?;
+        vm.with_env(|env| Ok(env.is_instance_of(&object.object, &self.class)?))
+    }
+
     pub fn find(name: &str) -> Result<Rc<Self>> {
         let vm = JavaVm::get()?;
         vm.with_env(|env| {
