@@ -15,7 +15,8 @@ use rquickjs::{Array, Ctx, Function, IntoJs, Object, Persistent, Result as JsRes
 
 use crate::worker::{java_dispatch, JavaHookEntry, JavaHookTable};
 use art::java::{
-    ClassInfo, CtorInfo, FieldInfo, JavaArg, JavaClass, JavaObject, JavaValue, Kind, MethodInfo,
+    ClassInfo, CtorInfo, FieldInfo, JavaArg, JavaClass, JavaObject, JavaValue, Kind, MethodId,
+    MethodInfo,
 };
 
 thread_local! {
@@ -111,17 +112,27 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                   callback: Function<'js>|
                   -> JsResult<()> {
                 let class = JavaClass::find(&class_name).map_err(to_js_error)?;
-                let method = class
-                    .info
-                    .methods
-                    .iter()
-                    .find(|method| {
-                        method.name == method_name
-                            && method.signature == signature
-                            && method.is_static == is_static
-                    })
-                    .cloned()
-                    .ok_or_else(|| js_error("Java method not found"))?;
+                let method = if method_name == "$init" {
+                    let ctor = class
+                        .info
+                        .ctors
+                        .iter()
+                        .find(|ctor| ctor.signature == signature)
+                        .ok_or_else(|| js_error("Java constructor not found"))?;
+                    ctor_method(ctor)
+                } else {
+                    class
+                        .info
+                        .methods
+                        .iter()
+                        .find(|method| {
+                            method.name == method_name
+                                && method.signature == signature
+                                && method.is_static == is_static
+                        })
+                        .cloned()
+                        .ok_or_else(|| js_error("Java method not found"))?
+                };
                 let mut table = set_hooks.borrow_mut();
                 let id = table.entries.len();
                 let hook = art::hook::install(method.id, java_dispatch as *const () as usize, id)
@@ -147,10 +158,15 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                   is_static: bool|
                   -> JsResult<()> {
                 let mut table = detach_hooks.borrow_mut();
+                let lookup_name = if method_name == "$init" {
+                    "<init>"
+                } else {
+                    method_name.as_str()
+                };
                 if let Some((id, slot)) = table.entries.iter_mut().enumerate().find(|(_, slot)| {
                     slot.as_ref().is_some_and(|entry| {
                         entry.class.info.name == class_name
-                            && entry.method.name == method_name
+                            && entry.method.name == lookup_name
                             && entry.method.signature == signature
                             && entry.method.is_static == is_static
                     })
@@ -260,6 +276,13 @@ fn class_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>) -> JsResult<Object<'js
         let function = method_function(ctx.clone(), class.clone(), target, methods)?;
         wrapper.set(name, function)?;
     }
+    if let Some(ctor) = class.info.ctors.first() {
+        let mut method = ctor_method(ctor);
+        method.name = "$init".into();
+        let function =
+            method_function(ctx.clone(), class.clone(), Target::Prototype, vec![method])?;
+        wrapper.set("$init", function)?;
+    }
     for field in class
         .info
         .fields
@@ -277,6 +300,17 @@ fn class_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>) -> JsResult<Object<'js
         )?;
     }
     Ok(wrapper)
+}
+
+fn ctor_method(ctor: &CtorInfo) -> MethodInfo {
+    MethodInfo {
+        name: "<init>".into(),
+        signature: ctor.signature.clone(),
+        id: MethodId::Instance(ctor.id),
+        is_static: false,
+        params: ctor.params.clone(),
+        ret: Kind::Void,
+    }
 }
 
 fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResult<Object<'js>> {
@@ -603,7 +637,9 @@ pub(crate) fn invoke_impl<'js>(
         }
         this.into_value()
     } else {
-        let object = if jni_mode {
+        let object = if jni_mode && globals & (1 << 1) != 0 {
+            art::java::object_from_global_handle(class.info.clone(), args[1] as usize)
+        } else if jni_mode {
             art::java::object_from_jni_handle(class.info.clone(), args[1] as usize)
         } else if globals & (1 << 1) != 0 {
             art::java::object_from_global_handle(class.info.clone(), args[1] as usize)
@@ -613,7 +649,25 @@ pub(crate) fn invoke_impl<'js>(
         .map_err(to_js_error)?;
         let id = register(object);
         let this = instance_object(ctx.clone(), class.clone(), id)?;
-        if let Some(hook) = hook {
+        if method.name == "<init>" {
+            if let Some(hook) = hook {
+                this.set(
+                    "$init",
+                    original_function(
+                        ctx.clone(),
+                        class.clone(),
+                        method.clone(),
+                        hook,
+                        OriginalCall {
+                            this_id: id,
+                            raw: args,
+                            fargs,
+                            globals,
+                        },
+                    )?,
+                )?;
+            }
+        } else if let Some(hook) = hook {
             let method_function: Function<'js> = this.get(method.name.clone())?;
             method_function.set(
                 "original",
@@ -643,7 +697,9 @@ pub(crate) fn invoke_impl<'js>(
             Kind::Byte | Kind::Char | Kind::Short | Kind::Int => (raw as i32).into_js(ctx)?,
             Kind::Long => (raw as i64).into_js(ctx)?,
             Kind::Object(name) if name == "java.lang.String" => {
-                let value = if jni_mode {
+                let value = if jni_mode && globals & (1 << (start + slot)) != 0 {
+                    art::java::string_from_global_handle(raw as usize)
+                } else if jni_mode {
                     art::java::string_from_jni_handle(raw as usize)
                 } else if globals & (1 << (start + slot)) != 0 {
                     art::java::string_from_global_handle(raw as usize)
@@ -657,18 +713,14 @@ pub(crate) fn invoke_impl<'js>(
                 }
             }
             Kind::Object(name) => {
-                let (info, source) = if jni_mode || globals & (1 << (start + slot)) != 0 {
+                let (info, source) = if globals & (1 << (start + slot)) != 0 {
                     let param_class = JavaClass::find(name).map_err(to_js_error)?;
                     (param_class.info.clone(), 2)
                 } else {
                     (class.info.clone(), 1)
                 };
                 let object = if source == 2 {
-                    if jni_mode {
-                        art::java::object_from_jni_handle(info, raw as usize)
-                    } else {
-                        art::java::object_from_global_handle(info, raw as usize)
-                    }
+                    art::java::object_from_global_handle(info, raw as usize)
                 } else {
                     art::java::object_from_raw(info, raw as usize)
                 }

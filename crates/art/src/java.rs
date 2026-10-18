@@ -1499,3 +1499,21 @@ pub fn string_from_jni_handle(handle: usize) -> Result<Option<String>> {
         Ok(Some(jstring_to_string(env, &string)?))
     })
 }
+
+pub fn jni_new_global(env: usize, handle: usize) -> Result<usize> {
+    if env == 0 || handle == 0 {
+        return Ok(0);
+    }
+    // SAFETY: env is the JNIEnv passed to the native hook callback; NewGlobalRef
+    // is entry 21 in the standard JNI function table.
+    let table = unsafe { *(env as *mut *const usize) };
+    let new_global: unsafe extern "C" fn(
+        *mut jni::sys::JNIEnv,
+        jni::sys::jobject,
+    ) -> jni::sys::jobject = unsafe { std::mem::transmute(*table.add(21)) };
+    let global = unsafe { new_global(env as *mut jni::sys::JNIEnv, handle as jni::sys::jobject) };
+    if global.is_null() {
+        return Err(Error::Parse("NewGlobalRef returned null".into()));
+    }
+    Ok(global as usize)
+}

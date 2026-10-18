@@ -367,7 +367,33 @@ pub(crate) extern "C" fn java_dispatch(
     }
     let mut globals = 0u8;
     let jni_mode = crate::java::hook_jni_mode(id);
-    if !jni_mode {
+    if jni_mode {
+        if saved[0] != 0 {
+            let env = saved[0] as usize;
+            if let Some((is_static, params)) = crate::java::hook_meta_for(id) {
+                let start = 2;
+                if !is_static && saved[1] != 0 {
+                    if let Ok(global) = art::java::jni_new_global(env, saved[1] as usize) {
+                        saved[1] = global as u64;
+                        globals |= 1 << 1;
+                    }
+                }
+                for (slot, kind) in params.iter().enumerate() {
+                    if !matches!(kind, art::java::Kind::Object(_) | art::java::Kind::Array(_)) {
+                        continue;
+                    }
+                    let register = start + slot;
+                    if register >= 8 || saved[register] == 0 {
+                        continue;
+                    }
+                    if let Ok(global) = art::java::jni_new_global(env, saved[register] as usize) {
+                        saved[register] = global as u64;
+                        globals |= 1 << register;
+                    }
+                }
+            }
+        }
+    } else if !jni_mode {
         if let Some((is_static, params)) = crate::java::hook_meta_for(id) {
             let start = if is_static { 1 } else { 2 };
             if !is_static && saved[1] != 0 {
