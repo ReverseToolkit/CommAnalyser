@@ -195,6 +195,7 @@ fn make_stub(dispatcher: usize, id: usize) -> Result<usize> {
     w.abs_addr(0, id as u64);
     w.put(0x9100_03E1); // add x1, sp, #0 (saved x0-x7)
     w.put(0x9101_03E2); // add x2, sp, #64 (saved d0-d7)
+    w.put(0x9103_03E3); // add x3, sp, #192 (caller SP / stack args)
     w.abs_bl(dispatcher);
     w.put(0x9E67_0020); // fmov d0, x1
     w.ldp(29, 30, 31, 176);

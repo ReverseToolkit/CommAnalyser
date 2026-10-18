@@ -852,7 +852,7 @@ fn marshal<'a>(
                 strings.push(string);
                 jvalue { l: raw }
             }
-            (Kind::Object(_), JavaArg::Object(object)) => jvalue {
+            (Kind::Object(_) | Kind::Array(_), JavaArg::Object(object)) => jvalue {
                 l: object.as_obj().as_raw(),
             },
             (_, JavaArg::Null) => jvalue { l: ptr::null_mut() },

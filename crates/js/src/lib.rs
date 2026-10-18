@@ -199,9 +199,7 @@ impl ScriptRuntime {
     pub(crate) fn run_java_impl(
         &self,
         id: usize,
-        args: [u64; 8],
-        fargs: [u64; 8],
-        globals: u8,
+        call: crate::worker::JavaImplArgs,
         hook: Option<std::rc::Rc<std::cell::RefCell<art::hook::JavaHook>>>,
     ) -> crate::worker::DispatchResult {
         let jni_mode = crate::java::hook_jni_mode(id);
@@ -231,9 +229,11 @@ impl ScriptRuntime {
                 class,
                 &method,
                 crate::java::HookCall {
-                    args,
-                    fargs,
-                    globals,
+                    args: call.args,
+                    fargs: call.fargs,
+                    params: call.params,
+                    stack: call.stack,
+                    globals: call.globals,
                     hook,
                     jni_mode,
                 },

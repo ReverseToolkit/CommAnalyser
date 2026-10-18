@@ -518,20 +518,66 @@ fn method_function<'js>(
 fn choose_method<'a>(methods: &'a [MethodInfo], args: &[Value<'_>]) -> JsResult<&'a MethodInfo> {
     methods
         .iter()
-        .find(|method| {
-            method.params.len() == args.len()
-                && method
-                    .params
-                    .iter()
-                    .zip(args)
-                    .all(|(kind, value)| matches_kind(kind, value))
-        })
-        .or_else(|| {
-            methods
+        .filter(|method| method.params.len() == args.len())
+        .filter_map(|method| {
+            let score: i32 = method
+                .params
                 .iter()
-                .find(|method| method.params.len() == args.len())
+                .zip(args)
+                .map(|(kind, value)| match_score(kind, value))
+                .try_fold(0, |total, score| score.map(|score| total + score))?;
+            Some((score, method))
         })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, method)| method)
         .ok_or_else(|| js_error("no matching Java overload"))
+}
+
+fn match_score(kind: &Kind, value: &Value<'_>) -> Option<i32> {
+    match kind {
+        Kind::Boolean => value.is_bool().then_some(4),
+        Kind::Byte | Kind::Short | Kind::Int | Kind::Long => {
+            let number = value.as_number()?;
+            if number.fract() == 0.0 {
+                Some(3)
+            } else {
+                None
+            }
+        }
+        Kind::Char => {
+            let number = value.as_number()?;
+            if number.fract() == 0.0 && (0.0..=0xffff as f64).contains(&number) {
+                Some(2)
+            } else {
+                None
+            }
+        }
+        Kind::Float | Kind::Double => {
+            let number = value.as_number()?;
+            Some(if number.fract() == 0.0 { 3 } else { 5 })
+        }
+        Kind::Object(name) if name == "java.lang.String" => {
+            if value.is_string() {
+                Some(4)
+            } else {
+                java_id(value).map(|_| 2)
+            }
+        }
+        Kind::Object(name) => {
+            if value.is_null() || value.is_undefined() {
+                return Some(1);
+            }
+            let id = java_id(value)?;
+            let object = get_object(id)?;
+            Some(if &object.info.name == name { 4 } else { 2 })
+        }
+        Kind::Array(desc) => {
+            let id = java_id(value)?;
+            let object = get_object(id)?;
+            Some(if &object.info.name == desc { 5 } else { 1 })
+        }
+        Kind::Void => None,
+    }
 }
 
 fn choose_ctor<'a>(class: &'a JavaClass, args: &[Value<'_>]) -> JsResult<&'a CtorInfo> {
@@ -591,7 +637,9 @@ fn matches_kind(kind: &Kind, value: &Value<'_>) -> bool {
             value.is_string() || java_id(value).is_some()
         }
         Kind::Object(_) => value.is_string() || value.is_null() || java_id(value).is_some(),
-        Kind::Array(_) | Kind::Void | Kind::Float | Kind::Double => false,
+        Kind::Array(_) => java_id(value).is_some(),
+        Kind::Float | Kind::Double => value.is_number(),
+        Kind::Void => false,
     }
 }
 
@@ -624,16 +672,27 @@ fn to_arg(value: &Value<'_>, kind: &Kind) -> JsResult<JavaArg> {
             }
             Err(js_error("expected a Java object or string"))
         }
-        Kind::Array(_) | Kind::Void | Kind::Float | Kind::Double => {
-            Err(js_error("unsupported Java parameter type"))
+        Kind::Array(_) => {
+            if value.is_null() || value.is_undefined() {
+                return Ok(JavaArg::Null);
+            }
+            let id = java_id(value).ok_or_else(|| js_error("expected a Java array"))?;
+            Ok(JavaArg::Object(
+                get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?,
+            ))
         }
+        Kind::Float => Ok(JavaArg::Float(value.get()?)),
+        Kind::Double => Ok(JavaArg::Double(value.get()?)),
+        Kind::Void => Err(js_error("unsupported Java parameter type")),
     }
 }
 
 pub(crate) struct HookCall {
     pub(crate) args: [u64; 8],
     pub(crate) fargs: [u64; 8],
-    pub(crate) globals: u8,
+    pub(crate) params: [u64; 16],
+    pub(crate) stack: [u64; 8],
+    pub(crate) globals: u32,
     pub(crate) hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
     pub(crate) jni_mode: bool,
 }
@@ -642,7 +701,7 @@ struct OriginalCall {
     this_id: u32,
     raw: [u64; 8],
     fargs: [u64; 8],
-    globals: u8,
+    globals: u32,
 }
 
 pub(crate) fn invoke_impl<'js>(
@@ -655,17 +714,12 @@ pub(crate) fn invoke_impl<'js>(
     let HookCall {
         args,
         fargs,
+        params,
+        stack: _stack,
         globals,
         hook,
         jni_mode,
     } = call;
-    let start = if jni_mode {
-        2
-    } else if method.is_static {
-        1
-    } else {
-        2
-    };
     let this_value: Value<'js> = if method.is_static {
         let this = class_object(ctx.clone(), class.clone())?;
         if let Some(hook) = hook.clone() {
@@ -688,11 +742,11 @@ pub(crate) fn invoke_impl<'js>(
         }
         this.into_value()
     } else {
-        let object = if jni_mode && globals & (1 << 1) != 0 {
+        let object = if jni_mode && globals & 1 != 0 {
             art::java::object_from_global_handle(class.info.clone(), args[1] as usize)
         } else if jni_mode {
             art::java::object_from_jni_handle(class.info.clone(), args[1] as usize)
-        } else if globals & (1 << 1) != 0 {
+        } else if globals & 1 != 0 {
             art::java::object_from_global_handle(class.info.clone(), args[1] as usize)
         } else {
             art::java::object_from_raw(class.info.clone(), args[1] as usize)
@@ -740,19 +794,18 @@ pub(crate) fn invoke_impl<'js>(
     };
 
     let call_args = Array::new(ctx.clone())?;
-    let mut fp_index = 0;
     for (slot, kind) in method.params.iter().enumerate() {
-        let raw = args[start + slot];
+        let raw = params[slot];
         let value: Value<'js> = match kind {
             Kind::Boolean => (raw as u8 != 0).into_js(ctx)?,
             Kind::Byte | Kind::Char | Kind::Short | Kind::Int => (raw as i32).into_js(ctx)?,
             Kind::Long => (raw as i64).into_js(ctx)?,
             Kind::Object(name) if name == "java.lang.String" => {
-                let value = if jni_mode && globals & (1 << (start + slot)) != 0 {
+                let value = if jni_mode && globals & (1 << (slot + 1)) != 0 {
                     art::java::string_from_global_handle(raw as usize)
                 } else if jni_mode {
                     art::java::string_from_jni_handle(raw as usize)
-                } else if globals & (1 << (start + slot)) != 0 {
+                } else if globals & (1 << (slot + 1)) != 0 {
                     art::java::string_from_global_handle(raw as usize)
                 } else {
                     art::java::string_from_raw(raw as usize)
@@ -764,7 +817,7 @@ pub(crate) fn invoke_impl<'js>(
                 }
             }
             Kind::Object(name) => {
-                let (info, source) = if globals & (1 << (start + slot)) != 0 {
+                let (info, source) = if globals & (1 << (slot + 1)) != 0 {
                     let param_class = JavaClass::find(name).map_err(to_js_error)?;
                     (param_class.info.clone(), 2)
                 } else {
@@ -779,19 +832,20 @@ pub(crate) fn invoke_impl<'js>(
                 let id = register(object);
                 instance_object(ctx.clone(), class.clone(), id)?.into_value()
             }
-            Kind::Float => {
-                let value = f32::from_bits(fargs[fp_index] as u32);
-                fp_index += 1;
-                value.into_js(ctx)?
+            Kind::Float => f32::from_bits(raw as u32).into_js(ctx)?,
+            Kind::Double => f64::from_bits(raw).into_js(ctx)?,
+            Kind::Array(name) => {
+                let array_class = JavaClass::find(name).map_err(to_js_error)?;
+                let object = if globals & (1 << (slot + 1)) != 0 {
+                    art::java::object_from_global_handle(array_class.info.clone(), raw as usize)
+                } else {
+                    art::java::object_from_raw(array_class.info.clone(), raw as usize)
+                }
+                .map_err(to_js_error)?;
+                let id = register(object);
+                instance_object(ctx.clone(), array_class, id)?.into_value()
             }
-            Kind::Double => {
-                let value = f64::from_bits(fargs[fp_index]);
-                fp_index += 1;
-                value.into_js(ctx)?
-            }
-            Kind::Array(_) | Kind::Void => {
-                return Err(js_error("unsupported Java hook argument type"))
-            }
+            Kind::Void => return Err(js_error("unsupported Java hook argument type")),
         };
         call_args.set(slot, value)?;
     }
@@ -869,7 +923,7 @@ fn original_args(
     method: &MethodInfo,
     raw: &[u64; 8],
     fargs: &[u64; 8],
-    globals: u8,
+    globals: u32,
 ) -> JsResult<Vec<JavaArg>> {
     let start = if method.is_static { 1 } else { 2 };
     let mut fp_index = 0;

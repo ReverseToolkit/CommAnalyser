@@ -122,10 +122,20 @@ pub(crate) enum Job {
         id: usize,
         args: [u64; 8],
         fargs: [u64; 8],
-        globals: u8,
+        params: [u64; 16],
+        stack: [u64; 8],
+        globals: u32,
         reply: Sender<DispatchResult>,
     },
     Shutdown,
+}
+
+pub(crate) struct JavaImplArgs {
+    pub args: [u64; 8],
+    pub fargs: [u64; 8],
+    pub params: [u64; 16],
+    pub stack: [u64; 8],
+    pub globals: u32,
 }
 
 /// Handle used by the agent control thread and by hook trampolines.
@@ -230,6 +240,8 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
                 id,
                 args,
                 fargs,
+                params,
+                stack,
                 globals,
                 reply,
             } => {
@@ -238,7 +250,17 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
                     .entries
                     .get(id)
                     .and_then(|entry| entry.as_ref().map(|entry| entry.hook.clone()));
-                let _ = reply.send(runtime.run_java_impl(id, args, fargs, globals, hook));
+                let _ = reply.send(runtime.run_java_impl(
+                    id,
+                    JavaImplArgs {
+                        args,
+                        fargs,
+                        params,
+                        stack,
+                        globals,
+                    },
+                    hook,
+                ));
             }
             Job::Shutdown => break,
         }
@@ -348,6 +370,7 @@ pub(crate) extern "C" fn java_dispatch(
     id: usize,
     args: *const u64,
     fargs: *const u64,
+    stack: *const u64,
 ) -> DispatchResult {
     if is_js_thread() {
         return DispatchResult::default();
@@ -365,55 +388,88 @@ pub(crate) extern "C" fn java_dispatch(
         // SAFETY: the hook stub passes a pointer to its saved d0-d7.
         unsafe { std::ptr::copy_nonoverlapping(fargs, float_args.as_mut_ptr(), 8) };
     }
-    let mut globals = 0u8;
+    let mut stack_args = [0u64; 8];
+    if !stack.is_null() {
+        // SAFETY: the stub passes the caller SP; the native ABI guarantees at
+        // least the stack slots consumed by the hooked method.
+        unsafe { std::ptr::copy_nonoverlapping(stack, stack_args.as_mut_ptr(), 8) };
+    }
+    let mut params = [0u64; 16];
+    let mut globals = 0u32;
     let jni_mode = crate::java::hook_jni_mode(id);
-    if jni_mode {
-        if saved[0] != 0 {
-            let env = saved[0] as usize;
-            if let Some((is_static, params)) = crate::java::hook_meta_for(id) {
-                let start = 2;
-                if !is_static && saved[1] != 0 {
-                    if let Ok(global) = art::java::jni_new_global(env, saved[1] as usize) {
-                        saved[1] = global as u64;
-                        globals |= 1 << 1;
-                    }
+    if let Some((is_static, param_kinds)) = crate::java::hook_meta_for(id) {
+        let mut int_index = if jni_mode {
+            2
+        } else if is_static {
+            1
+        } else {
+            2
+        };
+        let mut fp_index = 0usize;
+        let mut stack_index = 0usize;
+        if !is_static {
+            let this_global = if jni_mode {
+                if saved[0] != 0 && saved[1] != 0 {
+                    art::java::jni_new_global(saved[0] as usize, saved[1] as usize)
+                        .map(|handle| handle as u64)
+                        .unwrap_or(saved[1])
+                } else {
+                    saved[1]
                 }
-                for (slot, kind) in params.iter().enumerate() {
-                    if !matches!(kind, art::java::Kind::Object(_) | art::java::Kind::Array(_)) {
-                        continue;
-                    }
-                    let register = start + slot;
-                    if register >= 8 || saved[register] == 0 {
-                        continue;
-                    }
-                    if let Ok(global) = art::java::jni_new_global(env, saved[register] as usize) {
-                        saved[register] = global as u64;
-                        globals |= 1 << register;
-                    }
-                }
-            }
+            } else if saved[1] != 0 {
+                art::soa::convert(saved[1] as usize).unwrap_or(saved[1] as usize) as u64
+            } else {
+                saved[1]
+            };
+            saved[1] = this_global;
+            globals |= 1;
         }
-    } else if !jni_mode {
-        if let Some((is_static, params)) = crate::java::hook_meta_for(id) {
-            let start = if is_static { 1 } else { 2 };
-            if !is_static && saved[1] != 0 {
-                if let Ok(handle) = art::soa::convert(saved[1] as usize) {
-                    saved[1] = handle as u64;
-                    globals |= 1 << 1;
+        for (slot, kind) in param_kinds.iter().enumerate() {
+            let raw = match kind {
+                art::java::Kind::Float | art::java::Kind::Double => {
+                    if fp_index < 8 {
+                        let value = float_args[fp_index];
+                        fp_index += 1;
+                        value
+                    } else {
+                        let value = stack_args.get(stack_index).copied().unwrap_or(0);
+                        stack_index += 1;
+                        value
+                    }
                 }
-            }
-            for (slot, kind) in params.iter().enumerate() {
-                if !matches!(kind, art::java::Kind::Object(_) | art::java::Kind::Array(_)) {
-                    continue;
+                _ => {
+                    if int_index < 8 {
+                        let value = saved[int_index];
+                        int_index += 1;
+                        value
+                    } else {
+                        let value = stack_args.get(stack_index).copied().unwrap_or(0);
+                        stack_index += 1;
+                        value
+                    }
                 }
-                let register = start + slot;
-                if register >= 8 || saved[register] == 0 {
-                    continue;
+            };
+            let value = if matches!(kind, art::java::Kind::Object(_) | art::java::Kind::Array(_))
+                && raw != 0
+            {
+                if jni_mode && saved[0] != 0 {
+                    art::java::jni_new_global(saved[0] as usize, raw as usize)
+                        .map(|handle| handle as u64)
+                        .unwrap_or(raw)
+                } else if !jni_mode {
+                    art::soa::convert(raw as usize).unwrap_or(raw as usize) as u64
+                } else {
+                    raw
                 }
-                if let Ok(handle) = art::soa::convert(saved[register] as usize) {
-                    saved[register] = handle as u64;
-                    globals |= 1 << register;
-                }
+            } else {
+                raw
+            };
+            params[slot] = value;
+            if value != raw
+                || (raw != 0
+                    && matches!(kind, art::java::Kind::Object(_) | art::java::Kind::Array(_)))
+            {
+                globals |= 1 << (slot + 1);
             }
         }
     }
@@ -423,6 +479,8 @@ pub(crate) extern "C" fn java_dispatch(
             id,
             args: saved,
             fargs: float_args,
+            params,
+            stack: stack_args,
             globals,
             reply,
         })
