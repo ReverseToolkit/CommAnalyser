@@ -41,6 +41,10 @@ impl JavaVm {
         Ok(VM.get().expect("JavaVm was just initialized"))
     }
 
+    pub fn vm_raw(&self) -> *mut RawJavaVM {
+        self.raw
+    }
+
     pub fn with_env<T>(&self, f: impl FnOnce(&mut Env<'_>) -> jni::errors::Result<T>) -> Result<T> {
         // SAFETY: the raw pointer came from JNI_GetCreatedJavaVMs and remains
         // valid for the process lifetime.
@@ -1050,4 +1054,13 @@ pub fn ref_debug() -> Result<String> {
         "symbol": symbol.map(|symbol| format!("{:#x}", symbol.st_value)),
     })
     .to_string())
+}
+
+pub fn object_from_global_handle(info: Rc<ClassInfo>, handle: usize) -> Result<JavaObject> {
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        // SAFETY: the caller owns this global reference.
+        let global = unsafe { env.global_from_raw::<JObject>(handle as jni::sys::jobject) };
+        Ok(JavaObject::from_global(info, global))
+    })
 }

@@ -6,6 +6,7 @@
 
 pub mod hook;
 pub mod java;
+pub mod soa;
 
 use std::ffi::c_void;
 use std::ptr;
@@ -125,9 +126,10 @@ pub fn libart_base() -> Result<usize> {
     let maps = maps::read_self_maps()?;
     maps.iter()
         .find(|mapping| {
-            mapping
-                .clean_path()
-                .is_some_and(|path| path.ends_with("/libart.so"))
+            mapping.perms.exec
+                && mapping
+                    .clean_path()
+                    .is_some_and(|path| path.ends_with("/libart.so"))
         })
         .map(|mapping| mapping.range.start.saturating_sub(mapping.offset as usize))
         .ok_or_else(|| Error::NotFound("libart.so".into()))

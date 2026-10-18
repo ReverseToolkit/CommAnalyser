@@ -5,8 +5,9 @@
 //! and referenced from JS via a hidden `__analyserJavaId` property.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
+use std::sync::{Mutex, OnceLock};
 
 use rquickjs::function::Rest;
 use rquickjs::prelude::Func;
@@ -22,6 +23,28 @@ thread_local! {
 }
 
 const HANDLE: &str = "__analyserJavaId";
+
+static HOOK_META: OnceLock<Mutex<HashMap<usize, bool>>> = OnceLock::new();
+
+fn hook_meta() -> &'static Mutex<HashMap<usize, bool>> {
+    HOOK_META.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn hook_is_static(id: usize) -> Option<bool> {
+    hook_meta().lock().ok()?.get(&id).copied()
+}
+
+fn register_hook(id: usize, is_static: bool) {
+    if let Ok(mut meta) = hook_meta().lock() {
+        meta.insert(id, is_static);
+    }
+}
+
+fn unregister_hook(id: usize) {
+    if let Ok(mut meta) = hook_meta().lock() {
+        meta.remove(&id);
+    }
+}
 
 pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>>) -> JsResult<()> {
     let set_hooks = java_hooks.clone();
@@ -51,6 +74,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                 let id = table.entries.len();
                 let hook = art::hook::install(method.id, java_dispatch as *const () as usize, id)
                     .map_err(to_js_error)?;
+                register_hook(id, is_static);
                 table.entries.push(Some(JavaHookEntry {
                     function: Persistent::save(&ctx, callback),
                     class,
@@ -71,7 +95,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                   is_static: bool|
                   -> JsResult<()> {
                 let mut table = detach_hooks.borrow_mut();
-                if let Some(slot) = table.entries.iter_mut().find(|slot| {
+                if let Some((id, slot)) = table.entries.iter_mut().enumerate().find(|(_, slot)| {
                     slot.as_ref().is_some_and(|entry| {
                         entry.class.info.name == class_name
                             && entry.method.name == method_name
@@ -80,6 +104,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                     })
                 }) {
                     *slot = None;
+                    unregister_hook(id);
                 }
                 Ok(())
             },
@@ -456,13 +481,18 @@ pub(crate) fn invoke_impl<'js>(
     class: Rc<JavaClass>,
     method: &MethodInfo,
     args: [u64; 8],
+    this_global: bool,
 ) -> JsResult<u64> {
     let start = if method.is_static { 1 } else { 2 };
     let this_value: Value<'js> = if method.is_static {
         Value::new_undefined(ctx.clone())
     } else {
-        let object = art::java::object_from_raw(class.info.clone(), args[1] as usize)
-            .map_err(to_js_error)?;
+        let object = if this_global {
+            art::java::object_from_global_handle(class.info.clone(), args[1] as usize)
+        } else {
+            art::java::object_from_raw(class.info.clone(), args[1] as usize)
+        }
+        .map_err(to_js_error)?;
         let id = register(object);
         let this = instance_object(ctx.clone(), class.clone(), id)?;
         this.into_value()

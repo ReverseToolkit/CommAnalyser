@@ -114,6 +114,7 @@ pub(crate) enum Job {
     JavaImpl {
         id: usize,
         args: [u64; 8],
+        this_global: bool,
         reply: Sender<u64>,
     },
     Shutdown,
@@ -212,8 +213,13 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
             Job::Rpc { name, args, reply } => {
                 let _ = reply.send(runtime.run_rpc(&name, &args));
             }
-            Job::JavaImpl { id, args, reply } => {
-                let _ = reply.send(runtime.run_java_impl(id, args));
+            Job::JavaImpl {
+                id,
+                args,
+                this_global,
+                reply,
+            } => {
+                let _ = reply.send(runtime.run_java_impl(id, args, this_global));
             }
             Job::Shutdown => break,
         }
@@ -327,11 +333,19 @@ pub(crate) extern "C" fn java_dispatch(id: usize, args: *const u64) -> u64 {
         // SAFETY: the hook stub passes a pointer to its saved x0-x7.
         unsafe { std::ptr::copy_nonoverlapping(args, saved.as_mut_ptr(), 8) };
     }
+    let mut this_global = false;
+    if crate::java::hook_is_static(id) == Some(false) && saved[1] != 0 {
+        if let Ok(handle) = art::soa::convert(saved[1] as usize) {
+            saved[1] = handle as u64;
+            this_global = true;
+        }
+    }
     let (reply, response) = mpsc::channel();
     if tx
         .send(Job::JavaImpl {
             id,
             args: saved,
+            this_global,
             reply,
         })
         .is_err()

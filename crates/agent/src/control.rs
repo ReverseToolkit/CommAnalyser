@@ -160,6 +160,17 @@ fn run(name: &str) -> std::io::Result<()> {
                     .unwrap_or_else(|_| json!({"ok": true, "raw": text})),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
+            "java_soa_debug" => {
+                let (target, store, trampoline, called, converted) = art::soa::debug_state();
+                json!({
+                    "ok": true,
+                    "target": format!("{target:#x}"),
+                    "store": format!("{store:#x}"),
+                    "trampoline": format!("{trampoline:#x}"),
+                    "called": called,
+                    "converted": format!("{converted:#x}"),
+                })
+            }
             "java_char_at" => match art::java::call_char_at() {
                 Ok(value) => json!({"ok": true, "value": value}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
