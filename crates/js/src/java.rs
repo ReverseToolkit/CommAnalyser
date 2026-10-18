@@ -233,6 +233,14 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
     java.set("array", Func::from(make_array))?;
     java.set("cast", Func::from(cast))?;
     java.set("retain", Func::from(retain))?;
+    java.set(
+        "enumerateLoadedClassesSync",
+        Func::from(enumerate_loaded_classes_sync),
+    )?;
+    java.set(
+        "enumerateLoadedClasses",
+        Func::from(enumerate_loaded_classes),
+    )?;
     ctx.globals().set("Java", java)?;
     Ok(())
 }
@@ -909,6 +917,27 @@ fn original_args(
             })
         })
         .collect()
+}
+
+fn enumerate_loaded_classes_sync<'js>(ctx: Ctx<'js>) -> JsResult<Array<'js>> {
+    let names = art::java::enumerate_loaded_classes().map_err(to_js_error)?;
+    let result = Array::new(ctx)?;
+    for (index, name) in names.into_iter().enumerate() {
+        result.set(index, name)?;
+    }
+    Ok(result)
+}
+
+fn enumerate_loaded_classes<'js>(_ctx: Ctx<'js>, callbacks: Object<'js>) -> JsResult<()> {
+    let names = art::java::enumerate_loaded_classes().map_err(to_js_error)?;
+    let on_match: Function<'js> = callbacks.get("onMatch")?;
+    for name in names {
+        on_match.call::<_, ()>((name,))?;
+    }
+    if let Ok(on_complete) = callbacks.get::<_, Function<'js>>("onComplete") {
+        on_complete.call::<_, ()>(())?;
+    }
+    Ok(())
 }
 
 fn retain<'js>(ctx: Ctx<'js>, value: Value<'js>) -> JsResult<Value<'js>> {

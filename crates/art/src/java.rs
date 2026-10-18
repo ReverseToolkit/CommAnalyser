@@ -1596,3 +1596,100 @@ pub fn new_object_array_from_objects(
         Ok(JavaObject::from_global(array_class.info.clone(), global))
     })
 }
+
+thread_local! {
+    static VISITED_CLASSES: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+extern "C" fn visit_class(_visitor: *mut c_void, klass: usize) -> bool {
+    VISITED_CLASSES.with(|classes| classes.borrow_mut().push(klass));
+    true
+}
+
+extern "C" fn visitor_destructor(_visitor: *mut c_void) {}
+
+/// Enumerate loaded classes through ART's ClassLinker, using Frida's
+/// Runtime::java_vm_ based field-offset discovery.
+pub fn enumerate_loaded_classes() -> Result<Vec<String>> {
+    let instance_symbol = resolve_libart_symbol("_ZN3art7Runtime9instance_E")
+        .ok_or_else(|| Error::NotFound("Runtime::instance_".into()))?;
+    // SAFETY: Runtime::instance_ is a data symbol holding Runtime*.
+    let runtime = unsafe { ptr::read_unaligned(instance_symbol as *const usize) };
+    if runtime == 0 {
+        return Err(Error::NotFound("Runtime".into()));
+    }
+    let vm_pointer = JavaVm::get()?.vm_raw() as usize;
+    let vm_offset = (384..384 + 800)
+        .step_by(8)
+        .find(|offset| {
+            // SAFETY: reading within the Runtime object.
+            let value = unsafe { ptr::read_unaligned((runtime + offset) as *const usize) };
+            value == vm_pointer
+        })
+        .ok_or_else(|| Error::NotFound("Runtime::java_vm_".into()))?;
+    let class_linker_offset = vm_offset - 4 * 8;
+    let intern_table_offset = class_linker_offset - 8;
+    // SAFETY: offsets derived from Runtime::java_vm_.
+    let class_linker =
+        unsafe { ptr::read_unaligned((runtime + class_linker_offset) as *const usize) };
+    let intern_table =
+        unsafe { ptr::read_unaligned((runtime + intern_table_offset) as *const usize) };
+    if class_linker == 0 || intern_table == 0 {
+        return Err(Error::NotFound("ClassLinker/InternTable".into()));
+    }
+
+    let visit_symbol =
+        resolve_libart_symbol("_ZN3art11ClassLinker12VisitClassesEPNS_12ClassVisitorE")
+            .ok_or_else(|| Error::NotFound("ClassLinker::VisitClasses".into()))?;
+    let new_local_symbol =
+        resolve_libart_symbol("_ZN3art9JNIEnvExt11NewLocalRefEPNS_6mirror6ObjectE")
+            .ok_or_else(|| Error::NotFound("JNIEnvExt::NewLocalRef".into()))?;
+    type VisitClasses = unsafe extern "C" fn(*mut c_void, *mut c_void);
+    type NewLocal = unsafe extern "C" fn(*mut jni::sys::JNIEnv, *mut c_void) -> jni::sys::jobject;
+    // SAFETY: addresses come from libart's dynamic symbol table.
+    let visit_classes: VisitClasses = unsafe { std::mem::transmute(visit_symbol) };
+    let new_local: NewLocal = unsafe { std::mem::transmute(new_local_symbol) };
+
+    static VTABLE: std::sync::OnceLock<Box<[usize; 3]>> = std::sync::OnceLock::new();
+    let vtable = VTABLE.get_or_init(|| {
+        Box::new([
+            visitor_destructor as usize,
+            visitor_destructor as usize,
+            visit_class as usize,
+        ])
+    });
+    let visitor = [vtable.as_ptr() as usize];
+    let visitor_address = visitor.as_ptr() as usize;
+    VISITED_CLASSES.with(|classes| classes.borrow_mut().clear());
+    crate::soa::with_soa(move || {
+        // SAFETY: visitor is a valid ClassVisitor vtable object and the SOA
+        // window holds the mutator lock VisitClasses requires.
+        unsafe {
+            visit_classes(class_linker as *mut c_void, visitor_address as *mut c_void);
+        }
+    })?;
+
+    let raw_classes = VISITED_CLASSES.with(|classes| classes.borrow().clone());
+    let vm = JavaVm::get()?;
+    vm.with_env(|env| {
+        let mut names = Vec::with_capacity(raw_classes.len());
+        let name = JNIString::from("getName");
+        let signature = RuntimeMethodSignature::from_str("()Ljava/lang/String;")?;
+        for raw in raw_classes {
+            // SAFETY: ClassVisitor supplied a live mirror::Class raw pointer.
+            let local = unsafe { new_local(env.get_raw(), raw as *mut c_void) };
+            if local.is_null() {
+                continue;
+            }
+            // SAFETY: NewLocalRef returned a jclass local reference.
+            let class = unsafe { JClass::from_raw(env, local) };
+            let result = env.call_method(&class, &*name, signature.method_signature(), &[])?;
+            let object = result.l()?;
+            // SAFETY: Class.getName returns java.lang.String.
+            let string = unsafe { JString::from_raw(env, object.as_raw()) };
+            names.push(jstring_to_string(env, &string)?);
+        }
+        Ok(names)
+    })
+}

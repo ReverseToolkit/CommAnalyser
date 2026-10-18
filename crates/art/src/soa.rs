@@ -7,7 +7,7 @@
 //! Runnable and holds the mutator lock, which is exactly what AddGlobalRef
 //! needs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,6 +27,7 @@ type AddGlobalRef =
 thread_local! {
     static PENDING_RAW: Cell<usize> = const { Cell::new(0) };
     static CONVERTED_GLOBAL: Cell<usize> = const { Cell::new(0) };
+    static ACTION: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
 
 static TARGET: AtomicUsize = AtomicUsize::new(0);
@@ -36,6 +37,9 @@ static CALLED: AtomicUsize = AtomicUsize::new(0);
 
 fn callback(thread: usize) {
     CALLED.fetch_add(1, Ordering::Relaxed);
+    if let Some(action) = ACTION.with(|slot| slot.borrow_mut().take()) {
+        action();
+    }
     let raw = PENDING_RAW.with(Cell::get);
     if raw == 0 {
         return;
@@ -108,25 +112,51 @@ pub fn debug_state() -> (usize, usize, usize, usize, usize) {
     )
 }
 
-pub fn convert(raw: usize) -> Result<usize> {
-    if raw == 0 {
-        return Ok(0);
-    }
+fn trigger() -> Result<()> {
     install()?;
-    PENDING_RAW.with(|slot| slot.set(raw));
-    CONVERTED_GLOBAL.with(|slot| slot.set(0));
     let target = TARGET.load(Ordering::Acquire);
     if target == 0 {
         return Err(Error::NotFound("ExceptionClear target".into()));
     }
+    // Force the exception path before invoking the patched clear.  The jni
+    // wrapper catches the exception afterwards, but ThrowNew has already made
+    // ExceptionClear take its pending-exception path.
+    let _ = crate::java::JavaVm::get()?.with_env(|env| {
+        let class = jni::strings::JNIString::from("java/lang/RuntimeException");
+        let message = jni::strings::JNIString::from("CommAnalyser SOA");
+        let _ = env.throw_new(class, message);
+        Ok(())
+    });
     // SAFETY: the vtable entry is JNI::ExceptionClear for this process.
     let exception_clear: ExceptionClear = unsafe { std::mem::transmute(target) };
-    crate::java::JavaVm::get()?.with_env(|env| {
+    let vm = crate::java::JavaVm::get()?;
+    vm.with_env(|env| {
         // SAFETY: JNIEnv is valid and the patched function only adds one
         // callback around its exception store.
         unsafe { exception_clear(env.get_raw()) };
         Ok(())
     })?;
+    Ok(())
+}
+
+/// Run a closure while the current thread is inside ART's ScopedObjectAccess.
+pub fn with_soa(f: impl FnOnce() + 'static) -> Result<()> {
+    ACTION.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
+    trigger()?;
+    if ACTION.with(|slot| slot.borrow().is_some()) {
+        ACTION.with(|slot| *slot.borrow_mut() = None);
+        return Err(Error::Parse("SOA action did not run".into()));
+    }
+    Ok(())
+}
+
+pub fn convert(raw: usize) -> Result<usize> {
+    if raw == 0 {
+        return Ok(0);
+    }
+    PENDING_RAW.with(|slot| slot.set(raw));
+    CONVERTED_GLOBAL.with(|slot| slot.set(0));
+    trigger()?;
     PENDING_RAW.with(|slot| slot.set(0));
     let global = CONVERTED_GLOBAL.with(Cell::get);
     if global == 0 {
