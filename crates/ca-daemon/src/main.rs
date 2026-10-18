@@ -3,11 +3,15 @@
 //! M0 speaks a line-delimited JSON protocol and implements `ping`, `version`
 //! and `ps`.  Script/attach operations are added in M1.
 
+mod control_server;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 
 use serde_json::{json, Value};
+
+use ca_inject::AttachOptions;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -106,11 +110,60 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
                 .collect();
             json!({"ok": true, "processes": processes}).to_string()
         }
-        "attach" => error_response("attach: M1".to_owned()),
-        "detach" => error_response("detach: M1".to_owned()),
+        "attach" => error_response("attach: use inject".to_owned()),
+        "detach" => error_response("detach: M2".to_owned()),
+        "inject" => {
+            let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let agent = request
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or("/data/local/tmp/libca_agent.so");
+            match inject(pid, agent) {
+                Ok(hello) => {
+                    json!({"ok": true, "pid": pid, "agent": agent, "hello": hello}).to_string()
+                }
+                Err(err) => error_response(format!("inject: {err}")),
+            }
+        }
         "" => error_response("missing op".to_owned()),
         other => error_response(format!("unknown op: {other}")),
     }
+}
+
+fn inject(pid: u32, agent: &str) -> Result<String, String> {
+    if pid == 0 {
+        return Err("invalid pid".to_owned());
+    }
+    if !std::path::Path::new(agent).exists() {
+        return Err(format!("agent not found: {agent}"));
+    }
+
+    let socket_name = format!(
+        "ca-agent-{pid}-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            & 0xffff_ffff
+    );
+    let listener = control_server::Listener::bind(&socket_name)
+        .map_err(|err| format!("bind {socket_name}: {err}"))?;
+
+    let options = AttachOptions::new(pid, agent).with_config(socket_name.clone());
+    let mut session = ca_inject::attach(&options).map_err(|err| format!("{err}"))?;
+
+    let stream = listener
+        .accept_timeout(std::time::Duration::from_secs(5))
+        .map_err(|err| format!("accept: {err}"))?
+        .ok_or_else(|| "agent did not connect".to_owned())?;
+
+    let hello = control_server::Listener::read_hello(&stream, std::time::Duration::from_secs(2))
+        .map_err(|err| format!("hello: {err}"))?;
+    let mut stream = stream;
+    control_server::Listener::send_bye(&mut stream);
+
+    session.resume();
+    Ok(hello)
 }
 
 fn error_response(message: String) -> String {

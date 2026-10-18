@@ -10,3 +10,4 @@ rust-version.workspace = true
 ca-core.workspace = true
 libc.workspace = true
 thiserror.workspace = true
+goblin = "0.10"

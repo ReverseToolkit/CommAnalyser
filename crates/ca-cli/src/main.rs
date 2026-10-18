@@ -39,7 +39,7 @@ fn run() -> Result<(), String> {
     }
 
     let command = command.ok_or_else(|| {
-        "usage: ca [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach>".to_owned()
+        "usage: ca [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject>".to_owned()
     })?;
 
     let request = match command.as_str() {
@@ -53,6 +53,20 @@ fn run() -> Result<(), String> {
                 .parse::<u32>()
                 .map_err(|_| "invalid pid".to_owned())?;
             json!({"op": "attach", "pid": pid})
+        }
+        "inject" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: ca inject <pid> [--agent PATH]")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let agent = rest
+                .iter()
+                .position(|v| v == "--agent")
+                .and_then(|i| rest.get(i + 1))
+                .map(String::as_str)
+                .unwrap_or("/data/local/tmp/libca_agent.so");
+            json!({"op": "inject", "pid": pid, "agent": agent})
         }
         other => return Err(format!("unknown command: {other}")),
     };

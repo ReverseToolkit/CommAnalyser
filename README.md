@@ -2,8 +2,9 @@
 
 ARM64 Android dynamic instrumentation framework (Rust).
 
-> Status: M0 skeleton.  The research and plan live in [`docs/00-research.md`](docs/00-research.md)
-> and [`docs/01-plan.md`](docs/01-plan.md).
+> Status: M1 (attach injection) done.  Research and plan live in
+> [`docs/00-research.md`](docs/00-research.md) and [`docs/01-plan.md`](docs/01-plan.md);
+> M1 details in [`docs/02-m1.md`](docs/02-m1.md).
 
 ## Layout
 
@@ -13,7 +14,7 @@ ARM64 Android dynamic instrumentation framework (Rust).
 - `crates/ca-js` — QuickJS runtime (rquickjs).
 - `crates/ca-art` — ART engine (planned, M3).
 - `crates/ca-qbdi` — QBDI native API (planned, M4).
-- `crates/ca-inject` — ptrace/memfd/PIC loader (M1).
+- `crates/ca-inject` — ptrace/remote-call/memfd loader.
 - `crates/ca-agent` — in-process payload (`cdylib`).
 - `crates/ca-daemon` / `crates/ca-cli` — device daemon and host CLI.
 
@@ -32,21 +33,33 @@ export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
 cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
 ```
 
-## M0 status (2026-10-18)
+## Status
 
-- Workspace builds on host; `cargo test --workspace` passes 37 tests.
-- Android cross-compile works for `ca-agent` (cdylib), `ca-daemon`, `ca-cli`
-  with NDK 29.0.14206865 / `aarch64-linux-android24`.
-- Device validation on `282eb4e4` (Android 15, arm64): pushed `ca-daemon`,
-  started it on `127.0.0.1:17321`, then ran
-  `ca ping` / `ca version` / `ca ps` over `adb forward`.
-- Implemented so far: `/proc` maps + module aggregation, ARM64 instruction
-  classification, absolute-branch writer, B/BL prologue relocation,
-  QuickJS eval/console embedding, daemon/CLI JSON protocol.
-- Placeholders (explicitly `Unsupported`): Interceptor, NativeFunction,
-  ptrace attach, ART, QBDI link.
+- **M0 (done)**: workspace, `/proc` maps + modules, ARM64 instruction
+  classification/writer/relocator, QuickJS eval, daemon/CLI JSON protocol.
+- **M1 (done)**: ptrace attach, remote calls, memfd agent load via
+  `android_dlopen_ext`, abstract-socket agent hello.  Validated on
+  `282eb4e4` against `sleep` (shell domain) and `com.android.settings`
+  (app domain), with the target alive and `TracerPid=0`.
+- **M2 (next)**: resident agent control channel, pure-Rust ARM64 inline hook,
+  NativeFunction/NativeCallback stubs.
 
-Next: M1 (ptrace attach + PIC loader + memfd + agent control channel).
+Details: [`docs/02-m1.md`](docs/02-m1.md).
+
+## Quick start
+
+```bash
+cargo test --workspace
+cargo build --workspace
+
+# device side (root shell)
+adb push target/aarch64-linux-android/debug/ca-daemon /data/local/tmp/
+adb push target/aarch64-linux-android/debug/libca_agent.so /data/local/tmp/
+adb shell 'chmod 755 /data/local/tmp/ca-daemon; /data/local/tmp/ca-daemon --addr 127.0.0.1:17321 &'
+adb forward tcp:17321 tcp:17321
+./target/debug/ca --addr 127.0.0.1:17321 ps
+./target/debug/ca --addr 127.0.0.1:17321 inject <pid> --agent /data/local/tmp/libca_agent.so
+```
 
 ## Protocol (M0)
 
@@ -56,6 +69,7 @@ Line-delimited JSON over TCP:
 {"op":"ping"}
 {"op":"version"}
 {"op":"ps"}
+{"op":"inject","pid":1234,"agent":"/data/local/tmp/libca_agent.so"}
 ```
 
 `ca --addr 127.0.0.1:17321 ps` prints the process list.

@@ -4,6 +4,8 @@
 //! validates the ABI and logs; the QuickJS runtime and control channel are
 //! wired in M1.
 
+mod control;
+
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 
@@ -17,12 +19,18 @@ use std::os::raw::{c_char, c_int};
 #[no_mangle]
 pub unsafe extern "C" fn ca_agent_main(config: *const c_char) -> c_int {
     let text = if config.is_null() {
-        ""
+        String::new()
     } else {
         // SAFETY: caller guarantees NUL-termination.
-        unsafe { CStr::from_ptr(config) }.to_str().unwrap_or("")
+        unsafe { CStr::from_ptr(config) }
+            .to_str()
+            .unwrap_or("")
+            .to_owned()
     };
     eprintln!("[ca-agent] loaded (config={text:?})");
+    if !text.is_empty() {
+        control::spawn(text);
+    }
     0
 }
 

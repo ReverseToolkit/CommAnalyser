@@ -1,9 +1,19 @@
 //! Attach injection for CommAnalyser.
 //!
-//! M0 defines the session API and process checks.  The ptrace/PIC-loader
-//! implementation lands in M1; see `docs/01-plan.md` §3.6.
+//! M1 implements the aarch64 attach path: stop every thread, use remote calls
+//! into libc/linker to create a memfd, `dlopen()` the agent, resolve
+//! `ca_agent_main`, and call it.  The daemon then waits for the agent's hello
+//! before resuming the target.
 
-use ca_core::{Error, Result};
+pub mod elf;
+pub mod ptrace;
+pub mod remote;
+pub mod session;
+
+#[cfg(test)]
+use ca_core::Error;
+
+pub use session::{attach, Session};
 
 /// Whether injection is supported on this build target.
 pub const fn supported() -> bool {
@@ -13,10 +23,12 @@ pub const fn supported() -> bool {
 #[derive(Clone, Debug)]
 pub struct AttachOptions {
     pub pid: u32,
-    /// Path or memfd name of the agent library.
+    /// Path to the agent `.so` on the device.
     pub agent: String,
     /// Entrypoint symbol, default `ca_agent_main`.
     pub entrypoint: String,
+    /// Abstract socket name the agent should connect to.
+    pub config: String,
 }
 
 impl AttachOptions {
@@ -25,41 +37,24 @@ impl AttachOptions {
             pid,
             agent: agent.into(),
             entrypoint: "ca_agent_main".to_owned(),
+            config: String::new(),
         }
     }
-}
 
-/// An injected agent session.
-#[derive(Debug)]
-pub struct Session {
-    pub pid: u32,
-    pub agent_base: usize,
-}
-
-/// Attach to `pid` and load the agent.  M1.
-pub fn attach(options: &AttachOptions) -> Result<Session> {
-    if options.pid == 0 {
-        return Err(Error::Parse("attach: pid 0".into()));
+    pub fn with_config(mut self, config: impl Into<String>) -> Self {
+        self.config = config.into();
+        self
     }
-    if !std::path::Path::new("/proc")
-        .join(options.pid.to_string())
-        .exists()
-    {
-        return Err(Error::NotFound(format!("pid {}", options.pid)));
-    }
-    Err(Error::Unsupported("attach injection: M1"))
 }
 
 /// Check that a pid exists and is not a zombie.
 pub fn pid_alive(pid: u32) -> bool {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
     match stat {
-        Ok(text) => {
-            // state is the char after the final ')'.
-            text.rfind(')')
-                .and_then(|i| text.as_bytes().get(i + 2).copied())
-                .is_some_and(|c| c != b'Z')
-        }
+        Ok(text) => text
+            .rfind(')')
+            .and_then(|i| text.as_bytes().get(i + 2).copied())
+            .is_some_and(|c| c != b'Z'),
         Err(_) => false,
     }
 }
