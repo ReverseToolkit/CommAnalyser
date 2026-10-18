@@ -311,6 +311,7 @@ pub(crate) fn install_with_hooks<'js>(
         };
         "#,
     )?;
+    crate::java::install(ctx)?;
     Ok(())
 }
 

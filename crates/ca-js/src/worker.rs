@@ -298,6 +298,8 @@ mod tests {
         assert_eq!(worker.eval("typeof Interceptor").unwrap(), "object");
         assert_eq!(worker.eval("typeof NativeFunction").unwrap(), "function");
         assert_eq!(worker.eval("typeof NativeCallback").unwrap(), "function");
+        assert_eq!(worker.eval("typeof Java").unwrap(), "object");
+        assert_eq!(worker.eval("Java.available").unwrap(), "true");
         worker
             .eval("rpc.exports.add = (a, b) => a + b; send({hello: 1}); 'ok'")
             .unwrap();

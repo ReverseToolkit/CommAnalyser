@@ -63,6 +63,9 @@ cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
 - **M3a (done)**: JNI VM discovery, Android 15 ArtMethod layout probing,
   and a minimal `ArtMethod` entrypoint hook validated on Settings.
   Details: [`docs/09-m3a.md`](docs/09-m3a.md).
+- **M3b (partial)**: `Java.perform`, `Java.use` with JNI reflection,
+  constructors, static/instance calls, string/int/long/boolean marshalling.
+  Details: [`docs/10-m3b.md`](docs/10-m3b.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 

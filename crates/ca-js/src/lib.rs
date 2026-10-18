@@ -5,6 +5,7 @@
 
 mod api;
 mod elf;
+mod java;
 mod worker;
 
 use std::cell::RefCell;

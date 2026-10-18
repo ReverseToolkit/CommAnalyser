@@ -130,6 +130,7 @@ dependencies = [
 name = "ca-js"
 version = "0.1.0"
 dependencies = [
+ "ca-art",
  "ca-core",
  "ca-gum",
  "goblin",
