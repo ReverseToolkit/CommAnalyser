@@ -13,6 +13,7 @@ rust-version = "1.85"
 ca-core = { path = "crates/ca-core" }
 ca-arch-arm64 = { path = "crates/ca-arch-arm64" }
 ca-gum = { path = "crates/ca-gum" }
+ca-art = { path = "crates/ca-art" }
 ca-js = { path = "crates/ca-js" }
 ca-inject = { path = "crates/ca-inject" }
 ca-qbdi = { path = "crates/ca-qbdi" }

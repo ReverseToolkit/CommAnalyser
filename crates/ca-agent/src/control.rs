@@ -133,6 +133,21 @@ fn run(name: &str) -> std::io::Result<()> {
                     None => json!({"ok": false, "error": "QuickJS unavailable"}),
                 }
             }
+            "java_stub_info" => match ca_art::stub_info() {
+                Ok(text) => serde_json::from_str::<Value>(&text)
+                    .unwrap_or_else(|_| json!({"ok": true, "raw": text})),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_hook_probe" => match ca_art::probe_hook() {
+                Ok(text) => serde_json::from_str::<Value>(&text)
+                    .unwrap_or_else(|_| json!({"ok": true, "raw": text})),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "java_probe" => match ca_art::probe() {
+                Ok(text) => serde_json::from_str::<Value>(&text)
+                    .unwrap_or_else(|_| json!({"ok": true, "raw": text})),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
             "rpc" => {
                 let name = request.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = request

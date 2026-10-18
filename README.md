@@ -60,6 +60,9 @@ cargo build --target aarch64-linux-android -p ca-agent -p ca-daemon -p ca-cli
 - **M2h (done)**: `send` and `rpc.exports` over the agent channel,
   validated in `sleep` and Settings.
   Details: [`docs/08-m2h.md`](docs/08-m2h.md).
+- **M3a (done)**: JNI VM discovery, Android 15 ArtMethod layout probing,
+  and a minimal `ArtMethod` entrypoint hook validated on Settings.
+  Details: [`docs/09-m3a.md`](docs/09-m3a.md).
 
 Details: [`docs/02-m1.md`](docs/02-m1.md).
 

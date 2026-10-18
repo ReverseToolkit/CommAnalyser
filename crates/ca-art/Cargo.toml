@@ -1,0 +1,14 @@
+[package]
+name = "ca-art"
+description = "ART/JNI probing and Java hook foundation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ca-core.workspace = true
+jni = { version = "0.22", default-features = false }
+libc.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
