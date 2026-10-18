@@ -37,6 +37,12 @@ static CALLED: AtomicUsize = AtomicUsize::new(0);
 
 fn callback(thread: usize) {
     CALLED.fetch_add(1, Ordering::Relaxed);
+    // Clear the temporary exception before running ART/JVMTI internals.
+    // SAFETY: thread is the art::Thread* passed by the trampoline; 0x98 is the
+    // Android 15 tlsPtr_.exception offset.
+    unsafe {
+        ptr::write_unaligned((thread + 0x98) as *mut usize, 0);
+    }
     if let Some(action) = ACTION.with(|slot| slot.borrow_mut().take()) {
         action();
     }

@@ -142,6 +142,17 @@ fn run(name: &str) -> std::io::Result<()> {
                 Ok(value) => json!({"ok": true, "value": format!("{value:#x}")}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
+            "java_jvmti_env" => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(art::java::jvmti_env_handle());
+                });
+                match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(Ok(env)) => json!({ "ok": true, "value": format!("{env:#x}") }),
+                    Ok(Err(error)) => json!({ "ok": false, "error": error.to_string() }),
+                    Err(_) => json!({ "ok": false, "error": "JVMTI env timed out" }),
+                }
+            }
             "java_ensure_call" => {
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {

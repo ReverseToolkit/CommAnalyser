@@ -246,6 +246,7 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
         "enumerateLoadedClasses",
         Func::from(enumerate_loaded_classes),
     )?;
+    java.set("choose", Func::from(choose))?;
     ctx.globals().set("Java", java)?;
     Ok(())
 }
@@ -996,6 +997,29 @@ fn enumerate_loaded_classes_sync<'js>(ctx: Ctx<'js>) -> JsResult<Array<'js>> {
         result.set(index, name)?;
     }
     Ok(result)
+}
+
+fn choose<'js>(ctx: Ctx<'js>, class_name: String, callbacks: Object<'js>) -> JsResult<()> {
+    let handles = art::java::choose_class_handles(&class_name).map_err(to_js_error)?;
+    let class = JavaClass::find(&class_name).map_err(to_js_error)?;
+    let on_match: Function<'js> = callbacks.get("onMatch")?;
+    for handle in handles {
+        let object = art::java::object_from_global_handle(class.info.clone(), handle)
+            .map_err(to_js_error)?;
+        let id = register(object);
+        let value = instance_object(ctx.clone(), class.clone(), id)?.into_value();
+        let result: Value<'js> = on_match.call((value,))?;
+        if result
+            .as_string()
+            .is_some_and(|value| value.to_string().ok().as_deref() == Some("stop"))
+        {
+            break;
+        }
+    }
+    if let Ok(on_complete) = callbacks.get::<_, Function<'js>>("onComplete") {
+        on_complete.call::<_, ()>(())?;
+    }
+    Ok(())
 }
 
 fn enumerate_loaded_classes<'js>(_ctx: Ctx<'js>, callbacks: Object<'js>) -> JsResult<()> {

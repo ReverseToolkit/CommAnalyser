@@ -1365,10 +1365,11 @@ pub fn ensure_plugin_symbol() -> Result<usize> {
 }
 
 pub fn runtime_pointer() -> Result<usize> {
-    let symbol = resolve_libart_symbol("_ZN3art7Runtime9instance_E")
-        .ok_or_else(|| Error::NotFound("Runtime::instance_".into()))?;
-    // SAFETY: Runtime::instance_ is a data symbol holding Runtime*.
-    let runtime = unsafe { ptr::read_unaligned(symbol as *const usize) };
+    let vm = JavaVm::get()?;
+    let raw_vm = vm.vm_raw() as usize;
+    // Frida's getArtRuntimeSpec: JavaVMExt stores Runtime* at +pointerSize.
+    // SAFETY: raw_vm is the live JavaVM/JavaVMExt object.
+    let runtime = unsafe { ptr::read_unaligned((raw_vm + 8) as *const usize) };
     if runtime == 0 {
         return Err(Error::NotFound("Runtime".into()));
     }
@@ -1805,7 +1806,7 @@ pub fn ensure_plugin_call() -> Result<bool> {
         *mut RawJavaVM,
         *mut *mut c_void,
         jni::sys::jint,
-    ) -> jni::sys::jint = unsafe { std::mem::transmute(*table.add(3)) };
+    ) -> jni::sys::jint = unsafe { std::mem::transmute(*table.add(6)) };
     let attach: unsafe extern "C" fn(
         *mut RawJavaVM,
         *mut *mut c_void,
@@ -1834,4 +1835,146 @@ pub fn ensure_plugin_call() -> Result<bool> {
         )
     };
     Ok(result)
+}
+
+pub fn jvmti_env_handle() -> Result<usize> {
+    if !ensure_plugin_call()? {
+        return Err(Error::Unsupported("EnsurePluginLoaded failed"));
+    }
+    let vm = JavaVm::get()?;
+    let raw_vm = vm.vm_raw();
+    // SAFETY: JavaVM points at JNIInvokeInterface; GetEnv is entry 6.
+    let table = unsafe { *(raw_vm as *mut *const usize) };
+    let get_env: unsafe extern "C" fn(
+        *mut RawJavaVM,
+        *mut *mut c_void,
+        jni::sys::jint,
+    ) -> jni::sys::jint = unsafe { std::mem::transmute(*table.add(6)) };
+    let mut env = std::ptr::null_mut();
+    let status = unsafe { get_env(raw_vm, &mut env, 0x7001_0200) };
+    if status != 0 || env.is_null() {
+        return Err(Error::Unsupported("JVMTI unavailable"));
+    }
+    Ok(env as usize)
+}
+
+extern "C" fn tag_heap_object(
+    _class_tag: i64,
+    _size: i64,
+    tag_ptr: *mut i64,
+    _user_data: *mut c_void,
+) -> jni::sys::jint {
+    if !tag_ptr.is_null() {
+        // SAFETY: JVMTI provides a writable tag slot.
+        unsafe { *tag_ptr = 1 };
+    }
+    1
+}
+
+pub fn choose_class_handles(class_name: &str) -> Result<Vec<usize>> {
+    choose_class_handles_impl(class_name)
+}
+
+fn choose_class_handles_impl(class_name: &str) -> Result<Vec<usize>> {
+    let class = JavaClass::find(class_name)?;
+    let env = jvmti_env_handle()?;
+    // SAFETY: jvmtiEnv points at the JVMTI function table.
+    let table = unsafe { *(env as *mut *const usize) };
+    let function = |index: usize| -> *const c_void {
+        // SAFETY: index is within the JVMTI interface table.
+        unsafe { *table.add(index) as *const c_void }
+    };
+    let add_capabilities: unsafe extern "C" fn(*mut c_void, *mut u64) -> jni::sys::jint =
+        unsafe { std::mem::transmute(function(141)) };
+    let iterate: unsafe extern "C" fn(
+        *mut c_void,
+        jni::sys::jclass,
+        jni::sys::jint,
+        *const c_void,
+        *mut c_void,
+    ) -> jni::sys::jint = unsafe { std::mem::transmute(function(111)) };
+    let get_objects: unsafe extern "C" fn(
+        *mut c_void,
+        jni::sys::jint,
+        *const i64,
+        *mut jni::sys::jint,
+        *mut *mut jni::sys::jobject,
+        *mut *mut i64,
+    ) -> jni::sys::jint = unsafe { std::mem::transmute(function(113)) };
+    let deallocate: unsafe extern "C" fn(*mut c_void, *mut c_void) -> jni::sys::jint =
+        unsafe { std::mem::transmute(function(46)) };
+
+    let mut capabilities = 1u64;
+    // SAFETY: first jvmtiCapabilities bit is can_tag_objects.
+    let status = unsafe { add_capabilities(env as *mut c_void, &mut capabilities) };
+    if status != 0 {
+        return Err(Error::Parse(format!("JVMTI addCapabilities: {status}")));
+    }
+
+    let global_class = {
+        let vm = JavaVm::get()?;
+        vm.with_env(|env| {
+            let slash = JNIString::new(class.info.name.replace('.', "/"));
+            let local = env.find_class(&*slash)?;
+            Ok(env.new_global_ref(&local)?.into_raw() as usize)
+        })?
+    };
+    // SAFETY: global_class is a live jclass global reference.
+    let status = unsafe {
+        iterate(
+            env as *mut c_void,
+            global_class as jni::sys::jclass,
+            3,
+            tag_heap_object as *const () as *const c_void,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(Error::Parse(format!("JVMTI iterate: {status}")));
+    }
+    let tag = 1i64;
+    let mut count = 0;
+    let mut objects: *mut jni::sys::jobject = std::ptr::null_mut();
+    // SAFETY: JVMTI allocates objects/count.
+    let status = unsafe {
+        get_objects(
+            env as *mut c_void,
+            1,
+            &tag,
+            &mut count,
+            &mut objects,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(Error::Parse(format!("JVMTI getObjects: {status}")));
+    }
+    if objects.is_null() || count <= 0 {
+        if !objects.is_null() {
+            // SAFETY: JVMTI allocated the (empty) result array.
+            unsafe {
+                deallocate(env as *mut c_void, objects as *mut c_void);
+            }
+        }
+        return Ok(Vec::new());
+    }
+    let vm = JavaVm::get()?;
+    let handles = vm.with_env(|jni_env| {
+        let mut result = Vec::with_capacity(count as usize);
+        for index in 0..count as usize {
+            // SAFETY: JVMTI returned an array of count jobject handles.
+            let handle = unsafe { *objects.add(index) };
+            if handle.is_null() {
+                continue;
+            }
+            let object = unsafe { JObject::from_raw(jni_env, handle) };
+            result.push(jni_env.new_global_ref(&object)?.into_raw() as usize);
+        }
+        Ok(result)
+    })?;
+    // SAFETY: JVMTI allocated objects.
+    unsafe {
+        deallocate(env as *mut c_void, objects as *mut c_void);
+    }
+    Ok(handles)
 }
