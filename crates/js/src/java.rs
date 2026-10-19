@@ -172,7 +172,9 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
                             && entry.method.is_static == is_static
                     })
                 }) {
-                    *slot = None;
+                    if let Some(entry) = slot.take() {
+                        let _ = entry.hook.borrow_mut().detach();
+                    }
                     unregister_hook(id);
                 }
                 Ok(())

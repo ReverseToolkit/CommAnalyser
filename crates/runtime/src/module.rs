@@ -122,9 +122,25 @@ pub fn find_by_name(name: &str) -> Result<Option<Module>> {
         .find(|m| m.name == name || m.path == name))
 }
 
+pub fn score_containing(module: &Module, addr: usize) -> (u8, u8, usize) {
+    let exact = u8::from(module.base != addr);
+    let ephemeral = u8::from(
+        module.name.contains("memfd")
+            || module.name.contains("jit")
+            || !module.path.starts_with('/'),
+    );
+    (exact, ephemeral, module.size())
+}
+
 /// Find the module containing `addr`.
+///
+/// Prefer an exact `base` match, then a file-backed mapping, then the
+/// smallest containing module (ART jit/memfd ranges can overlap an ELF).
 pub fn find_by_address(addr: usize) -> Result<Option<Module>> {
-    Ok(enumerate()?.into_iter().find(|m| m.contains(addr)))
+    Ok(enumerate()?
+        .into_iter()
+        .filter(|module| module.contains(addr))
+        .min_by_key(|module| score_containing(module, addr)))
 }
 
 #[cfg(test)]

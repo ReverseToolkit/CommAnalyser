@@ -472,7 +472,7 @@ fn module_map_object<'js>(ctx: Ctx<'js>, filter: Option<Function<'js>>) -> JsRes
             let store = store.clone();
             move |address: Value<'js>| -> JsResult<bool> {
                 let addr = parse_pointer(&address)? as usize;
-                Ok(store.borrow().iter().any(|module| module.contains(addr)))
+                Ok(best_module(&store.borrow(), addr).is_some())
             }
         }),
     )?;
@@ -482,7 +482,7 @@ fn module_map_object<'js>(ctx: Ctx<'js>, filter: Option<Function<'js>>) -> JsRes
             let store = store.clone();
             move |ctx: Ctx<'js>, address: Value<'js>| -> JsResult<Value<'js>> {
                 let addr = parse_pointer(&address)? as usize;
-                match store.borrow().iter().find(|module| module.contains(addr)) {
+                match best_module(&store.borrow(), addr) {
                     Some(module) => Ok(crate::api::module_object_from(ctx, module)?.into_value()),
                     None => Ok(Value::new_null(ctx)),
                 }
@@ -495,7 +495,7 @@ fn module_map_object<'js>(ctx: Ctx<'js>, filter: Option<Function<'js>>) -> JsRes
             let store = store.clone();
             move |ctx: Ctx<'js>, address: Value<'js>| -> JsResult<Value<'js>> {
                 let addr = parse_pointer(&address)? as usize;
-                match store.borrow().iter().find(|module| module.contains(addr)) {
+                match best_module(&store.borrow(), addr) {
                     Some(module) => module.name.clone().into_js_local(&ctx),
                     None => Ok(Value::new_null(ctx)),
                 }
@@ -508,7 +508,7 @@ fn module_map_object<'js>(ctx: Ctx<'js>, filter: Option<Function<'js>>) -> JsRes
             let store = store.clone();
             move |ctx: Ctx<'js>, address: Value<'js>| -> JsResult<Value<'js>> {
                 let addr = parse_pointer(&address)? as usize;
-                match store.borrow().iter().find(|module| module.contains(addr)) {
+                match best_module(&store.borrow(), addr) {
                     Some(module) => module.path.clone().into_js_local(&ctx),
                     None => Ok(Value::new_null(ctx)),
                 }
@@ -540,6 +540,13 @@ fn module_map_object<'js>(ctx: Ctx<'js>, filter: Option<Function<'js>>) -> JsRes
         }),
     )?;
     Ok(obj)
+}
+
+fn best_module(modules: &[module::Module], addr: usize) -> Option<&module::Module> {
+    modules
+        .iter()
+        .filter(|module| module.contains(addr))
+        .min_by_key(|module| module::score_containing(module, addr))
 }
 
 fn collect_modules(filter: Option<&Function<'_>>) -> JsResult<Vec<module::Module>> {
