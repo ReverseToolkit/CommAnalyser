@@ -45,6 +45,11 @@ impl CodeWriter {
         self.bytes.extend_from_slice(&word.to_le_bytes());
     }
 
+    /// Overwrite one instruction that was already emitted at byte `at`.
+    pub fn set_word(&mut self, at: usize, word: u32) {
+        self.bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+    }
+
     #[inline]
     pub fn put_bytes(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
@@ -81,6 +86,39 @@ impl CodeWriter {
 
     pub fn br(&mut self, rn: u8) {
         self.put(0xD61F_0000 | ((rn as u32) << 5));
+    }
+
+    /// `XPACI Xd` — strip IA PAC (`gum_arm64_writer_put_xpaci_reg`).
+    pub fn xpaci(&mut self, rd: u8) {
+        self.put(0xDAC1_43E0 | rd as u32);
+    }
+
+    /// `PACIZA Xd` — sign IA, modifier 0 (`gum_sign_code_pointer`).
+    pub fn paciza(&mut self, rd: u8) {
+        self.put(0xDAC1_23E0 | rd as u32);
+    }
+
+    /// `BRAAZ Xn` — gum `put_br_reg` with ptrauth extra `0x81f`.
+    pub fn braaz(&mut self, rn: u8) {
+        self.put(0xD61F_0000 | ((rn as u32) << 5) | 0x81F);
+    }
+
+    /// Frida `put_jmp_reg` for a raw address: `RET Xn`.
+    ///
+    /// BTI-exempt, and it does not authenticate against SP. Use this for a
+    /// computed resume (`patch + 4`). A PAC-signed LR needs [`jmp_auth_lr`].
+    pub fn jmp_signed(&mut self, rn: u8) {
+        self.ret(rn);
+    }
+
+    /// Frida leave: `gum_sign_code_pointer` then `BRAAZ`.
+    ///
+    /// `RET` of an SP-PAC'd LR fetches the signed bits and MAPERRs. Strip,
+    /// re-sign with modifier 0, then branch.
+    pub fn jmp_auth_lr(&mut self, rn: u8) {
+        self.xpaci(rn);
+        self.paciza(rn);
+        self.braaz(rn);
     }
 
     pub fn blr(&mut self, rn: u8) {
@@ -223,6 +261,24 @@ impl CodeWriter {
         self.put(word);
     }
 
+    /// `STP Qt, Qt2, [Xn, #imm]` (128-bit SIMD, imm multiple of 16).
+    pub fn stp_q(&mut self, rt: u8, rt2: u8, rn: u8, offset: i64) {
+        debug_assert!(offset % 16 == 0 && (-1024..1024).contains(&offset));
+        let imm7 = ((offset / 16) as u32) & 0x7F;
+        self.put(
+            0xAD00_0000 | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt as u32,
+        );
+    }
+
+    /// `LDP Qt, Qt2, [Xn, #imm]`.
+    pub fn ldp_q(&mut self, rt: u8, rt2: u8, rn: u8, offset: i64) {
+        debug_assert!(offset % 16 == 0 && (-1024..1024).contains(&offset));
+        let imm7 = ((offset / 16) as u32) & 0x7F;
+        self.put(
+            0xAD40_0000 | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt as u32,
+        );
+    }
+
     pub fn str_imm(&mut self, rt: u8, rn: u8, offset: u32) {
         debug_assert!(offset % 8 == 0 && offset < 32768);
         self.put(0xF900_0000 | ((offset / 8) << 10) | ((rn as u32) << 5) | rt as u32);
@@ -304,6 +360,13 @@ impl CodeWriter {
         self.put_u64(target as u64);
     }
 
+    /// Absolute resume: `ldr x16, #8; ret x16; .quad target`.
+    pub fn abs_b_signed(&mut self, target: usize) {
+        self.ldr_literal_x(16, 8);
+        self.jmp_signed(16);
+        self.put_u64(target as u64);
+    }
+
     /// Absolute call preserving LR.
     ///
     /// Layout (24 bytes):
@@ -344,6 +407,56 @@ mod tests {
             words(w.bytes()),
             vec![0xD503_201F, 0xD65F_03C0, 0xD61F_0200, 0xD63F_0220]
         );
+    }
+
+    #[test]
+    fn simd_q_pair_encodings() {
+        let mut w = CodeWriter::new();
+        w.stp_q(0, 1, 31, 272);
+        w.ldp_q(2, 3, 31, 304);
+        assert_eq!(words(w.bytes()), vec![0xAD08_87E0, 0xAD49_8FE2]);
+    }
+
+    #[test]
+    fn ptrauth_jmp_encodings() {
+        let mut w = CodeWriter::new();
+        w.xpaci(16);
+        w.paciza(16);
+        w.braaz(16);
+        assert_eq!(
+            words(w.bytes()),
+            vec![0xDAC1_43F0, 0xDAC1_23F0, 0xD61F_0A1F]
+        );
+    }
+
+    #[test]
+    fn auth_lr_is_xpaci_paciza_braaz() {
+        let mut w = CodeWriter::new();
+        w.jmp_auth_lr(16);
+        let words: Vec<u32> = w
+            .bytes()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![0xDAC1_43F0, 0xDAC1_23F0, 0xD61F_0A1F]);
+    }
+
+    #[test]
+    fn abs_resume_is_ldr_then_ret() {
+        let mut w = CodeWriter::new();
+        w.abs_b_signed(0x2000);
+        let words: Vec<u32> = w
+            .bytes()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words[0], 0x5800_0050); // ldr x16, #8
+        assert_eq!(words[1], 0xD65F_0200); // ret x16
+        assert_eq!(
+            u64::from_le_bytes(w.bytes()[8..16].try_into().unwrap()),
+            0x2000
+        );
+        assert!(!words.contains(&0xD61F_0A1F));
     }
 
     #[test]

@@ -101,12 +101,21 @@ mod tests {
                 *(target as *mut u8).add(i) = [0x1F, 0x20, 0x03, 0xD5][i % 4];
             }
         }
+        let before = unsafe { std::slice::from_raw_parts(target as *const u8, 16) }.to_vec();
         Interceptor::replace(target, 0xAABB_CCDD).unwrap();
         assert!(original_trampoline(target).is_some());
+        let patched = unsafe { std::slice::from_raw_parts(target as *const u8, 16) };
+        let word = u32::from_le_bytes(patched[..4].try_into().unwrap());
+        let len = if word & 0xFC00_0000 == 0x1400_0000 {
+            4
+        } else {
+            16
+        };
+        assert_eq!(&patched[len..], &before[len..]);
         Interceptor::flush();
         Interceptor::revert(target).unwrap();
-        let restored = unsafe { std::slice::from_raw_parts(target as *const u8, 4) };
-        assert_eq!(restored, &[0x1F, 0x20, 0x03, 0xD5]);
+        let restored = unsafe { std::slice::from_raw_parts(target as *const u8, 16) };
+        assert_eq!(restored, &before);
         unsafe { libc::munmap(page, 0x1000) };
     }
 }

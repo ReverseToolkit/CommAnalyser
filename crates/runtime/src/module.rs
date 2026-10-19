@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::error::Result;
@@ -12,7 +12,9 @@ pub struct Module {
     pub name: String,
     /// Full path as seen in `/proc/self/maps`, with ` (deleted)` removed.
     pub path: String,
-    /// Lowest mapping start, i.e. the ELF load bias is `base` for most libs.
+    /// Start of the loaded image. For a normal ELF this is the load bias:
+    /// the first mapping of the contiguous run that contains the text,
+    /// not a separate read-only file snapshot of the same path.
     pub base: usize,
     /// Highest mapping end.
     pub end: usize,
@@ -48,53 +50,79 @@ impl Module {
 /// Notes:
 /// - anonymous mappings (`[anon:...]`, `[stack]`, `[heap]`) are skipped;
 /// - `[vdso]` is kept because scripts commonly look it up by name;
-/// - the same path can appear many times (split segments), so entries are
-///   grouped by cleaned path.
+/// - consecutive mappings of the same path (split PT_LOAD segments) form one
+///   module, matching Frida's proc-maps walk;
+/// - a later disjoint run of the same path that is only readable is dropped
+///   when another run is executable. That is a file snapshot (`g_mapped_file`),
+///   not the linker load. Using its start as `base` relocates symbols into a
+///   non-executable page.
 pub fn enumerate() -> Result<Vec<Module>> {
     let maps = maps::read_self_maps()?;
     Ok(aggregate(&maps))
 }
 
+struct Run {
+    module: Module,
+    executable: bool,
+}
+
 /// Aggregate raw mappings into modules.  Kept public for testing and for
 /// remote-process enumeration (where maps come from `/proc/<pid>/maps`).
+///
+/// `maps` must be in address order, as `/proc/<pid>/maps` is.
 pub fn aggregate(maps: &[Mapping]) -> Vec<Module> {
-    let mut by_path: BTreeMap<String, Module> = BTreeMap::new();
-
-    for m in maps {
-        let Some(path) = m.clean_path() else {
+    let mut runs: Vec<Run> = Vec::new();
+    for mapping in maps {
+        let Some(path) = mapping.clean_path() else {
             continue;
         };
         if !path.starts_with('/') && path != "[vdso]" {
             continue;
         }
-        let name = if path == "[vdso]" {
-            "[vdso]".to_owned()
-        } else {
-            Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path)
-                .to_owned()
-        };
-
-        let entry = by_path.entry(path.to_owned()).or_insert_with(|| Module {
-            name,
-            path: path.to_owned(),
-            base: m.range.start,
-            end: m.range.end,
-            ranges: Vec::new(),
+        if let Some(run) = runs.last_mut().filter(|run| run.module.path == path) {
+            run.module.end = run.module.end.max(mapping.range.end);
+            run.module.ranges.push(mapping.range);
+            run.executable |= mapping.perms.exec;
+            continue;
+        }
+        runs.push(Run {
+            module: Module {
+                name: module_name(path),
+                path: path.to_owned(),
+                base: mapping.range.start,
+                end: mapping.range.end,
+                ranges: vec![mapping.range],
+            },
+            executable: mapping.perms.exec,
         });
-        entry.base = entry.base.min(m.range.start);
-        entry.end = entry.end.max(m.range.end);
-        entry.ranges.push(m.range);
     }
 
-    let mut result: Vec<Module> = by_path.into_values().collect();
+    let loaded: HashSet<String> = runs
+        .iter()
+        .filter(|run| run.executable)
+        .map(|run| run.module.path.clone())
+        .collect();
+    let mut result: Vec<Module> = runs
+        .into_iter()
+        .filter(|run| run.executable || !loaded.contains(&run.module.path))
+        .map(|run| run.module)
+        .collect();
     for module in &mut result {
-        module.ranges.sort_by_key(|r| r.start);
+        module.ranges.sort_by_key(|range| range.start);
     }
-    result.sort_by_key(|m| m.base);
+    result.sort_by_key(|module| module.base);
     result
+}
+
+fn module_name(path: &str) -> String {
+    if path == "[vdso]" {
+        return "[vdso]".to_owned();
+    }
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_owned()
 }
 
 /// The module covering the process executable, Frida's `Process.mainModule`.
@@ -165,6 +193,41 @@ mod tests {
         assert_eq!(foo.ranges.len(), 3);
         assert_eq!(foo.size(), 0x3000);
         assert!(modules.iter().any(|m| m.name == "[vdso]"));
+    }
+
+    #[test]
+    fn file_snapshot_does_not_become_the_load_bias() {
+        // Lowest run is a whole-file r-- image. The linker mapping comes later,
+        // after another module, and is the one that contains executable pages.
+        let maps = maps::parse_maps(
+            "1000-4000 r--p 00000000 fd:01 1 /apex/libm.so\n\
+             5000-6000 r-xp 00000000 fd:01 2 /apex/libc.so\n\
+             8000-9000 r--p 00000000 fd:01 1 /apex/libm.so\n\
+             9000-b000 r-xp 00001000 fd:01 1 /apex/libm.so\n",
+        )
+        .unwrap();
+        let modules = aggregate(&maps);
+        let libm = modules.iter().find(|m| m.name == "libm.so").unwrap();
+        assert_eq!(libm.base, 0x8000);
+        assert_eq!(libm.end, 0xb000);
+        assert_eq!(libm.ranges.len(), 2);
+        assert!(!libm.contains(0x1000));
+        assert_eq!(
+            modules.iter().filter(|m| m.name == "libm.so").count(),
+            1
+        );
+        assert_eq!(
+            modules.iter().find(|m| m.name == "libc.so").unwrap().base,
+            0x5000
+        );
+    }
+
+    #[test]
+    fn readable_only_module_is_kept_when_it_is_the_only_run() {
+        let maps = maps::parse_maps("1000-2000 r--p 00000000 fd:01 1 /data/libonly.so\n").unwrap();
+        let modules = aggregate(&maps);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].base, 0x1000);
     }
 
     #[test]

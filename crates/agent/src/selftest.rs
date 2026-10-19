@@ -74,6 +74,7 @@ pub fn run(worker: Option<&JsWorker>, suite: Option<&str>) -> Value {
         cases.push(guard("gum", "memory", test_memory));
         cases.push(guard("gum", "native_strlen", test_native_strlen));
         cases.push(guard("gum", "native_sqrt", test_native_sqrt));
+        cases.push(guard("gum", "native_f32", test_native_f32));
         cases.extend(arch_cases());
         cases.extend(hook_cases());
     }
@@ -97,11 +98,52 @@ pub fn run(worker: Option<&JsWorker>, suite: Option<&str>) -> Value {
                   var n = new NativeFunction(sqrt, 'double', ['double'])(9.0);
                   var ev = Trace.takeEvents();
                   if (ev.length < 1) throw new Error('no events n=' + n);
+                  if (Math.abs(n - 3) > 1e-9) throw new Error('want 3 n=' + n);
                   return 'n=' + n + ' events=' + ev.length;
                 })()
                 "#,
             )),
             None => cases.push(Outcome::skip("trace", "libm_sqrt", "QuickJS unavailable")),
+        }
+        match worker {
+            Some(worker) => cases.push(js_eval(
+                worker,
+                "trace",
+                "libm_ilogb",
+                r#"
+                (function () {
+                  var ilogb = Module.findExportByName('libm.so', 'ilogb');
+                  if (!ilogb) throw new Error('no ilogb');
+                  Trace.function(ilogb, { events: ['inst'] });
+                  var n = new NativeFunction(ilogb, 'int', ['double'])(8.0);
+                  var ev = Trace.takeEvents();
+                  if (n !== 3) throw new Error('want 3 n=' + n);
+                  if (ev.length < 1) throw new Error('no events n=' + n);
+                  return 'n=' + n + ' events=' + ev.length;
+                })()
+                "#,
+            )),
+            None => cases.push(Outcome::skip("trace", "libm_ilogb", "QuickJS unavailable")),
+        }
+        match worker {
+            Some(worker) => cases.push(js_eval(
+                worker,
+                "trace",
+                "libm_hypot",
+                r#"
+                (function () {
+                  var hypot = Module.findExportByName('libm.so', 'hypot');
+                  if (!hypot) throw new Error('no hypot');
+                  Trace.function(hypot, { events: ['inst'] });
+                  var n = new NativeFunction(hypot, 'double', ['double', 'double'])(3, 4);
+                  var ev = Trace.takeEvents();
+                  if (Math.abs(n - 5) > 1e-9) throw new Error('want 5 n=' + n);
+                  if (ev.length < 1) throw new Error('no events n=' + n);
+                  return 'n=' + n + ' events=' + ev.length;
+                })()
+                "#,
+            )),
+            None => cases.push(Outcome::skip("trace", "libm_hypot", "QuickJS unavailable")),
         }
     }
     if take("java") {
@@ -231,10 +273,31 @@ extern "C" fn commanalyser_selftest_three_f64() -> f64 {
     3.0
 }
 
+#[inline(never)]
+extern "C" fn commanalyser_selftest_half_f32(x: f32) -> f32 {
+    x * 0.5
+}
+
+fn test_native_f32() -> Result<String, String> {
+    let got = unsafe {
+        gum::native::call_f32(
+            std::hint::black_box(commanalyser_selftest_half_f32 as *const () as usize),
+            &[],
+            &[u64::from(0.5f32.to_bits())],
+        )
+    }
+    .map_err(|err| err.to_string())?;
+    if (got - 0.25).abs() > 1e-6 {
+        return Err(format!("f32={got}"));
+    }
+    Ok(format!("f32={got}"))
+}
+
 fn test_native_sqrt() -> Result<String, String> {
     let ret = unsafe {
         gum::native::call_f64(
             std::hint::black_box(commanalyser_selftest_three_f64 as *const () as usize),
+            &[],
             &[],
         )
     }
@@ -314,7 +377,10 @@ fn hook_cases() -> Vec<Outcome> {
             guard("gum", "hook_enter", test_hook_enter),
             guard("gum", "hook_leave_replace", test_hook_leave_replace),
             guard("gum", "hook_gprs", test_hook_gprs),
+            guard("gum", "hook_sp_pc", test_hook_sp_pc),
+            guard("gum", "reloc_literal", test_reloc_literal),
             guard("gum", "replace_revert", test_replace_revert),
+            guard("gum", "replace_tail", test_replace_tail),
         ]
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -429,6 +495,10 @@ static SEEN_FP: AtomicU64 = AtomicU64::new(0);
 static SEEN_LR: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_arch = "aarch64")]
 static SEEN_SP: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static REDIR_PC: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static REDIR_SP: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_arch = "aarch64")]
 unsafe extern "C" fn on_add2_enter(regs: *mut SavedRegs, _data: *mut c_void) {
@@ -539,6 +609,157 @@ fn test_hook_gprs() -> Result<String, String> {
 }
 
 #[cfg(target_arch = "aarch64")]
+unsafe extern "C" fn on_redirect_sp_pc(regs: *mut SavedRegs, _data: *mut c_void) {
+    if regs.is_null() {
+        return;
+    }
+    let regs = unsafe { &mut *regs };
+    // Keep the caller's SP in x19 and its x19 in x20 so the landing can
+    // switch back before RET.  Otherwise the caller pops a foreign stack.
+    let caller_sp = regs.sp;
+    let caller_x19 = regs.x[19];
+    regs.x[20] = caller_x19;
+    regs.x[19] = caller_sp;
+    regs.pc = REDIR_PC.load(Ordering::SeqCst);
+    regs.sp = REDIR_SP.load(Ordering::SeqCst);
+}
+
+/// Callback sets SP and PC.  The epilogue must resume at that PC with that SP.
+#[cfg(target_arch = "aarch64")]
+fn test_hook_sp_pc() -> Result<String, String> {
+    // bti jc; mov x0, sp; mov sp, x19; mov x19, x20; ret
+    let landing = {
+        let page = mmap_exec_page()?;
+        let mut writer = gum::arch::writer::CodeWriter::new();
+        writer.bti_jc();
+        writer.put(0x9100_03E0); // mov x0, sp
+        writer.put(0x9100_027F); // mov sp, x19
+        writer.put(0xAA14_03F3); // mov x19, x20
+        writer.ret(30);
+        unsafe {
+            ptr::copy_nonoverlapping(writer.bytes().as_ptr(), page as *mut u8, writer.len());
+        }
+        gum::memory::flush_icache(page as usize, writer.len());
+        page as usize
+    };
+    let target = emit_stub(&[0x5280_0020, 0xD65F_03C0])?; // mov w0, #1; ret
+    let stack = mmap_exec_page().map_err(|err| {
+        free_stub(landing);
+        free_stub(target);
+        err
+    })?;
+    let want_sp = stack as usize + 0x800;
+    REDIR_PC.store(landing as u64, Ordering::SeqCst);
+    REDIR_SP.store(want_sp as u64, Ordering::SeqCst);
+    let hooked = unsafe { InlineHook::attach(target, on_redirect_sp_pc, ptr::null_mut()) };
+    let mut hook = match hooked {
+        Ok(hook) => hook,
+        Err(err) => {
+            free_stub(landing);
+            free_stub(target);
+            free_stub(stack as usize);
+            return Err(err.to_string());
+        }
+    };
+    let got = unsafe { gum::native::call(target, &[]) };
+    let detach = hook.detach();
+    free_stub(landing);
+    free_stub(target);
+    free_stub(stack as usize);
+    detach.map_err(|err| err.to_string())?;
+    let got = got.map_err(|err| err.to_string())?;
+    if got != want_sp as u64 {
+        return Err(format!("sp {got:#x} want {want_sp:#x}"));
+    }
+    Ok(format!("resumed at landing with sp={got:#x}"))
+}
+
+/// Execute relocated integer and vector literal loads against a real pool.
+#[cfg(target_arch = "aarch64")]
+fn test_reloc_literal() -> Result<String, String> {
+    let data = mmap_exec_page()?;
+    let base = data as usize;
+    unsafe {
+        ptr::write_unaligned(base as *mut u32, 0x3FC0_0000); // 1.5f
+        ptr::write_unaligned((base + 8) as *mut u64, 2.5f64.to_bits());
+        let q = [
+            0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xF0, 0x0F,
+        ];
+        ptr::copy_nonoverlapping(q.as_ptr(), (base + 32) as *mut u8, 16);
+        ptr::write_unaligned((base + 64) as *mut u64, 0x1122_3344_5566_7788);
+    }
+    let prfm = gum::arch::relocator::relocate_one(0xD800_0000, base);
+    if prfm.is_ok() {
+        free_stub(base);
+        return Err("prfm literal was rewritten".into());
+    }
+
+    let s = exec_reloc(0x1C00_0000, base, 0xBD00_0040)?;
+    let d = exec_reloc(0x5C00_0001, base + 8, 0xFD00_0041)?;
+    let q = exec_reloc(0x9C00_0002, base + 32, 0x3D80_0042)?;
+    let gpr = exec_reloc_gpr(0x5800_0003, base + 64)?;
+    free_stub(base);
+
+    let s_bits = u32::from_le_bytes(s[..4].try_into().unwrap());
+    let d_bits = u64::from_le_bytes(d[..8].try_into().unwrap());
+    if s_bits != 0x3FC0_0000 {
+        return Err(format!("s0 {s_bits:#x}"));
+    }
+    if d_bits != 2.5f64.to_bits() {
+        return Err(format!("d1 {d_bits:#x}"));
+    }
+    if q != [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0,
+        0x0F,
+    ] {
+        return Err(format!("q2 {q:?}"));
+    }
+    if gpr != 0x1122_3344_5566_7788 {
+        return Err(format!("x3 {gpr:#x}"));
+    }
+    Ok("s/d/q literal and x3 literal".into())
+}
+
+/// Run a relocated literal load and `str` the destination vector through `x2`.
+#[cfg(target_arch = "aarch64")]
+fn exec_reloc(word: u32, pc: usize, store: u32) -> Result<[u8; 16], String> {
+    let relocated = gum::arch::relocator::relocate_one(word, pc).map_err(|err| err.to_string())?;
+    let mut code = gum::arch::writer::CodeWriter::new();
+    code.put_bytes(&relocated.bytes);
+    code.put(store); // str Vd, [x2]
+    code.ret(30);
+    let page = mmap_exec_page()?;
+    unsafe {
+        ptr::copy_nonoverlapping(code.bytes().as_ptr(), page as *mut u8, code.len());
+    }
+    gum::memory::flush_icache(page as usize, code.len());
+    let mut out = [0u8; 16];
+    let call = unsafe { gum::native::call(page as usize, &[0, 0, out.as_mut_ptr() as u64]) };
+    free_stub(page as usize);
+    call.map_err(|err| err.to_string())?;
+    Ok(out)
+}
+
+/// Run a relocated `ldr x3` and return that register.
+#[cfg(target_arch = "aarch64")]
+fn exec_reloc_gpr(word: u32, pc: usize) -> Result<u64, String> {
+    let relocated = gum::arch::relocator::relocate_one(word, pc).map_err(|err| err.to_string())?;
+    let mut code = gum::arch::writer::CodeWriter::new();
+    code.put_bytes(&relocated.bytes);
+    code.put(0xAA03_03E0); // mov x0, x3
+    code.ret(30);
+    let page = mmap_exec_page()?;
+    unsafe {
+        ptr::copy_nonoverlapping(code.bytes().as_ptr(), page as *mut u8, code.len());
+    }
+    gum::memory::flush_icache(page as usize, code.len());
+    let value = unsafe { gum::native::call(page as usize, &[]) };
+    free_stub(page as usize);
+    value.map_err(|err| err.to_string())
+}
+
+#[cfg(target_arch = "aarch64")]
 fn test_replace_revert() -> Result<String, String> {
     let target = make_add2_stub()?;
     let replacement = make_seven_stub()?;
@@ -566,6 +787,70 @@ fn test_replace_revert() -> Result<String, String> {
         return Err(format!("after {after}"));
     }
     Ok("replace 3→7, revert 7→3".into())
+}
+
+/// Two replaces of one stub must keep every byte past the redirect, then revert.
+#[cfg(target_arch = "aarch64")]
+fn test_replace_tail() -> Result<String, String> {
+    let target = make_add2_stub()?;
+    let first = make_seven_stub()?;
+    let second = emit_stub(&[0x5280_0100, 0xD65F_03C0])?; // mov w0, #8; ret
+    let mut original = [0u8; 16];
+    unsafe {
+        ptr::copy_nonoverlapping(target as *const u8, original.as_mut_ptr(), 16);
+    }
+    let fail = |err: String| {
+        free_stub(target);
+        free_stub(first);
+        free_stub(second);
+        Err(err)
+    };
+    if let Err(err) = gum::replace::replace(target, first) {
+        return fail(err.to_string());
+    }
+    let mut mid = [0u8; 16];
+    unsafe {
+        ptr::copy_nonoverlapping(target as *const u8, mid.as_mut_ptr(), 16);
+    }
+    let pad = u32::from_le_bytes(mid[..4].try_into().unwrap());
+    let branch = u32::from_le_bytes(mid[4..8].try_into().unwrap());
+    if pad != u32::from_le_bytes(original[..4].try_into().unwrap()) {
+        return fail(format!("replace overwrote the landing pad {pad:#x}"));
+    }
+    if branch & 0xFC00_0000 != 0x1400_0000 {
+        return fail(format!("redirect {branch:#x} is not a single B"));
+    }
+    if mid[8..] != original[8..] {
+        return fail("first replace wrote past the branch".into());
+    }
+    let via_first = call_add2_at(target, 1, 2);
+    if let Err(err) = gum::replace::replace(target, second) {
+        return fail(err.to_string());
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(target as *const u8, mid.as_mut_ptr(), 16);
+    }
+    if mid[..4] != original[..4] || mid[8..] != original[8..] {
+        return fail("second replace wrote past the branch".into());
+    }
+    let via_second = call_add2_at(target, 1, 2);
+    let revert = gum::replace::revert(target);
+    let mut restored = [0u8; 16];
+    unsafe {
+        ptr::copy_nonoverlapping(target as *const u8, restored.as_mut_ptr(), 16);
+    }
+    let via_original = call_add2_at(target, 1, 2);
+    free_stub(target);
+    free_stub(first);
+    free_stub(second);
+    revert.map_err(|err| err.to_string())?;
+    if restored != original {
+        return Err("revert did not restore the pre-replace bytes".into());
+    }
+    if via_first != 7 || via_second != 8 || via_original != 3 {
+        return Err(format!("calls {via_first}/{via_second}/{via_original}"));
+    }
+    Ok("B redirect, tail kept, revert restored".into())
 }
 
 fn js_cases(worker: &JsWorker) -> Vec<Outcome> {

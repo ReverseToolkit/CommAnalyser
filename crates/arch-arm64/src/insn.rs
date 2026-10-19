@@ -43,13 +43,19 @@ pub enum Insn {
         rd: u8,
         offset: i64,
     },
-    /// `LDR` / `LDRSW` / `PRFM` (literal form).
+    /// Integer `LDR` / `LDRSW` / `PRFM` (literal form, V = 0).
     LdrLiteral {
         rt: u8,
         offset: i64,
         is_64: bool,
         is_signed: bool,
         is_prfm: bool,
+    },
+    /// SIMD/FP `LDR` literal (`S` / `D` / `Q`).
+    LdrLiteralSimd {
+        rt: u8,
+        offset: i64,
+        kind: LiteralSimd,
     },
     /// `BR`.
     Br {
@@ -65,6 +71,17 @@ pub enum Insn {
     },
     /// Anything the relocator does not understand yet.
     Other(u32),
+}
+
+/// Width of an FP/SIMD literal load. Matches Frida's `S` / `D` / `Q` split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiteralSimd {
+    /// 32-bit `S` register.
+    S,
+    /// 64-bit `D` register.
+    D,
+    /// 128-bit `Q` register.
+    Q,
 }
 
 impl Insn {
@@ -148,8 +165,9 @@ pub fn classify(word: u32) -> Insn {
         };
     }
 
-    // Load register (literal): opc 011000 imm19 Rt.
-    if word & 0x3B00_0000 == 0x1800_0000 {
+    // Integer load (literal): opc 011 0 00 imm19 Rt.  Bit 26 (V) is clear.
+    // PRFM is opc = 11; it is not a GPR load.
+    if word & 0x3F00_0000 == 0x1800_0000 {
         let opc = (word >> 30) & 0x3;
         let rt = (word & 0x1F) as u8;
         let imm = sign_extend(((word >> 5) & 0x7_FFFF) as u64, 19) << 2;
@@ -166,6 +184,25 @@ pub fn classify(word: u32) -> Insn {
             is_64,
             is_signed,
             is_prfm,
+        };
+    }
+
+    // SIMD/FP load (literal): opc 011 1 00 imm19 Rt.
+    // opc 00/01/10 are S/D/Q.  opc 11 is unallocated, not PRFM.
+    if word & 0x3F00_0000 == 0x1C00_0000 {
+        let opc = (word >> 30) & 0x3;
+        let rt = (word & 0x1F) as u8;
+        let imm = sign_extend(((word >> 5) & 0x7_FFFF) as u64, 19) << 2;
+        let kind = match opc {
+            0b00 => LiteralSimd::S,
+            0b01 => LiteralSimd::D,
+            0b10 => LiteralSimd::Q,
+            _ => return Insn::Other(word),
+        };
+        return Insn::LdrLiteralSimd {
+            rt,
+            offset: imm,
+            kind,
         };
     }
 
@@ -256,6 +293,35 @@ mod tests {
                 is_prfm: false
             }
         );
+        assert_eq!(
+            classify(0x1C00_0000),
+            Insn::LdrLiteralSimd {
+                rt: 0,
+                offset: 0,
+                kind: LiteralSimd::S
+            }
+        );
+        assert_eq!(
+            classify(0x5C00_0000),
+            Insn::LdrLiteralSimd {
+                rt: 0,
+                offset: 0,
+                kind: LiteralSimd::D
+            }
+        );
+        assert_eq!(
+            classify(0x9C00_0002),
+            Insn::LdrLiteralSimd {
+                rt: 2,
+                offset: 0,
+                kind: LiteralSimd::Q
+            }
+        );
+        assert!(matches!(
+            classify(0xD800_0000),
+            Insn::LdrLiteral { is_prfm: true, .. }
+        ));
+        assert!(matches!(classify(0xDC00_0000), Insn::Other(_)));
     }
 
     #[test]

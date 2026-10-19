@@ -562,8 +562,24 @@ mod api_tests {
         2.5
     }
 
+    unsafe extern "C" fn native_mul2_f64(x: f64) -> f64 {
+        x * 2.0
+    }
+
+    unsafe extern "C" fn native_ilogb(x: f64) -> i32 {
+        if (x - 8.0).abs() < 1e-9 {
+            3
+        } else {
+            -1
+        }
+    }
+
     unsafe extern "C" fn native_ret_f32() -> f32 {
         0.5
+    }
+
+    unsafe extern "C" fn native_half_f32(x: f32) -> f32 {
+        x * 0.5
     }
 
     #[test]
@@ -572,6 +588,9 @@ mod api_tests {
         let rt = ScriptRuntime::new().unwrap();
         let f64_addr = native_ret_f64 as *const () as usize;
         let f32_addr = native_ret_f32 as *const () as usize;
+        let half_addr = native_half_f32 as *const () as usize;
+        let mul_addr = native_mul2_f64 as *const () as usize;
+        let ilogb_addr = native_ilogb as *const () as usize;
         let script = format!(
             r#"
             (function () {{
@@ -579,8 +598,14 @@ mod api_tests {
                 if (d() !== 2.5) return "double:" + d();
                 const f = new NativeFunction(ptr("0x{f32_addr:x}"), "float", []);
                 if (f() !== 0.5) return "float:" + f();
+                const half = new NativeFunction(ptr("0x{half_addr:x}"), "float", ["float"]);
+                if (half(0.5) !== 0.25) return "half:" + half(0.5);
                 const sys = new SystemFunction(ptr("0x{f64_addr:x}"), "double", []);
                 if (sys() !== 2.5) return "system";
+                const mul = new NativeFunction(ptr("0x{mul_addr:x}"), "double", ["double"]);
+                if (mul(1.5) !== 3) return "mul:" + mul(1.5);
+                const il = new NativeFunction(ptr("0x{ilogb_addr:x}"), "int", ["double"]);
+                if (il(8) !== 3) return "ilogb:" + il(8);
                 return "ok";
             }})()
             "#

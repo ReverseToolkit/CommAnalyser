@@ -2189,31 +2189,56 @@ fn make_native_function<'js>(
     Function::new(
         ctx,
         move |values: Rest<Value<'js>>| -> JsResult<Value<'js>> {
-            let mut raw = [0u64; 8];
+            let mut gpr = [0u64; 8];
+            let mut fpr = [0u64; 8];
+            let mut gi = 0usize;
+            let mut fi = 0usize;
             for (index, value) in values.0.iter().enumerate().take(8) {
                 let ty = types.get(index).map(String::as_str).unwrap_or("pointer");
-                raw[index] = match ty {
-                    "pointer" => parse_pointer(value)?,
-                    "void" => 0,
-                    "bool" => u64::from(value.get::<bool>()?),
-                    "float" => value.get::<f64>()?.to_bits() & 0xFFFF_FFFF,
-                    "double" => value.get::<f64>()?.to_bits(),
-                    _ if is_signed_type(ty) => value.get::<i64>()? as u64,
-                    _ => value.get::<u64>().or_else(|_| parse_pointer(value))?,
-                };
+                match ty {
+                    "double" => {
+                        fpr[fi] = value.get::<f64>()?.to_bits();
+                        fi = fi.saturating_add(1).min(8);
+                    }
+                    "float" => {
+                        // AAPCS64 passes float in s0, the low 32 bits of v0.
+                        let bits = (value.get::<f64>()? as f32).to_bits();
+                        fpr[fi] = u64::from(bits);
+                        fi = fi.saturating_add(1).min(8);
+                    }
+                    "pointer" => {
+                        gpr[gi] = parse_pointer(value)?;
+                        gi = gi.saturating_add(1).min(8);
+                    }
+                    "void" => {
+                        gi = gi.saturating_add(1).min(8);
+                    }
+                    "bool" => {
+                        gpr[gi] = u64::from(value.get::<bool>()?);
+                        gi = gi.saturating_add(1).min(8);
+                    }
+                    ty if is_signed_type(ty) => {
+                        gpr[gi] = value.get::<i64>()? as u64;
+                        gi = gi.saturating_add(1).min(8);
+                    }
+                    _ => {
+                        gpr[gi] = value.get::<u64>().or_else(|_| parse_pointer(value))?;
+                        gi = gi.saturating_add(1).min(8);
+                    }
+                }
             }
-            let argc = values.0.len().min(8);
-            let slice = &raw[..argc.max(types.len()).min(8)];
+            let gpr = &gpr[..gi];
+            let fpr = &fpr[..fi];
             // SAFETY: the caller supplied the function address and signature.
             if returns_double {
-                let result = unsafe { native::call_f64(target, slice) }.map_err(to_js_error)?;
+                let result = unsafe { native::call_f64(target, gpr, fpr) }.map_err(to_js_error)?;
                 return result.into_js(&call_ctx);
             }
             if returns_float {
-                let result = unsafe { native::call_f32(target, slice) }.map_err(to_js_error)?;
+                let result = unsafe { native::call_f32(target, gpr, fpr) }.map_err(to_js_error)?;
                 return f64::from(result).into_js(&call_ctx);
             }
-            let result = unsafe { native::call(target, slice) }.map_err(to_js_error)?;
+            let result = unsafe { native::call_with_fpr(target, gpr, fpr) }.map_err(to_js_error)?;
             if returns_void {
                 Ok(Value::new_undefined(call_ctx.clone()))
             } else if returns_pointer {

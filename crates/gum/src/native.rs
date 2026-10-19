@@ -26,100 +26,229 @@ const PAGE: usize = 0x1000;
 /// The caller is responsible for the target's ABI and for arg values being
 /// valid for that function.
 pub unsafe fn call(target: usize, args: &[u64]) -> Result<u64> {
+    call_with_fpr(target, args, &[])
+}
+
+/// Like [`call`], with IEEE-754 `double` arguments in `fpr` (`d0`/`xmm0`).
+///
+/// Needed for C functions such as `int ilogb(double)` that return in `x0`
+/// but read the first argument from `d0`.
+///
+/// # Safety
+/// Same contract as [`call`].
+pub unsafe fn call_with_fpr(target: usize, gpr: &[u64], fpr: &[u64]) -> Result<u64> {
     if target == 0 {
         return Err(Error::Parse("native call: null target".into()));
     }
-    if args.len() > 8 {
-        return Err(Error::Unsupported("native call: more than 8 arguments"));
+    let x = pack8(gpr)?;
+    let d_bits = pack8(fpr)?;
+    #[cfg(target_arch = "aarch64")]
+    {
+        Ok(unsafe { invoke_x0(target, x, d_bits) })
     }
-    let mut a = [0u64; 8];
-    a[..args.len()].copy_from_slice(args);
-    // SAFETY: caller supplied a C function that reads at most eight GPRs.
-    let function = unsafe {
-        std::mem::transmute::<
-            usize,
-            unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64,
-        >(target)
-    };
-    // Must not tail-call: Android 15 BTI `BTI c` landing pads reject `BR`.
-    let ret = unsafe { invoke_eight(function, a) };
-    Ok(ret)
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if fpr.is_empty() {
+            let function = unsafe {
+                std::mem::transmute::<
+                    usize,
+                    unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64,
+                >(target)
+            };
+            Ok(unsafe { function(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]) })
+        } else {
+            let d: [f64; 8] = core::array::from_fn(|i| f64::from_bits(d_bits[i]));
+            let function = unsafe {
+                std::mem::transmute::<
+                    usize,
+                    unsafe extern "C" fn(f64, f64, f64, f64, f64, f64, f64, f64) -> u64,
+                >(target)
+            };
+            Ok(unsafe { function(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]) })
+        }
+    }
 }
 
 /// Call `target` and read a `double` return (ARM64 `d0` / x86_64 `xmm0`).
 ///
+/// Integer arguments go in `gpr` (`x0`/`rdi`). IEEE-754 `double` arguments go
+/// in `fpr` (`d0`/`xmm0`), independently, matching AAPCS64 / SysV.
+///
 /// # Safety
 /// Same contract as [`call`].
-pub unsafe fn call_f64(target: usize, args: &[u64]) -> Result<f64> {
+pub unsafe fn call_f64(target: usize, gpr: &[u64], fpr: &[u64]) -> Result<f64> {
     if target == 0 {
         return Err(Error::Parse("native call: null target".into()));
     }
-    if args.len() > 8 {
-        return Err(Error::Unsupported("native call: more than 8 arguments"));
+    let x = pack8(gpr)?;
+    let d_bits = pack8(fpr)?;
+    #[cfg(target_arch = "aarch64")]
+    {
+        Ok(unsafe { invoke_f64(target, x, d_bits) })
     }
-    let mut a = [0u64; 8];
-    a[..args.len()].copy_from_slice(args);
-    let function = unsafe {
-        std::mem::transmute::<
-            usize,
-            unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> f64,
-        >(target)
-    };
-    Ok(unsafe { function(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]) })
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if fpr.is_empty() {
+            let function = unsafe {
+                std::mem::transmute::<
+                    usize,
+                    unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> f64,
+                >(target)
+            };
+            Ok(unsafe { function(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]) })
+        } else {
+            let d: [f64; 8] = core::array::from_fn(|i| f64::from_bits(d_bits[i]));
+            let function = unsafe {
+                std::mem::transmute::<
+                    usize,
+                    unsafe extern "C" fn(f64, f64, f64, f64, f64, f64, f64, f64) -> f64,
+                >(target)
+            };
+            Ok(unsafe { function(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]) })
+        }
+    }
 }
 
 /// Call `target` and read a `float` return.
 ///
 /// # Safety
 /// Same contract as [`call`].
-pub unsafe fn call_f32(target: usize, args: &[u64]) -> Result<f32> {
+pub unsafe fn call_f32(target: usize, gpr: &[u64], fpr: &[u64]) -> Result<f32> {
     if target == 0 {
         return Err(Error::Parse("native call: null target".into()));
     }
-    if args.len() > 8 {
-        return Err(Error::Unsupported("native call: more than 8 arguments"));
-    }
-    let mut a = [0u64; 8];
-    a[..args.len()].copy_from_slice(args);
-    let function = unsafe {
-        std::mem::transmute::<
-            usize,
-            unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> f32,
-        >(target)
-    };
-    Ok(unsafe { function(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]) })
-}
-
-#[inline(never)]
-unsafe fn invoke_eight(
-    function: unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64,
-    a: [u64; 8],
-) -> u64 {
+    let x = pack8(gpr)?;
+    let d_bits = pack8(fpr)?;
     #[cfg(target_arch = "aarch64")]
     {
-        let mut ret: u64;
-        // BLR is required for `BTI c` landing pads used throughout Android 15 libc/ART.
-        unsafe {
-            core::arch::asm!(
-                "blr {f}",
-                f = in(reg) function,
-                inout("x0") a[0] => ret,
-                in("x1") a[1],
-                in("x2") a[2],
-                in("x3") a[3],
-                in("x4") a[4],
-                in("x5") a[5],
-                in("x6") a[6],
-                in("x7") a[7],
-                clobber_abi("C"),
-            );
-        }
-        ret
+        Ok(unsafe { invoke_f32(target, x, d_bits) })
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        unsafe { function(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]) }
+        if fpr.is_empty() {
+            let function = unsafe {
+                std::mem::transmute::<
+                    usize,
+                    unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> f32,
+                >(target)
+            };
+            Ok(unsafe { function(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]) })
+        } else {
+            // AAPCS64/SysV put float args in s0/xmm0. The low 32 bits are the f32.
+            let s: [f32; 8] = core::array::from_fn(|i| f32::from_bits(d_bits[i] as u32));
+            let function = unsafe {
+                std::mem::transmute::<
+                    usize,
+                    unsafe extern "C" fn(f32, f32, f32, f32, f32, f32, f32, f32) -> f32,
+                >(target)
+            };
+            Ok(unsafe { function(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]) })
+        }
     }
+}
+
+fn pack8(src: &[u64]) -> Result<[u64; 8]> {
+    if src.len() > 8 {
+        return Err(Error::Unsupported("native call: more than 8 arguments"));
+    }
+    let mut out = [0u64; 8];
+    out[..src.len()].copy_from_slice(src);
+    Ok(out)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn invoke_x0(target: usize, x: [u64; 8], d_bits: [u64; 8]) -> u64 {
+    let d: [f64; 8] = core::array::from_fn(|i| f64::from_bits(d_bits[i]));
+    let mut ret: u64;
+    // SAFETY: caller supplied a C function; BLR satisfies Android 15 BTI.
+    unsafe {
+        core::arch::asm!(
+            "blr {f}",
+            f = in(reg) target,
+            inout("x0") x[0] => ret,
+            in("x1") x[1],
+            in("x2") x[2],
+            in("x3") x[3],
+            in("x4") x[4],
+            in("x5") x[5],
+            in("x6") x[6],
+            in("x7") x[7],
+            in("d0") d[0],
+            in("d1") d[1],
+            in("d2") d[2],
+            in("d3") d[3],
+            in("d4") d[4],
+            in("d5") d[5],
+            in("d6") d[6],
+            in("d7") d[7],
+            clobber_abi("C"),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn invoke_f64(target: usize, x: [u64; 8], d_bits: [u64; 8]) -> f64 {
+    let d: [f64; 8] = core::array::from_fn(|i| f64::from_bits(d_bits[i]));
+    let mut ret: f64;
+    // SAFETY: caller supplied a C function; BLR satisfies Android 15 BTI.
+    unsafe {
+        core::arch::asm!(
+            "blr {f}",
+            f = in(reg) target,
+            in("x0") x[0],
+            in("x1") x[1],
+            in("x2") x[2],
+            in("x3") x[3],
+            in("x4") x[4],
+            in("x5") x[5],
+            in("x6") x[6],
+            in("x7") x[7],
+            inout("d0") d[0] => ret,
+            in("d1") d[1],
+            in("d2") d[2],
+            in("d3") d[3],
+            in("d4") d[4],
+            in("d5") d[5],
+            in("d6") d[6],
+            in("d7") d[7],
+            clobber_abi("C"),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn invoke_f32(target: usize, x: [u64; 8], d_bits: [u64; 8]) -> f32 {
+    let d: [f64; 8] = core::array::from_fn(|i| f64::from_bits(d_bits[i]));
+    let mut bits: u32;
+    // SAFETY: `fmov` reads s0 after the call, before the compiler reuses d0.
+    unsafe {
+        core::arch::asm!(
+            "blr {f}",
+            "fmov w9, s0",
+            f = in(reg) target,
+            lateout("x9") bits,
+            in("x0") x[0],
+            in("x1") x[1],
+            in("x2") x[2],
+            in("x3") x[3],
+            in("x4") x[4],
+            in("x5") x[5],
+            in("x6") x[6],
+            in("x7") x[7],
+            inout("d0") d[0] => _,
+            in("d1") d[1],
+            in("d2") d[2],
+            in("d3") d[3],
+            in("d4") d[4],
+            in("d5") d[5],
+            in("d6") d[6],
+            in("d7") d[7],
+            clobber_abi("C"),
+        );
+    }
+    f32::from_bits(bits)
 }
 
 /// Build a native callback trampoline that packs x0-x7 and calls
@@ -282,10 +411,55 @@ mod tests {
 
     #[test]
     fn call_float_and_double_returns() {
-        let d = unsafe { super::call_f64(ret_f64 as *const () as usize, &[]) }.unwrap();
+        let d = unsafe { super::call_f64(ret_f64 as *const () as usize, &[], &[]) }.unwrap();
         assert_eq!(d, 1.25);
-        let f = unsafe { super::call_f32(ret_f32 as *const () as usize, &[]) }.unwrap();
+        let f = unsafe { super::call_f32(ret_f32 as *const () as usize, &[], &[]) }.unwrap();
         assert_eq!(f, 0.25);
+    }
+
+    unsafe extern "C" fn half_f32(x: f32) -> f32 {
+        x * 0.5
+    }
+
+    #[test]
+    fn call_f32_reads_s0_bits() {
+        let got = unsafe {
+            super::call_f32(
+                half_f32 as *const () as usize,
+                &[],
+                &[u64::from(0.5f32.to_bits())],
+            )
+        }
+        .unwrap();
+        assert_eq!(got, 0.25);
+    }
+
+    unsafe extern "C" fn mul2(x: f64) -> f64 {
+        x * 2.0
+    }
+
+    #[test]
+    fn call_double_arg_uses_d0() {
+        let got = unsafe { super::call_f64(mul2 as *const () as usize, &[], &[2.5f64.to_bits()]) }
+            .unwrap();
+        assert_eq!(got, 5.0);
+    }
+
+    unsafe extern "C" fn ilogb_eight(x: f64) -> i32 {
+        if (x - 8.0).abs() < 1e-9 {
+            3
+        } else {
+            -1
+        }
+    }
+
+    #[test]
+    fn call_int_return_loads_d0() {
+        let got = unsafe {
+            super::call_with_fpr(ilogb_eight as *const () as usize, &[], &[8.0f64.to_bits()])
+        }
+        .unwrap() as i32;
+        assert_eq!(got, 3);
     }
 
     unsafe extern "C" fn add2(a: u64, b: u64) -> u64 {

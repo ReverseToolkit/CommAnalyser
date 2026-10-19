@@ -114,7 +114,10 @@ mod tests {
     fn engine_follows_tal_door() {
         let engine = include_str!("engine.rs");
         assert!(engine.contains("InlineHook"), "our Interceptor is the door");
+        assert!(engine.contains("attach_and_return"), "TAL already ran the body");
+        assert!(engine.contains("orig_lr"), "keep SP-PAC'd LR for trampoline ret");
         assert!(engine.contains("tal_prepare") || include_str!("load.rs").contains("tal_prepare"));
+        assert!(include_str!("load.rs").contains("pub q"));
         assert!(!engine.contains("qbdi_callA"));
         assert!(!engine.contains("gum_attach"));
     }

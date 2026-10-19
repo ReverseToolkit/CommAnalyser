@@ -3,7 +3,7 @@
 //! Mnemonics and operand shapes follow Frida/Capstone closely enough for
 //! frida-java-bridge's ARM64 offset probes.
 
-use crate::insn::{classify, Insn};
+use crate::insn::{classify, Insn, LiteralSimd};
 
 const XREGS: [&str; 32] = [
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
@@ -174,6 +174,21 @@ fn decode_classified(word: u32, pc: u64) -> Option<Decoded> {
                 vec![Operand::Reg(reg.into()), Operand::Imm(target)],
                 vec![],
                 vec![reg.into()],
+            ))
+        }
+        Insn::LdrLiteralSimd { rt, offset, kind } => {
+            let reg = match kind {
+                LiteralSimd::S => format!("s{rt}"),
+                LiteralSimd::D => format!("d{rt}"),
+                LiteralSimd::Q => format!("q{rt}"),
+            };
+            let target = pc.wrapping_add(offset as u64) as i64;
+            Some(simple(
+                "ldr",
+                &format!("{reg}, {target:#x}"),
+                vec![Operand::Reg(reg.clone()), Operand::Imm(target)],
+                vec![],
+                vec![reg],
             ))
         }
         Insn::Br { rn } => Some(simple(

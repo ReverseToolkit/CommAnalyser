@@ -11,6 +11,7 @@ pub struct TalCpuContext {
     pub sp: u64,
     pub nzcv: u64,
     pub pc: u64,
+    pub q: [u128; 8],
 }
 
 #[repr(C)]
@@ -27,14 +28,14 @@ pub struct TalEvent {
 #[derive(Clone, Copy)]
 pub struct Api {
     pub prepare: unsafe extern "C" fn(u64, u64, i32, i32) -> i32,
-    pub enter: unsafe extern "C" fn(*const TalCpuContext) -> i32,
+    pub enter: unsafe extern "C" fn(*mut TalCpuContext) -> i32,
     pub take_events: unsafe extern "C" fn(*mut TalEvent, usize) -> usize,
     pub add_escape: unsafe extern "C" fn(u64, u64),
 }
 
 extern "C" {
     fn tal_prepare(addr: u64, end: u64, all: i32, mode: i32) -> i32;
-    fn tal_enter(cpu: *const TalCpuContext) -> i32;
+    fn tal_enter(cpu: *mut TalCpuContext) -> i32;
     fn tal_take_events(out: *mut TalEvent, cap: usize) -> usize;
     fn add_escape(break_addr: u64, resume_addr: u64);
 }
