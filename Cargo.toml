@@ -28,4 +28,5 @@ lto = "thin"
 opt-level = "z"
 codegen-units = 1
 panic = "abort"
-strip = "symbols"
+# Keep local symbols so a stripped ELF cannot hide a compiler-rt constructor.
+strip = "none"

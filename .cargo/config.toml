@@ -2,7 +2,7 @@
 # Absolute path so a shell without the NDK on PATH still links with it.
 # Outline atomics would pull compiler-rt aarch64.c constructors into the
 # cdylib; those call getauxval during load. LL/SC atomics avoid that object.
-linker = "/root/Spec/CommAnalyser/scripts/aarch64-android-link"
+linker = "/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
 rustflags = ["-C", "target-feature=-outline-atomics"]
 
 [env]

@@ -23,6 +23,17 @@ fn link_tal_static() -> Result<(), String> {
         .parent()
         .ok_or_else(|| "tal_static parent".to_owned())?;
 
+    // Outline-atomic helpers in compiler_builtins read this flag and fall
+    // back to LL/SC when it is zero. Defining it here, before that archive
+    // is scanned, keeps compiler-rt's aarch64.c.o (and its .init_array
+    // getauxval constructor) out of the link.
+    let flag = lse_flag_archive(&tal_build)?;
+    println!(
+        "cargo:rustc-link-search=native={}",
+        flag.parent().unwrap_or(search).display()
+    );
+    println!("cargo:rustc-link-lib=static:+whole-archive=aarch64_lse_flag");
+
     println!("cargo:rustc-link-search=native={}", search.display());
     println!(
         "cargo:rustc-link-search=native={}",
@@ -88,6 +99,53 @@ fn collect_objs(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+fn lse_flag_archive(dir: &Path) -> Result<PathBuf, String> {
+    let src = dir.join("lse_flag.S");
+    let obj = dir.join("lse_flag.o");
+    let archive = dir.join("libaarch64_lse_flag.a");
+    std::fs::write(
+        &src,
+        r#"
+.section .bss
+.global __aarch64_have_lse_atomics
+.type __aarch64_have_lse_atomics, %object
+.p2align 2
+__aarch64_have_lse_atomics:
+.skip 1
+.size __aarch64_have_lse_atomics, 1
+"#,
+    )
+    .map_err(|err| format!("write lse_flag.S: {err}"))?;
+    let cc = ndk_bin("aarch64-linux-android24-clang");
+    let status = Command::new(&cc)
+        .args(["-c", "-o"])
+        .arg(&obj)
+        .arg(&src)
+        .status()
+        .map_err(|err| format!("{cc}: {err}"))?;
+    if !status.success() {
+        return Err(format!("{cc} failed to assemble lse_flag.S: {status}"));
+    }
+    let ar = ndk_ar();
+    let status = Command::new(&ar)
+        .args(["crs", archive.to_str().unwrap_or("libaarch64_lse_flag.a")])
+        .arg(&obj)
+        .status()
+        .map_err(|err| format!("{ar}: {err}"))?;
+    if !status.success() {
+        return Err(format!("{ar} failed to pack lse_flag: {status}"));
+    }
+    let _ = std::fs::remove_file(&src);
+    Ok(archive)
+}
+
+fn ndk_bin(name: &str) -> String {
+    let ndk = std::env::var("ANDROID_NDK_HOME")
+        .or_else(|_| std::env::var("NDK"))
+        .unwrap_or_else(|_| "/root/Android/Sdk/ndk/27.2.12479018".into());
+    format!("{ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/{name}")
 }
 
 fn ndk_ar() -> String {
