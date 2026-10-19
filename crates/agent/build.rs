@@ -23,9 +23,12 @@ fn main() {
     println!("cargo:rustc-link-arg={}", obj.display());
 }
 
-fn ndk_tool(name: &str) -> String {
-    let ndk = std::env::var("ANDROID_NDK_HOME")
+fn ndk_root() -> String {
+    std::env::var("ANDROID_NDK_HOME")
         .or_else(|_| std::env::var("NDK"))
-        .unwrap_or_else(|_| "/root/Android/Sdk/ndk/27.2.12479018".into());
-    format!("{ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/{name}")
+        .unwrap_or_else(|_| "/root/Android/Sdk/ndk/27.2.12479018".into())
+}
+
+fn ndk_tool(name: &str) -> String {
+    format!("{}/toolchains/llvm/prebuilt/linux-x86_64/bin/{name}", ndk_root())
 }
