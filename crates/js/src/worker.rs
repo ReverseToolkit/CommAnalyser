@@ -670,6 +670,7 @@ mod tests {
 
     #[test]
     fn evaluates_on_worker() {
+        let _js = crate::js_test_guard();
         let (events, _received) = std::sync::mpsc::channel();
         let worker = JsWorker::spawn(events).unwrap();
         assert_eq!(worker.eval("6 * 7").unwrap(), "42");
@@ -705,6 +706,7 @@ mod tests {
 
     #[test]
     fn arm64_writer_relocator_roundtrip() {
+        let _js = crate::js_test_guard();
         let (events, _received) = std::sync::mpsc::channel();
         let worker = JsWorker::spawn(events).unwrap();
         let result = worker
@@ -740,6 +742,7 @@ mod tests {
 
     #[test]
     fn set_timeout_fires_on_worker_after_delay() {
+        let _js = crate::js_test_guard();
         let (events, _received) = std::sync::mpsc::channel();
         let worker = JsWorker::spawn(events).unwrap();
         worker
@@ -751,6 +754,7 @@ mod tests {
 
     #[test]
     fn interceptor_frida_api_and_detach() {
+        let _js = crate::js_test_guard();
         let (events, _received) = std::sync::mpsc::channel();
         let worker = JsWorker::spawn(events).unwrap();
         let result = worker
@@ -805,6 +809,7 @@ mod tests {
 
     #[test]
     fn interceptor_enter_rewrites_args_and_leave_replaces_retval() {
+        let _js = crate::js_test_guard();
         let (events, _received) = std::sync::mpsc::channel();
         let worker = JsWorker::spawn(events).unwrap();
         let addr = worker
@@ -848,6 +853,7 @@ mod tests {
 
     #[test]
     fn native_callback_from_js_thread() {
+        let _js = crate::js_test_guard();
         let (events, _received) = std::sync::mpsc::channel();
         let worker = JsWorker::spawn(events).unwrap();
         let result = worker
@@ -872,5 +878,104 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn send_delivers_payload_on_event_channel() {
+        let _js = crate::js_test_guard();
+        let (events, received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        assert_eq!(worker.eval("send({hello: 1}); 'ok'").unwrap(), "ok");
+        let line = received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("send event");
+        assert!(line.contains("\"op\":\"send\""), "{line}");
+        assert!(line.contains("\"hello\":1"), "{line}");
+    }
+
+    #[test]
+    fn set_immediate_fires_on_eval() {
+        let _js = crate::js_test_guard();
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        worker
+            .eval("globalThis.__imm = 0; setImmediate(function () { __imm = 1; }); 'queued'")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(worker.eval("String(__imm)").unwrap(), "1");
+    }
+
+    #[test]
+    fn interceptor_enter_rewrites_context_gprs() {
+        let _js = crate::js_test_guard();
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        let addr = worker
+            .eval(
+                r#"
+                (function () {
+                    const page = Memory.alloc(Process.pageSize);
+                    Memory.protect(page, Process.pageSize, 'rwx');
+                    page.writeU32(0xd503201f);
+                    page.add(4).writeU32(0xd503201f);
+                    page.add(8).writeU32(0xd503201f);
+                    page.add(12).writeU32(0xd503201f);
+                    Interceptor.attach(page, {
+                        onEnter: function (args) {
+                            args[1] = ptr(99);
+                            this.context.x28 = ptr(0x55);
+                            this.context.lr = ptr(0x1234);
+                            this.context.nzcv = ptr(0x20000000);
+                        }
+                    });
+                    return page.toString();
+                })()
+                "#,
+            )
+            .unwrap();
+        let target = u64::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap() as usize;
+        let mut regs = SavedRegs::default();
+        regs.x[1] = 1;
+        regs.x[28] = 2;
+        let after = worker.fire_enter(0, target, regs).unwrap();
+        assert_eq!(after.x[1], 99);
+        assert_eq!(after.x[28], 0x55);
+        assert_eq!(after.lr, 0x1234);
+        assert_eq!(after.nzcv, 0x2000_0000);
+    }
+
+    #[test]
+    fn interceptor_enter_rewrites_context_x0() {
+        let _js = crate::js_test_guard();
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        let addr = worker
+            .eval(
+                r#"
+                (function () {
+                    const page = Memory.alloc(Process.pageSize);
+                    Memory.protect(page, Process.pageSize, 'rwx');
+                    page.writeU32(0xd503201f);
+                    page.add(4).writeU32(0xd503201f);
+                    page.add(8).writeU32(0xd503201f);
+                    page.add(12).writeU32(0xd503201f);
+                    Interceptor.attach(page, {
+                        onEnter: function (args) {
+                            if (args[0] !== this.context.x0) {
+                                throw new Error('args[0] must be this.context.x0');
+                            }
+                            this.context.x0 = ptr(42);
+                        }
+                    });
+                    return page.toString();
+                })()
+                "#,
+            )
+            .unwrap();
+        let target = u64::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap() as usize;
+        let mut regs = SavedRegs::default();
+        regs.x[0] = 3;
+        let after = worker.fire_enter(0, target, regs).unwrap();
+        assert_eq!(after.x[0], 42, "onEnter must rewrite this.context.x0");
     }
 }

@@ -226,6 +226,24 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
                 Err(err) => error_response(format!("call: {err}")),
             }
         }
+        "selftest" => {
+            let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let suite = request.get("suite").and_then(Value::as_str);
+            let mut body = json!({"op": "selftest"});
+            if let Some(suite) = suite {
+                body["suite"] = Value::String(suite.to_owned());
+            }
+            match agent_request(pid, &body) {
+                Ok(response) => json!({
+                    "ok": true,
+                    "pid": pid,
+                    "response": response,
+                    "messages": take_messages(),
+                })
+                .to_string(),
+                Err(err) => error_response(format!("selftest: {err}")),
+            }
+        }
         "eval" => {
             let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
             let code = request.get("code").and_then(Value::as_str).unwrap_or("");
@@ -437,5 +455,66 @@ mod tests {
             .unwrap()
             .iter()
             .any(|p| p["pid"] == wanted));
+    }
+
+    fn parsed(line: &str) -> Value {
+        serde_json::from_str(&handle_request(line, None)).unwrap()
+    }
+
+    #[test]
+    fn version_reports_package_and_arch() {
+        let value = parsed(r#"{"op":"version"}"#);
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["version"], VERSION);
+        assert_eq!(value["arch"], runtime::process::arch());
+        assert!(!value["arch"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_op_and_invalid_json_are_structured_errors() {
+        let missing = parsed("{}");
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["error"], "missing op");
+
+        let bad: Value = serde_json::from_str(&handle_request("not-json", None)).unwrap();
+        assert_eq!(bad["ok"], false);
+        assert!(
+            bad["error"].as_str().unwrap().contains("invalid json"),
+            "{bad}"
+        );
+    }
+
+    #[test]
+    fn attach_is_redirected_to_inject() {
+        let value = parsed(r#"{"op":"attach","pid":1}"#);
+        assert_eq!(value["ok"], false);
+        assert!(
+            value["error"].as_str().unwrap().contains("use inject"),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn ops_without_session_return_ok_false() {
+        for (line, needle) in [
+            (
+                r#"{"op":"inject","pid":1,"agent":"/no/such/agent.so"}"#,
+                "inject:",
+            ),
+            (r#"{"op":"spawn"}"#, "spawn:"),
+            (r#"{"op":"agent","pid":1,"command":"ping"}"#, "agent:"),
+            (r#"{"op":"eval","pid":1,"code":"1"}"#, "eval:"),
+            (r#"{"op":"rpc","pid":1,"name":"add","args":[]}"#, "rpc:"),
+            (r#"{"op":"call","pid":1,"address":1,"arg":0}"#, "call:"),
+            (
+                r#"{"op":"selftest","pid":1,"suite":"runtime"}"#,
+                "selftest:",
+            ),
+        ] {
+            let value = parsed(line);
+            assert_eq!(value["ok"], false, "{line} -> {value}");
+            let error = value["error"].as_str().unwrap();
+            assert!(error.contains(needle), "{line} -> {error}");
+        }
     }
 }

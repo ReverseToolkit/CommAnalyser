@@ -122,6 +122,12 @@ mod tests {
     fn starts_sleep_executable() {
         let pid = start_executable("/bin/sleep", &["30".to_owned()]).unwrap();
         assert!(pid_alive(pid), "sleep pid {pid} should be alive");
+        let named = pids_named("sleep");
+        assert!(named.contains(&pid), "{named:?}");
         let _ = Command::new("kill").arg(pid.to_string()).status();
+        assert!(start_executable("/no/such/commanalyser-exec", &[]).is_err());
+        let comm = std::fs::read_to_string("/proc/self/comm").unwrap();
+        let self_pids = pids_named(comm.trim());
+        assert!(self_pids.contains(&std::process::id()), "{self_pids:?}");
     }
 }

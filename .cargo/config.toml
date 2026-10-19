@@ -1,0 +1,4 @@
+[target.aarch64-linux-android]
+# NDK default outline-atomics pulls compiler-rt aarch64.c constructors into
+# the agent cdylib; those SIGSEGV on dlopen. LL/SC atomics are enough.
+rustflags = ["-C", "target-feature=-outline-atomics"]

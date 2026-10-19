@@ -328,23 +328,34 @@ impl Drop for ScriptRuntime {
 }
 
 #[cfg(test)]
+pub(crate) fn js_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    // QuickJS runtimes and gum replace/hook tables are process-global enough
+    // that parallel `ScriptRuntime`/`JsWorker` tests SIGSEGV on this host.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn evaluates_arithmetic() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         assert_eq!(rt.eval("20 + 22").unwrap(), "42");
     }
 
     #[test]
     fn console_log_does_not_throw() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         rt.eval("console.log('hello', 1 + 1)").unwrap();
     }
 
     #[test]
     fn reports_syntax_errors() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         assert!(rt.eval("function (").is_err());
     }
@@ -356,6 +367,7 @@ mod api_tests {
 
     #[test]
     fn pointer_arithmetic_and_strings() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         assert_eq!(
             rt.eval("ptr('0x1000').add(4).toString()").unwrap(),
@@ -370,6 +382,7 @@ mod api_tests {
 
     #[test]
     fn process_and_modules() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         assert!(!rt.eval("Process.arch").unwrap().is_empty());
         let count: usize = rt
@@ -387,6 +400,7 @@ mod api_tests {
 
     #[test]
     fn memory_roundtrip() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         assert_eq!(
             rt.eval("const p = Memory.alloc(16); p.writeU32(0x12345678); p.readU32()")
@@ -407,6 +421,7 @@ mod api_tests {
 
     #[test]
     fn export_lookup_and_array_buffer() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         assert_eq!(
             rt.eval("Module.getExportByName(null, 'malloc') !== null")
@@ -424,12 +439,14 @@ mod api_tests {
 
     #[test]
     fn thread_sleep() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         assert_eq!(rt.eval("Thread.sleep(0)").unwrap(), "undefined");
     }
 
     #[test]
     fn gumjs_surface_matches_frida_names() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         let result = rt
             .eval(
@@ -506,6 +523,7 @@ mod api_tests {
 
     #[test]
     fn file_read_write_roundtrip() {
+        let _js = crate::js_test_guard();
         let dir = std::env::temp_dir();
         let path = dir.join("ca-gumjs-file.txt");
         let path_js = path.to_string_lossy().replace('\\', "\\\\");
@@ -550,6 +568,7 @@ mod api_tests {
 
     #[test]
     fn native_function_float_and_double_returns() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         let f64_addr = native_ret_f64 as *const () as usize;
         let f32_addr = native_ret_f32 as *const () as usize;
@@ -571,6 +590,7 @@ mod api_tests {
 
     #[test]
     fn trace_function_exists_and_errors_without_qbdi() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         assert_eq!(rt.eval("typeof Trace").unwrap(), "object");
         assert_eq!(rt.eval("typeof Trace.function").unwrap(), "function");
@@ -588,6 +608,7 @@ mod api_tests {
 
     #[test]
     fn recv_waits_for_host_post() {
+        let _js = crate::js_test_guard();
         let (events, _rx) = std::sync::mpsc::channel();
         let worker = super::JsWorker::spawn(events).unwrap();
         std::thread::scope(|scope| {
@@ -610,6 +631,7 @@ mod api_tests {
 
     #[test]
     fn java_runtime_is_installed() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         assert_eq!(rt.eval("typeof Java").unwrap(), "object");
         assert_eq!(rt.eval("typeof Java.use").unwrap(), "function");
@@ -650,6 +672,7 @@ mod api_tests {
 
     #[test]
     fn pointer_and_memory_primitives() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         let result = rt
             .eval(
@@ -695,6 +718,7 @@ mod api_tests {
 
     #[test]
     fn interceptor_replace_rewrites_arm64_bytes() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         // Interceptor lives on the worker; drive it through eval after hooks install.
         // ScriptRuntime::new() does not install Interceptor; the worker does.
@@ -733,6 +757,7 @@ mod api_tests {
 
     #[test]
     fn arm64_writer_exposes_exception_clear_api() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         let result = rt
             .eval(
@@ -761,6 +786,7 @@ mod api_tests {
 
     #[test]
     fn int64_roundtrip_and_pointer_write() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         let result = rt
             .eval(
@@ -785,6 +811,7 @@ mod api_tests {
 
     #[test]
     fn native_function_is_instance() {
+        let _js = crate::js_test_guard();
         let rt = ScriptRuntime::new().unwrap();
         let result = rt
             .eval(
@@ -803,5 +830,225 @@ mod api_tests {
             )
             .unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn pointer_bitwise_compare_and_integer_conversions() {
+        let _js = crate::js_test_guard();
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    if (!NULL.isNull() || !NULL.equals(ptr(0))) return 'null';
+                    if (ptr('0xff').and(1).toString() !== '0x1') return 'and';
+                    if (ptr('0x10').or(1).toString() !== '0x11') return 'or';
+                    if (ptr('0xff').xor(0xf0).toString() !== '0xf') return 'xor';
+                    if (ptr('0x1').shl(4).toString() !== '0x10') return 'shl';
+                    if (ptr('0x10').shr(4).toString() !== '0x1') return 'shr';
+                    if (ptr(0).not().toString() !== '0xffffffffffffffff') return 'not';
+                    if (ptr(1).compare(ptr(2)) !== -1) return 'cmp-lt';
+                    if (ptr(2).compare(2) !== 0) return 'cmp-eq';
+                    if (ptr(3).compare(1) !== 1) return 'cmp-gt';
+                    if (!ptr(4).equals(4)) return 'equals';
+                    if (ptr('0xffffffff').toInt32() !== -1) return 'toInt32';
+                    if (ptr(7).toUInt32() !== 7) return 'toUInt32';
+                    if (ptr(7).valueOf() !== 7) return 'valueOf';
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn pointer_signed_float_utf_and_byte_widths() {
+        let _js = crate::js_test_guard();
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    const p = Memory.alloc(32);
+                    p.writeS8(-1);
+                    if (p.readS8() !== -1) return 's8';
+                    p.writeS16(-2);
+                    if (p.readS16() !== -2) return 's16';
+                    p.writeS32(-3);
+                    if (p.readS32() !== -3) return 's32';
+                    p.writeInt(-4);
+                    if (p.readInt() !== -4) return 'int';
+                    p.writeU8(0xff);
+                    if (p.readU8() !== 255) return 'u8';
+                    p.writeU16(0xabcd);
+                    if (p.readU16() !== 0xabcd) return 'u16';
+                    p.writeU64(7);
+                    if (p.readU64() !== 7) return 'u64:' + p.readU64();
+                    p.writeFloat(1.5);
+                    if (Math.abs(p.readFloat() - 1.5) > 1e-6) return 'float';
+                    p.writeDouble(2.25);
+                    if (p.readDouble() !== 2.25) return 'double';
+                    p.writeUtf8String('hi');
+                    if (p.readUtf8String() !== 'hi') return 'utf8';
+                    if (p.readUtf8String(2) !== 'hi') return 'utf8-n';
+                    const u16 = Memory.allocUtf16String('ab');
+                    if (u16.readUtf16String() !== 'ab') return 'utf16';
+                    const src = Memory.alloc(4);
+                    src.writeU32(0x01020304);
+                    p.writeByteArray(src.readByteArray(4));
+                    const bytes = p.readByteArray(4);
+                    if (bytes.byteLength !== 4) return 'bytes';
+                    Memory.writeUtf8String(p, 'z');
+                    if (Memory.readU8(p) !== 122) return 'mem-u8';
+                    if (Memory.readU64(p).toString() === '') return 'mem-u64';
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn int64_uint64_full_arithmetic() {
+        let _js = crate::js_test_guard();
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    if (int64(8).sub(3).toString() !== '5') return 'i-sub';
+                    if (int64(1).or(2).toString() !== '3') return 'i-or';
+                    if (int64(7).xor(1).toString() !== '6') return 'i-xor';
+                    if (int64(1).shl(3).toString() !== '8') return 'i-shl';
+                    if (int64(8).shr(2).toString() !== '2') return 'i-shr';
+                    if (int64(1).compare(2) !== -1) return 'i-cmp';
+                    if (!int64(5).equals(5)) return 'i-eq';
+                    if (int64(9).toNumber() !== 9) return 'i-num';
+                    if (int64(-1).toInt32() !== -1) return 'i-i32';
+                    if (int64(255).toString(16) !== 'ff') return 'i-hex';
+                    if (uint64(8).sub(3).toString() !== '5') return 'u-sub';
+                    if (uint64(1).or(2).toString() !== '3') return 'u-or';
+                    if (uint64(7).xor(1).toString() !== '6') return 'u-xor';
+                    if (uint64(1).shl(3).toString() !== '8') return 'u-shl';
+                    if (uint64(8).shr(2).toString() !== '2') return 'u-shr';
+                    if (uint64(3).compare(1) !== 1) return 'u-cmp';
+                    if (!uint64(5).equals(5)) return 'u-eq';
+                    if (uint64(9).toNumber() !== 9) return 'u-num';
+                    if (uint64(255).toString(16) !== 'ff') return 'u-hex';
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn script_cmodule_matchpattern_print_and_immediates() {
+        let _js = crate::js_test_guard();
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    var n = 0;
+                    Script.nextTick(function () { n = 1; });
+                    if (n !== 1) return 'nextTick';
+                    const id = Script.bindWeak({}, function () {});
+                    Script.unbindWeak(id);
+                    const cm = CModule('int add(int a, int b) { return a + b; }');
+                    if (typeof cm !== 'object') return 'cmodule';
+                    if (String(new MatchPattern('ff ?? aa')) !== 'ff ?? aa') return 'pattern';
+                    print('host-test-print');
+                    globalThis.__imm = 0;
+                    const imm = setImmediate(function () { __imm = 1; });
+                    const skipped = setImmediate(function () { __imm = 2; });
+                    clearImmediate(skipped);
+                    const to = setTimeout(function () { __imm = 3; }, 0);
+                    clearTimeout(to);
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+        assert_eq!(rt.eval("String(__imm)").unwrap(), "1");
+    }
+
+    #[test]
+    fn process_identity_dirs_and_module_exports() {
+        let _js = crate::js_test_guard();
+        let rt = ScriptRuntime::new().unwrap();
+        let pid = std::process::id();
+        let script = format!(
+            r#"
+            (function () {{
+                if (Process.id !== {pid}) return 'id';
+                if (typeof Process.platform !== 'string' || !Process.platform.length) return 'platform';
+                if (!(Process.pageSize >= 4096)) return 'page';
+                if (Process.pointerSize !== 8) return 'ptrsize';
+                if (typeof Process.myUid() !== 'number') return 'uid';
+                if (typeof Process.getCurrentDir() !== 'string') return 'cwd';
+                if (typeof Process.getHomeDir() !== 'string') return 'home';
+                if (typeof Process.getTmpDir() !== 'string') return 'tmp';
+                if (typeof Process.isDebuggerAttached() !== 'boolean') return 'dbg';
+                const obs = Process.attachThreadObserver({{}});
+                if (typeof obs.detach !== 'function') return 'observer';
+                obs.detach();
+                const malloc = Module.findExportByName(null, 'malloc');
+                if (!malloc || malloc.isNull()) return 'findExport';
+                const globalMalloc = Module.getGlobalExportByName('malloc');
+                if (globalMalloc.compare(malloc) !== 0) return 'global';
+                return 'ok';
+            }})()
+            "#
+        );
+        assert_eq!(rt.eval(&script).unwrap(), "ok");
+    }
+
+    #[test]
+    fn debug_symbol_matching_and_get_function() {
+        let _js = crate::js_test_guard();
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    const named = DebugSymbol.getFunctionByName('malloc');
+                    if (named.isNull()) return 'getFunction';
+                    const matching = DebugSymbol.findFunctionsMatching('malloc');
+                    if (!matching.length) return 'matching';
+                    if (matching[0].compare(named) !== 0 && matching.every(p => p.compare(named) !== 0)) {
+                        return 'match-addr';
+                    }
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn java_remaining_methods_error_without_art() {
+        let _js = crate::js_test_guard();
+        let rt = ScriptRuntime::new().unwrap();
+        for expr in [
+            "Java.choose('java.lang.String', { onMatch: function () {}, onComplete: function () {} })",
+            "Java.cast(ptr(0), 'java.lang.String')",
+            "Java.retain(ptr(0))",
+            "Java.array('int', [1, 2])",
+            "Java.enumerateLoadedClassesSync()",
+            "Java.enumerateLoadedClasses({ onMatch: function () {}, onComplete: function () {} })",
+            "Java.classFactory.use('java.lang.Object')",
+        ] {
+            let err = rt.eval(expr).unwrap_err();
+            assert!(
+                err.to_string().contains("Java API not available"),
+                "{expr}: {err}"
+            );
+        }
     }
 }

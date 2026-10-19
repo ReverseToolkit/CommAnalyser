@@ -79,5 +79,7 @@ mod tests {
         assert!(threads
             .iter()
             .any(|thread| thread.id == super::current_id()));
+        let frames = super::backtrace(8);
+        assert!(frames.iter().all(|frame| *frame != 0));
     }
 }

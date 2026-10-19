@@ -308,5 +308,12 @@ mod tests {
     fn probe_requires_art() {
         // On a host without a JVM this must fail cleanly instead of crashing.
         assert!(super::probe().is_err());
+        assert!(!super::java::vm_available());
+        assert!(super::libart_base().is_err());
+        assert!(super::probe_hook().is_err());
+        let _ = super::stub_info();
+        let _ = super::soa::debug_state();
+        assert!(super::java::exception_pending().is_err());
+        assert!(super::java::call_length().is_err());
     }
 }

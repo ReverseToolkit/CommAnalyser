@@ -174,4 +174,17 @@ mod tests {
         assert!(modules.iter().all(|m| m.end >= m.base));
         assert!(modules.windows(2).all(|w| w[0].base <= w[1].base));
     }
+
+    #[test]
+    fn main_module_and_lookup() {
+        let main = main_module().unwrap().expect("main module");
+        assert!(!main.name.is_empty());
+        assert!(main.end > main.base);
+        let by_name = find_by_name(&main.name).unwrap().expect("find_by_name");
+        assert_eq!(by_name.base, main.base);
+        let by_addr = find_by_address(main.base)
+            .unwrap()
+            .expect("find_by_address");
+        assert!(by_addr.contains(main.base));
+    }
 }

@@ -6,8 +6,8 @@ use runtime::Result;
 use crate::hook::{HookCallback, InlineHook};
 use crate::replace;
 
-/// AArch64 CPU context handed to hook listeners.  Layout mirrors the fields
-/// scripts see in Frida's `this.context` (`x0`–`x7`, `lr`, `pc`).
+/// AArch64 CPU context handed to hook listeners.  Layout mirrors Gum's
+/// `GumArm64CpuContext` (`x0`–`x28`, `fp`, `lr`, `sp`, `pc`).
 #[derive(Clone, Debug)]
 pub struct InvocationContext {
     pub pc: u64,
@@ -103,6 +103,7 @@ mod tests {
         }
         Interceptor::replace(target, 0xAABB_CCDD).unwrap();
         assert!(original_trampoline(target).is_some());
+        Interceptor::flush();
         Interceptor::revert(target).unwrap();
         let restored = unsafe { std::slice::from_raw_parts(target as *const u8, 4) };
         assert_eq!(restored, &[0x1F, 0x20, 0x03, 0xD5]);

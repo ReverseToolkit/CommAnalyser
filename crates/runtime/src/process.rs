@@ -79,5 +79,9 @@ mod tests {
         assert_eq!(pointer_size(), std::mem::size_of::<usize>());
         assert!(!arch().is_empty());
         assert!(!platform().is_empty());
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(arch(), "x64");
+        #[cfg(target_os = "linux")]
+        assert_eq!(platform(), "linux");
     }
 }

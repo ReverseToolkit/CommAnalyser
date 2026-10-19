@@ -287,4 +287,16 @@ mod tests {
         let f = unsafe { super::call_f32(ret_f32 as *const () as usize, &[]) }.unwrap();
         assert_eq!(f, 0.25);
     }
+
+    unsafe extern "C" fn add2(a: u64, b: u64) -> u64 {
+        a.wrapping_add(b)
+    }
+
+    #[test]
+    fn call_integer_two_args() {
+        let got = unsafe { super::call(add2 as *const () as usize, &[40, 2]) }.unwrap();
+        assert_eq!(got, 42);
+        let too_many = unsafe { super::call(add2 as *const () as usize, &[0; 9]) }.unwrap_err();
+        assert!(matches!(too_many, runtime::Error::Unsupported(_)));
+    }
 }

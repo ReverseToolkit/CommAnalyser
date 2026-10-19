@@ -6,6 +6,8 @@ use std::process::ExitCode;
 
 use serde_json::{json, Value};
 
+const USAGE: &str = "usage: comm-analyser [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|spawn|agent|eval|call|rpc|selftest>";
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -38,103 +40,9 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let command = command.ok_or_else(|| {
-        "usage: comm-analyser [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|spawn|agent|eval|call|rpc>"
-            .to_owned()
-    })?;
+    let command = command.ok_or_else(|| USAGE.to_owned())?;
 
-    let request = match command.as_str() {
-        "ping" => json!({"op": "ping"}),
-        "version" => json!({"op": "version"}),
-        "ps" => json!({"op": "ps"}),
-        "attach" => {
-            let pid = rest
-                .first()
-                .ok_or("usage: comm-analyser attach <pid>")?
-                .parse::<u32>()
-                .map_err(|_| "invalid pid".to_owned())?;
-            json!({"op": "attach", "pid": pid})
-        }
-        "inject" => {
-            let pid = rest
-                .first()
-                .ok_or("usage: comm-analyser inject <pid> [--agent PATH]")?
-                .parse::<u32>()
-                .map_err(|_| "invalid pid".to_owned())?;
-            let agent = rest
-                .iter()
-                .position(|v| v == "--agent")
-                .and_then(|i| rest.get(i + 1))
-                .map(String::as_str)
-                .unwrap_or("/data/local/tmp/libagent.so");
-            json!({"op": "inject", "pid": pid, "agent": agent})
-        }
-        "spawn" => spawn_request(&rest)?,
-        "agent" => {
-            let pid = rest
-                .first()
-                .ok_or("usage: comm-analyser agent <pid> <command>")?
-                .parse::<u32>()
-                .map_err(|_| "invalid pid".to_owned())?;
-            let command = rest
-                .get(1)
-                .ok_or("usage: comm-analyser agent <pid> <command>")?;
-            json!({"op": "agent", "pid": pid, "command": command})
-        }
-        "rpc" => {
-            let pid = rest
-                .first()
-                .ok_or("usage: comm-analyser rpc <pid> <name> [json-args]")?
-                .parse::<u32>()
-                .map_err(|_| "invalid pid".to_owned())?;
-            let name = rest
-                .get(1)
-                .ok_or("usage: comm-analyser rpc <pid> <name> [json-args]")?;
-            let args = rest
-                .get(2)
-                .map(|text| serde_json::from_str::<Value>(text))
-                .transpose()
-                .map_err(|err| format!("invalid args: {err}"))?
-                .unwrap_or_else(|| json!([]));
-            json!({"op": "rpc", "pid": pid, "name": name, "args": args})
-        }
-        "call" => {
-            let pid = rest
-                .first()
-                .ok_or("usage: comm-analyser call <pid> <address> <arg>")?
-                .parse::<u32>()
-                .map_err(|_| "invalid pid".to_owned())?;
-            let address = rest
-                .get(1)
-                .ok_or("usage: comm-analyser call <pid> <address> <arg>")?;
-            let address = address
-                .strip_prefix("0x")
-                .or_else(|| address.strip_prefix("0X"))
-                .unwrap_or(address);
-            let address =
-                u64::from_str_radix(address, 16).map_err(|_| "invalid address".to_owned())?;
-            let arg = rest
-                .get(2)
-                .map(String::as_str)
-                .unwrap_or("0")
-                .parse::<i64>()
-                .map_err(|_| "invalid arg".to_owned())?;
-            json!({"op": "call", "pid": pid, "address": address, "arg": arg})
-        }
-        "eval" => {
-            let pid = rest
-                .first()
-                .ok_or("usage: comm-analyser eval <pid> <expression>")?
-                .parse::<u32>()
-                .map_err(|_| "invalid pid".to_owned())?;
-            let code = rest[1..].join(" ");
-            if code.is_empty() {
-                return Err("usage: comm-analyser eval <pid> <expression>".to_owned());
-            }
-            json!({"op": "eval", "pid": pid, "code": code})
-        }
-        other => return Err(format!("unknown command: {other}")),
-    };
+    let request = command_to_json(&command, &rest)?;
 
     let mut request = request;
     if let Some(token) = token {
@@ -190,6 +98,7 @@ fn run() -> Result<(), String> {
                 .unwrap_or(Value::Null);
             let _ = writeln!(io::stdout(), "{value}");
         }
+        "selftest" => print_selftest(&response)?,
         _ => {
             let _ = writeln!(io::stdout(), "{response}");
         }
@@ -227,8 +136,152 @@ fn print_help() {
            ps                list processes\n\
            attach <pid>      attach to a process (M1)\n\
            inject <pid>      inject agent into a running pid\n\
-           spawn --package P | --exec PATH [args]   start then inject\n"
+           spawn --package P | --exec PATH [args]   start then inject\n\
+           agent <pid> <command>  send a command to an injected agent\n\
+           eval <pid> <expression>  evaluate JS in the agent\n\
+           call <pid> <address> [arg]  call a native function\n\
+           rpc <pid> <name> [json-args]  invoke rpc.exports\n\
+           selftest <pid> [suite]  run in-process agent tests\n"
     );
+}
+
+fn print_selftest(response: &Value) -> Result<(), String> {
+    let body = response.get("response").unwrap_or(response);
+    let cases = body
+        .get("cases")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for case in &cases {
+        let layer = case.get("layer").and_then(Value::as_str).unwrap_or("?");
+        let name = case.get("name").and_then(Value::as_str).unwrap_or("?");
+        let detail = case.get("detail").and_then(Value::as_str).unwrap_or("");
+        let status = match case.get("ok") {
+            Some(Value::Bool(true)) => "PASS",
+            Some(Value::Bool(false)) => "FAIL",
+            _ => "SKIP",
+        };
+        let _ = writeln!(io::stdout(), "{status:4}  {layer}.{name}  {detail}");
+    }
+    let passed = body.get("passed").and_then(Value::as_u64).unwrap_or(0);
+    let failed = body.get("failed").and_then(Value::as_u64).unwrap_or(0);
+    let skipped = body.get("skipped").and_then(Value::as_u64).unwrap_or(0);
+    let _ = writeln!(
+        io::stdout(),
+        "summary  passed={passed} failed={failed} skipped={skipped}"
+    );
+    if body.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(format!("{failed} selftest case(s) failed"));
+    }
+    Ok(())
+}
+
+/// Map a CLI command and remaining argv into the daemon JSON request body.
+fn command_to_json(command: &str, rest: &[String]) -> Result<Value, String> {
+    match command {
+        "ping" => Ok(json!({"op": "ping"})),
+        "version" => Ok(json!({"op": "version"})),
+        "ps" => Ok(json!({"op": "ps"})),
+        "attach" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: comm-analyser attach <pid>")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            Ok(json!({"op": "attach", "pid": pid}))
+        }
+        "inject" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: comm-analyser inject <pid> [--agent PATH]")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let agent = rest
+                .iter()
+                .position(|v| v == "--agent")
+                .and_then(|i| rest.get(i + 1))
+                .map(String::as_str)
+                .unwrap_or("/data/local/tmp/libagent.so");
+            Ok(json!({"op": "inject", "pid": pid, "agent": agent}))
+        }
+        "spawn" => spawn_request(rest),
+        "agent" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: comm-analyser agent <pid> <command>")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let command = rest
+                .get(1)
+                .ok_or("usage: comm-analyser agent <pid> <command>")?;
+            Ok(json!({"op": "agent", "pid": pid, "command": command}))
+        }
+        "rpc" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: comm-analyser rpc <pid> <name> [json-args]")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let name = rest
+                .get(1)
+                .ok_or("usage: comm-analyser rpc <pid> <name> [json-args]")?;
+            let args = rest
+                .get(2)
+                .map(|text| serde_json::from_str::<Value>(text))
+                .transpose()
+                .map_err(|err| format!("invalid args: {err}"))?
+                .unwrap_or_else(|| json!([]));
+            Ok(json!({"op": "rpc", "pid": pid, "name": name, "args": args}))
+        }
+        "call" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: comm-analyser call <pid> <address> <arg>")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let address = rest
+                .get(1)
+                .ok_or("usage: comm-analyser call <pid> <address> <arg>")?;
+            let address = address
+                .strip_prefix("0x")
+                .or_else(|| address.strip_prefix("0X"))
+                .unwrap_or(address);
+            let address =
+                u64::from_str_radix(address, 16).map_err(|_| "invalid address".to_owned())?;
+            let arg = rest
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("0")
+                .parse::<i64>()
+                .map_err(|_| "invalid arg".to_owned())?;
+            Ok(json!({"op": "call", "pid": pid, "address": address, "arg": arg}))
+        }
+        "eval" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: comm-analyser eval <pid> <expression>")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let code = rest[1..].join(" ");
+            if code.is_empty() {
+                return Err("usage: comm-analyser eval <pid> <expression>".to_owned());
+            }
+            Ok(json!({"op": "eval", "pid": pid, "code": code}))
+        }
+        "selftest" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: comm-analyser selftest <pid> [suite]")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let mut request = json!({"op": "selftest", "pid": pid});
+            if let Some(suite) = rest.get(1) {
+                request["suite"] = Value::String(suite.clone());
+            }
+            Ok(request)
+        }
+        other => Err(format!("unknown command: {other}")),
+    }
 }
 
 fn spawn_request(rest: &[String]) -> Result<Value, String> {
@@ -287,4 +340,86 @@ fn spawn_request(rest: &[String]) -> Result<Value, String> {
         "args": args,
         "agent": agent
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn every_usage_command_maps_to_json_op() {
+        assert_eq!(command_to_json("ping", &[]).unwrap()["op"], "ping");
+        assert_eq!(command_to_json("version", &[]).unwrap()["op"], "version");
+        assert_eq!(command_to_json("ps", &[]).unwrap()["op"], "ps");
+
+        let attach = command_to_json("attach", &args(&["42"])).unwrap();
+        assert_eq!(attach["op"], "attach");
+        assert_eq!(attach["pid"], 42);
+
+        let inject = command_to_json("inject", &args(&["7", "--agent", "/tmp/a.so"])).unwrap();
+        assert_eq!(inject["op"], "inject");
+        assert_eq!(inject["pid"], 7);
+        assert_eq!(inject["agent"], "/tmp/a.so");
+
+        let inject_default = command_to_json("inject", &args(&["8"])).unwrap();
+        assert_eq!(inject_default["agent"], "/data/local/tmp/libagent.so");
+
+        let spawn = command_to_json("spawn", &args(&["--package", "com.foo"])).unwrap();
+        assert_eq!(spawn["op"], "spawn");
+        assert_eq!(spawn["package"], "com.foo");
+
+        let spawn_exec =
+            command_to_json("spawn", &args(&["--exec", "/bin/sleep", "--", "5"])).unwrap();
+        assert_eq!(spawn_exec["exec"], "/bin/sleep");
+        assert_eq!(spawn_exec["args"][0], "5");
+
+        let agent = command_to_json("agent", &args(&["9", "ping"])).unwrap();
+        assert_eq!(agent["op"], "agent");
+        assert_eq!(agent["pid"], 9);
+        assert_eq!(agent["command"], "ping");
+
+        let eval = command_to_json("eval", &args(&["3", "1", "+", "2"])).unwrap();
+        assert_eq!(eval["op"], "eval");
+        assert_eq!(eval["pid"], 3);
+        assert_eq!(eval["code"], "1 + 2");
+
+        let call = command_to_json("call", &args(&["4", "0x10", "7"])).unwrap();
+        assert_eq!(call["op"], "call");
+        assert_eq!(call["address"], 16);
+        assert_eq!(call["arg"], 7);
+
+        let rpc = command_to_json("rpc", &args(&["5", "add", "[1,2]"])).unwrap();
+        assert_eq!(rpc["op"], "rpc");
+        assert_eq!(rpc["name"], "add");
+        assert_eq!(rpc["args"][1], 2);
+
+        let selftest = command_to_json("selftest", &args(&["6", "runtime"])).unwrap();
+        assert_eq!(selftest["op"], "selftest");
+        assert_eq!(selftest["pid"], 6);
+        assert_eq!(selftest["suite"], "runtime");
+    }
+
+    #[test]
+    fn unknown_command_and_missing_fields_are_errors() {
+        assert!(command_to_json("nope", &[])
+            .unwrap_err()
+            .contains("unknown command"));
+        assert!(command_to_json("attach", &[]).is_err());
+        assert!(command_to_json("eval", &args(&["1"])).is_err());
+        assert!(command_to_json("spawn", &[]).is_err());
+    }
+
+    #[test]
+    fn help_lists_every_usage_command() {
+        for command in [
+            "ping", "version", "ps", "attach", "inject", "spawn", "agent", "eval", "call", "rpc",
+            "selftest",
+        ] {
+            assert!(USAGE.contains(command), "{command}");
+        }
+    }
 }

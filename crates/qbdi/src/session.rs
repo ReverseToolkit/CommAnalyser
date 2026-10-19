@@ -168,8 +168,13 @@ mod tests {
 
     #[test]
     fn event_names_and_until() {
+        let default = EventMask::default();
+        assert!(default.inst && default.mem && default.call);
+        assert!(default.accepts(EventKind::Inst));
         let mask = EventMask::from_names(&["inst".into(), "bogus".into()]);
         assert!(mask.inst && !mask.mem);
+        assert!(mask.accepts(EventKind::Inst));
+        assert!(!mask.accepts(EventKind::Mem));
         let mut config = TraceConfig::new(0x10);
         config.until = Some(0x20);
         config.escapes.push(Escape {
@@ -179,5 +184,9 @@ mod tests {
         assert!(config.should_stop(0x20));
         assert!(config.should_stop(0x30));
         assert!(!config.should_stop(0x10));
+        exclude_module("libhost-test-exclude.so");
+        assert!(extra_excludes()
+            .iter()
+            .any(|name| name == "libhost-test-exclude.so"));
     }
 }

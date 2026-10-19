@@ -1184,19 +1184,30 @@ pub(crate) fn invoke_enter<'js>(
     let on_enter = on_enter.restore(ctx)?;
 
     let args = Array::new(ctx.clone())?;
+    let mut gprs = Vec::with_capacity(8);
     for index in 0..8 {
-        args.set(index, NativePointer::instance(ctx.clone(), regs.x[index])?)?;
+        let pointer = NativePointer::instance(ctx.clone(), regs.x[index])?;
+        args.set(index, pointer.clone())?;
+        gprs.push(pointer);
     }
 
-    let this = make_this(ctx, target, regs)?;
+    let this = make_this(ctx, target, regs, Some(&gprs))?;
     let mut call_args = Args::new(ctx.clone(), 1);
-    call_args.this(this)?;
+    call_args.this(this.clone())?;
     call_args.push_arg(args.clone())?;
     on_enter.call_arg::<()>(call_args)?;
 
+    // `args[i]` and `this.context.xi` start as one NativePointer. JS assignment
+    // replaces one slot, so copy args only when context left that GPR unchanged.
+    let original: [u64; 8] = core::array::from_fn(|index| regs.x[index]);
+    apply_context(this, regs)?;
     for index in 0..8 {
-        if let Ok(pointer) = args.get::<Class<NativePointer>>(index) {
-            regs.x[index] = pointer.borrow().value;
+        let Ok(pointer) = args.get::<Class<NativePointer>>(index) else {
+            continue;
+        };
+        let arg = pointer.borrow().value;
+        if arg != original[index] && regs.x[index] == original[index] {
+            regs.x[index] = arg;
         }
     }
     Ok(())
@@ -1212,33 +1223,69 @@ pub(crate) fn invoke_leave<'js>(
     let on_leave = on_leave.restore(ctx)?;
     let retval = Class::instance(ctx.clone(), Retval { value: regs.x[0] })?;
 
-    let this = make_this(ctx, target, regs)?;
+    let this = make_this(ctx, target, regs, None)?;
     let mut call_args = Args::new(ctx.clone(), 1);
-    call_args.this(this)?;
+    call_args.this(this.clone())?;
     call_args.push_arg(retval.clone())?;
     on_leave.call_arg::<()>(call_args)?;
 
+    apply_context(this, regs)?;
     regs.x[0] = retval.borrow().value;
     Ok(())
 }
 
-fn make_this<'js>(ctx: &Ctx<'js>, target: usize, regs: &SavedRegs) -> JsResult<Object<'js>> {
-    let context = Object::new(ctx.clone())?;
-    context.set("pc", NativePointer::instance(ctx.clone(), target as u64)?)?;
-    context.set("sp", NativePointer::instance(ctx.clone(), 0)?)?;
-    context.set("lr", NativePointer::instance(ctx.clone(), regs.lr)?)?;
-    for index in 0..8 {
-        let value = NativePointer::instance(ctx.clone(), regs.x[index])?;
-        match index {
-            0 => context.set("x0", value)?,
-            1 => context.set("x1", value)?,
-            2 => context.set("x2", value)?,
-            3 => context.set("x3", value)?,
-            4 => context.set("x4", value)?,
-            5 => context.set("x5", value)?,
-            6 => context.set("x6", value)?,
-            _ => context.set("x7", value)?,
+fn apply_context(this: Object<'_>, regs: &mut SavedRegs) -> JsResult<()> {
+    let Ok(context) = this.get::<_, Object>("context") else {
+        return Ok(());
+    };
+    let read = |name: &str| -> Option<u64> {
+        context
+            .get::<_, Class<NativePointer>>(name)
+            .ok()
+            .map(|pointer| pointer.borrow().value)
+    };
+    if let Some(value) = read("lr") {
+        regs.lr = value;
+    }
+    if let Some(value) = read("fp") {
+        regs.fp = value;
+    }
+    if let Some(value) = read("sp") {
+        regs.sp = value;
+    }
+    if let Some(value) = read("pc") {
+        regs.pc = value;
+    }
+    if let Some(value) = read("nzcv") {
+        regs.nzcv = value;
+    }
+    for index in 0..29 {
+        if let Some(value) = read(&format!("x{index}")) {
+            regs.x[index] = value;
         }
+    }
+    Ok(())
+}
+
+fn make_this<'js>(
+    ctx: &Ctx<'js>,
+    target: usize,
+    regs: &SavedRegs,
+    arg_gprs: Option<&[Class<'js, NativePointer>]>,
+) -> JsResult<Object<'js>> {
+    let context = Object::new(ctx.clone())?;
+    let pc = if regs.pc == 0 { target as u64 } else { regs.pc };
+    context.set("pc", NativePointer::instance(ctx.clone(), pc)?)?;
+    context.set("sp", NativePointer::instance(ctx.clone(), regs.sp)?)?;
+    context.set("lr", NativePointer::instance(ctx.clone(), regs.lr)?)?;
+    context.set("fp", NativePointer::instance(ctx.clone(), regs.fp)?)?;
+    context.set("nzcv", NativePointer::instance(ctx.clone(), regs.nzcv)?)?;
+    for index in 0..29 {
+        let pointer = match arg_gprs.and_then(|gprs| gprs.get(index)) {
+            Some(shared) => shared.clone(),
+            None => NativePointer::instance(ctx.clone(), regs.x[index])?,
+        };
+        context.set(format!("x{index}"), pointer)?;
     }
 
     let this = Object::new(ctx.clone())?;

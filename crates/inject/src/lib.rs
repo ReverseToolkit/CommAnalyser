@@ -79,5 +79,14 @@ mod tests {
     fn attach_validates_pid() {
         let err = attach(&AttachOptions::new(0, "agent.so")).unwrap_err();
         assert!(matches!(err, Error::Parse(_)));
+        let options = AttachOptions::new(1, "agent.so").with_config("sock");
+        assert_eq!(options.pid, 1);
+        assert_eq!(options.agent, "agent.so");
+        assert_eq!(options.entrypoint, "agent_main");
+        assert_eq!(options.config, "sock");
+        assert!(supported());
+        let missing =
+            attach(&AttachOptions::new(u32::MAX, "agent.so").with_config("sock")).unwrap_err();
+        assert!(matches!(missing, Error::NotFound(_)));
     }
 }

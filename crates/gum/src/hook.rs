@@ -1,11 +1,10 @@
 //! Minimal AArch64 inline hook.
 //!
-//! The trampoline saves the caller-saved argument registers, calls a Rust
-//! `onEnter` callback, and executes the relocated prologue with the original
-//! SP.  When `onLeave` is present, LR is redirected to a shared return stub;
-//! the stub calls `onLeave`, lets it rewrite x0, then returns to the original
-//! caller.  This is still smaller than Frida's Interceptor but covers the
-//! common `onEnter`/`onLeave` + `retval.replace` path.
+//! The trampoline saves the full GPR context (x0–x28, fp, lr, original SP,
+//! NZCV), calls a Rust `onEnter` callback, and executes the relocated
+//! prologue with the original SP.  When `onLeave` is present, LR is redirected
+//! to a shared return stub; the stub calls `onLeave`, lets it rewrite x0, then
+//! returns to the original caller.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -20,15 +19,24 @@ use crate::memory::{flush_icache, protect};
 
 const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
 const PAGE: usize = 0x1000;
-const SAVE_SIZE: u32 = 160;
+/// GumCpuContext-sized frame: x0–x28, fp, lr, sp, nzcv, pc.
+const SAVE_SIZE: u32 = 272;
 const NEAR_RADIUS: usize = 0x700_0000;
+const OFF_LR: u32 = 240;
+const OFF_SP: u32 = 248;
+const OFF_NZCV: u32 = 256;
+const OFF_PC: u32 = 264;
 
-/// Registers visible to the hook callback (x0-x18 + LR).
+/// Full AArch64 GPRs visible to the hook callback.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SavedRegs {
-    pub x: [u64; 19],
+    pub x: [u64; 29],
+    pub fp: u64,
     pub lr: u64,
+    pub sp: u64,
+    pub nzcv: u64,
+    pub pc: u64,
 }
 
 impl SavedRegs {
@@ -51,6 +59,7 @@ struct LeaveFrame {
     on_leave: HookCallback,
     user_data: *mut c_void,
     original_lr: u64,
+    pc: u64,
 }
 
 thread_local! {
@@ -63,6 +72,7 @@ struct HookEntry {
     on_leave: Option<HookCallback>,
     user_data: *mut c_void,
     return_stub: usize,
+    pc: u64,
 }
 
 unsafe extern "C" fn dispatch(entry: *mut HookEntry, regs: *mut SavedRegs) {
@@ -71,6 +81,7 @@ unsafe extern "C" fn dispatch(entry: *mut HookEntry, regs: *mut SavedRegs) {
     }
     // SAFETY: the trampoline embeds a pointer to a HookEntry that outlives it.
     let entry = unsafe { &*entry };
+    unsafe { (*regs).pc = entry.pc };
     let original_lr = unsafe { (*regs).lr };
 
     // SAFETY: caller-provided callback and data; contract is documented on attach().
@@ -83,6 +94,7 @@ unsafe extern "C" fn dispatch(entry: *mut HookEntry, regs: *mut SavedRegs) {
                     on_leave,
                     user_data: entry.user_data,
                     original_lr,
+                    pc: unsafe { (*regs).pc },
                 });
             });
             // The relocated prologue may save this LR; the function's RET will
@@ -103,7 +115,10 @@ unsafe extern "C" fn leave_dispatch(regs: *mut SavedRegs) {
     // SAFETY: caller-provided on_leave callback and user_data.
     unsafe { (frame.on_leave)(regs, frame.user_data) };
     // SAFETY: regs is the live SavedRegs passed by the return stub.
-    unsafe { (*regs).lr = frame.original_lr };
+    unsafe {
+        (*regs).lr = frame.original_lr;
+        (*regs).pc = frame.pc;
+    }
 }
 
 pub struct InlineHook {
@@ -116,7 +131,7 @@ pub struct InlineHook {
 
 impl InlineHook {
     /// Install a hook at `target`.  `callback` runs with the saved registers
-    /// and may modify x0-x18/LR before the relocated prologue executes.
+    /// and may modify GPRs before the relocated prologue executes.
     ///
     /// # Safety
     /// `user_data` must remain valid for as long as the hook is active.
@@ -153,6 +168,7 @@ impl InlineHook {
             on_leave,
             user_data,
             return_stub,
+            pc: target as u64,
         }));
 
         // Skip BTI/PAC prologue instructions: leaving them in place means an
@@ -245,23 +261,11 @@ impl Drop for InlineHook {
 
 fn emit_trampoline(w: &mut CodeWriter, entry: *mut HookEntry, prologue: &[u8], resume: usize) {
     w.bti_jc();
-    w.sub_sp(SAVE_SIZE);
-    for i in 0..9u8 {
-        w.stp(i * 2, i * 2 + 1, 31, (i as i64) * 16);
-    }
-    w.str_imm(18, 31, 144);
-    w.str_imm(30, 31, 152);
-
+    emit_save_gprs(w);
     w.abs_addr(0, entry as usize as u64);
     w.put(0x9100_03E1); // mov x1, sp
     w.abs_bl(dispatch as *const () as usize);
-
-    for i in 0..9u8 {
-        w.ldp(i * 2, i * 2 + 1, 31, (i as i64) * 16);
-    }
-    w.ldr_imm(18, 31, 144);
-    w.ldr_imm(30, 31, 152);
-    w.add_sp(SAVE_SIZE);
+    emit_restore_gprs(w);
 
     w.put_bytes(prologue);
     w.ldr_literal_x(16, 8);
@@ -293,7 +297,7 @@ fn make_return_stub() -> Option<usize> {
         return None;
     }
 
-    let mut w = CodeWriter::with_capacity(256);
+    let mut w = CodeWriter::with_capacity(512);
     emit_return_stub(&mut w);
     // SAFETY: page is a private mapping of at least PAGE bytes.
     unsafe {
@@ -309,23 +313,36 @@ fn make_return_stub() -> Option<usize> {
 
 fn emit_return_stub(w: &mut CodeWriter) {
     w.bti_jc();
-    w.sub_sp(SAVE_SIZE);
-    for i in 0..9u8 {
-        w.stp(i * 2, i * 2 + 1, 31, (i as i64) * 16);
-    }
-    w.str_imm(18, 31, 144);
-    w.str_imm(30, 31, 152);
-
+    emit_save_gprs(w);
     w.put(0x9100_03E0); // mov x0, sp
     w.abs_bl(leave_dispatch as *const () as usize);
+    emit_restore_gprs(w);
+    w.ret(30);
+}
 
-    for i in 0..9u8 {
+fn emit_save_gprs(w: &mut CodeWriter) {
+    w.sub_sp(SAVE_SIZE);
+    for i in 0..14u8 {
+        w.stp(i * 2, i * 2 + 1, 31, (i as i64) * 16);
+    }
+    w.stp(28, 29, 31, 224);
+    w.str_imm(30, 31, OFF_LR);
+    // Original SP is the frame plus SAVE_SIZE; NZCV via MRS. x16 was already stored.
+    w.put(0x9100_0000 | (SAVE_SIZE << 10) | (31 << 5) | 16); // add x16, sp, #SAVE_SIZE
+    w.str_imm(16, 31, OFF_SP);
+    w.put(0xD53B_4210); // mrs x16, nzcv
+    w.str_imm(16, 31, OFF_NZCV);
+}
+
+fn emit_restore_gprs(w: &mut CodeWriter) {
+    w.ldr_imm(16, 31, OFF_NZCV);
+    w.put(0xD51B_4210); // msr nzcv, x16
+    for i in 0..14u8 {
         w.ldp(i * 2, i * 2 + 1, 31, (i as i64) * 16);
     }
-    w.ldr_imm(18, 31, 144);
-    w.ldr_imm(30, 31, 152);
+    w.ldp(28, 29, 31, 224);
+    w.ldr_imm(30, 31, OFF_LR);
     w.add_sp(SAVE_SIZE);
-    w.ret(30);
 }
 
 fn is_bti_or_pac(word: u32) -> bool {
@@ -481,8 +498,28 @@ mod tests {
 
     #[test]
     fn saved_regs_layout() {
-        assert_eq!(std::mem::size_of::<SavedRegs>(), 160);
+        assert_eq!(std::mem::size_of::<SavedRegs>(), 272);
+        assert_eq!(std::mem::size_of::<SavedRegs>(), SAVE_SIZE as usize);
+        assert_eq!(core::mem::offset_of!(SavedRegs, lr), OFF_LR as usize);
+        assert_eq!(core::mem::offset_of!(SavedRegs, sp), OFF_SP as usize);
+        assert_eq!(core::mem::offset_of!(SavedRegs, nzcv), OFF_NZCV as usize);
+        assert_eq!(core::mem::offset_of!(SavedRegs, pc), OFF_PC as usize);
         assert_eq!(std::mem::align_of::<SavedRegs>(), 8);
+        let mut regs = SavedRegs::default();
+        regs.set_arg(0, 7);
+        regs.set_arg(28, 9);
+        assert_eq!(regs.arg(0), 7);
+        assert_eq!(regs.arg(28), 9);
+        assert_eq!(regs.arg(99), 0);
+        regs.fp = 1;
+        regs.lr = 2;
+        regs.sp = 3;
+        regs.nzcv = 4;
+        regs.pc = 5;
+        assert_eq!(
+            (regs.fp, regs.lr, regs.sp, regs.nzcv, regs.pc),
+            (1, 2, 3, 4, 5)
+        );
     }
 
     #[test]

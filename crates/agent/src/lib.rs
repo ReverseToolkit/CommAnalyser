@@ -5,6 +5,7 @@
 //! wired in M1.
 
 mod control;
+mod selftest;
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};

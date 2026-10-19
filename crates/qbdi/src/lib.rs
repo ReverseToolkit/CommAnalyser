@@ -1,7 +1,7 @@
 //! QBDI-backed function trace (TAL door: intercept, run under DBI, batch events).
 //!
-//! The `link` feature statically links `libQBDI.a`. Host tests compile without
-//! it so they do not need the Android archive.
+//! The `link` feature embeds a compressed `libtal.so` and dlopens it on
+//! first `Trace.function`. Host tests compile without that payload.
 
 mod blacklist;
 mod probe;
@@ -10,6 +10,8 @@ mod session;
 
 #[cfg(feature = "link")]
 mod engine;
+#[cfg(feature = "link")]
+mod load;
 
 pub use blacklist::{excluded_executable_ranges, is_conflict, is_excluded, ANDROID_CONFLICT};
 pub use probe::MemProbe;
@@ -23,7 +25,7 @@ use runtime::{Error, Result};
 /// QBDI version this crate is designed against.
 pub const QBDI_VERSION: &str = "0.12";
 
-/// Whether the QBDI static library is linked into this build.
+/// Whether this build embeds a QBDI shared library payload.
 pub const fn linked() -> bool {
     cfg!(feature = "link")
 }
@@ -82,14 +84,25 @@ mod tests {
 
     #[test]
     fn vm_requires_link() {
-        assert!(Vm::new().is_err());
+        let err = match Vm::new() {
+            Ok(_) => panic!("Vm::new must fail without link"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("QBDI is not linked"), "{err}");
+        assert!(take_events().is_empty());
     }
 
     #[test]
-    fn link_feature_uses_static_archive() {
+    fn link_feature_embeds_shared_payload() {
         let build = include_str!("../build.rs");
-        assert!(build.contains("cargo:rustc-link-lib=static=QBDI"));
-        assert!(!build.contains("libQBDI.so"));
+        assert!(build.contains("libtal.so.gz"));
+        assert!(
+            !build.contains("cargo:rustc-link-lib=static=QBDI"),
+            "TAL is a shared library, not statically linked QBDI"
+        );
+        let loader = include_str!("load.rs");
+        assert!(loader.contains("tal_prepare"));
+        assert!(loader.contains("tal_enter"));
         let agent = include_str!("../../agent/Cargo.toml");
         assert!(agent.contains("qbdi-static"));
         assert!(agent.contains("qbdi/link"));
@@ -98,18 +111,9 @@ mod tests {
     #[test]
     fn engine_follows_tal_door() {
         let engine = include_str!("engine.rs");
-        assert!(
-            engine.contains("syn_reg_gum"),
-            "TAL copies Gum GPR into QBDI"
-        );
-        assert!(engine.contains("qbdi_getGPRState"));
-        assert!(engine.contains("qbdi_run"), "TAL uses VM::run, not callA");
-        assert!(
-            !engine.contains("qbdi_callA"),
-            "callA requires a virtual stack and overwrites live LR/SP"
-        );
-        assert!(engine.contains("InlineHook"), "TAL gum_attach door");
-        assert!(engine.contains("1 << 24"), "TAL 16MiB host stack");
-        assert!(engine.contains("GPR SP is 0"), "refuse to run with SP==0");
+        assert!(engine.contains("InlineHook"), "our Interceptor is the door");
+        assert!(engine.contains("tal_prepare") || include_str!("load.rs").contains("tal_prepare"));
+        assert!(!engine.contains("qbdi_callA"));
+        assert!(!engine.contains("gum_attach"));
     }
 }

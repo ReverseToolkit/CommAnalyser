@@ -259,6 +259,11 @@ mod tests {
         assert!(!maps.is_empty());
         assert!(maps.iter().any(|m| m.perms.exec));
         assert!(maps.iter().any(|m| m.range.contains(maps[0].range.start)));
+        let local = 1u32;
+        let containing = self_mapping_containing(&local as *const u32 as usize)
+            .unwrap()
+            .expect("stack mapping");
+        assert!(containing.range.contains(&local as *const u32 as usize));
     }
 
     #[test]

@@ -478,4 +478,20 @@ mod tests {
         assert_eq!(&bytes, &[b'h', 0, b'i', 0, 0, 0]);
         free(utf16, 6);
     }
+
+    #[test]
+    fn format_prot_and_patch_code() {
+        assert_eq!(format_prot(true, false, true), "r-x");
+        assert_eq!(format_prot(true, true, false), "rw-");
+        assert_eq!(format_prot(false, false, false), "---");
+        let page = alloc(64).unwrap();
+        patch_code(page as usize, &[0x1F, 0x20, 0x03, 0xD5]).unwrap();
+        assert_eq!(
+            read(page as usize, 4).unwrap(),
+            vec![0x1F, 0x20, 0x03, 0xD5]
+        );
+        flush_icache(page as usize, 4);
+        free(page, 64);
+        assert!(parse_prot("rw").is_err());
+    }
 }

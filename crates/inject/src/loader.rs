@@ -229,7 +229,21 @@ impl MappedLibrary {
     ///
     /// # Errors
     /// Returns parse, mmap, relocation, or constructor errors.
-    pub fn load(bytes: &[u8], mut resolve: impl FnMut(&str) -> Result<u64>) -> Result<Self> {
+    pub fn load(bytes: &[u8], resolve: impl FnMut(&str) -> Result<u64>) -> Result<Self> {
+        Self::load_with(bytes, resolve, true, true)
+    }
+
+    /// Map `bytes` without constructors or IFUNC resolvers (app-domain TAL).
+    pub fn load_no_init(bytes: &[u8], resolve: impl FnMut(&str) -> Result<u64>) -> Result<Self> {
+        Self::load_with(bytes, resolve, false, false)
+    }
+
+    fn load_with(
+        bytes: &[u8],
+        mut resolve: impl FnMut(&str) -> Result<u64>,
+        run_ctors: bool,
+        call_ifuncs: bool,
+    ) -> Result<Self> {
         let image = Image::parse(bytes)?;
         let page = runtime::process::page_size();
         let size = image.span(page);
@@ -245,13 +259,21 @@ impl MappedLibrary {
                 (addr as *mut u64).write_unaligned(value);
                 Ok(())
             },
-            |fn_addr| unsafe {
-                let resolver: unsafe extern "C" fn() -> u64 = std::mem::transmute(fn_addr);
-                Ok(resolver())
+            |fn_addr| {
+                if call_ifuncs {
+                    // SAFETY: GNU IFUNC resolver has type `fn() -> u64`.
+                    let resolver: unsafe extern "C" fn() -> u64 =
+                        unsafe { std::mem::transmute(fn_addr) };
+                    Ok(unsafe { resolver() })
+                } else {
+                    Ok(fn_addr)
+                }
             },
         )?;
         protect_segments(map, load_start, page, &image)?;
-        run_local_inits(map, load_start, &image)?;
+        if run_ctors {
+            run_local_inits(map, load_start, &image)?;
+        }
         Ok(Self {
             base: map,
             size,
