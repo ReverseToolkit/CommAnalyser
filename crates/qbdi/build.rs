@@ -1,80 +1,105 @@
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-
-use flate2::write::GzEncoder;
-use flate2::Compression;
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=TAL_LIB_DIR");
+    println!("cargo:rerun-if-changed=../../native/tal/build-android/CMakeFiles/tal.dir");
     println!("cargo:rerun-if-changed=../../native/tal/android-arm64/libtal.so");
-    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_else(|_| ".".into()));
-    let blob = out.join("libtal.so.gz");
-    let cxx = out.join("libc++_shared.so.gz");
     if std::env::var("CARGO_FEATURE_LINK").is_err() {
-        write_empty_blob(&blob);
-        write_empty_blob(&cxx);
         return;
     }
+    match link_tal_static() {
+        Ok(()) => {}
+        Err(err) => println!("cargo:warning=TAL static link: {err}"),
+    }
+}
+
+fn link_tal_static() -> Result<(), String> {
+    let manifest =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()));
+    let root = manifest.join("../..");
+    let tal_build = std::env::var("TAL_LIB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("native/tal/build-android"));
+    let archive = ensure_tal_static(&tal_build)?;
+    let search = archive
+        .parent()
+        .ok_or_else(|| "tal_static parent".to_owned())?;
+
+    println!("cargo:rustc-link-search=native={}", search.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        tal_build.join("qbdi-src").display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        tal_build.join("boost-lite/libs/context").display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        root.join("native/tal/libs/frida-gum/android").display()
+    );
+
+    println!("cargo:rustc-link-lib=static:+whole-archive=tal_static");
+    println!("cargo:rustc-link-lib=static=QBDI");
+    println!("cargo:rustc-link-lib=static=qbdi-llvm");
+    println!("cargo:rustc-link-lib=static=boost_context");
+    println!("cargo:rustc-link-lib=static=frida-gum");
+    println!("cargo:rustc-link-lib=dylib=c++_shared");
+    println!("cargo:rustc-link-lib=dylib=log");
     println!("cargo:rustc-link-lib=dylib=dl");
-    match compress_tal(&blob) {
-        Ok(()) => {}
-        Err(err) => {
-            println!("cargo:warning=TAL shared payload: {err}");
-            write_empty_blob(&blob);
-        }
-    }
-    match compress_cxx(&cxx) {
-        Ok(()) => {}
-        Err(err) => {
-            println!("cargo:warning=libc++_shared payload: {err}");
-            write_empty_blob(&cxx);
-        }
-    }
-}
-
-fn write_empty_blob(blob: &Path) {
-    let _ = File::create(blob).and_then(|mut f| f.write_all(&[]));
-}
-
-fn compress_tal(blob: &Path) -> Result<(), String> {
-    let dir = std::env::var("TAL_LIB_DIR").unwrap_or_else(|_| {
-        format!(
-            "{}/native/tal/android-arm64",
-            std::env::var("CARGO_MANIFEST_DIR")
-                .map(|manifest| format!("{manifest}/../.."))
-                .unwrap_or_else(|_| ".".into())
-        )
-    });
-    let so = PathBuf::from(dir).join("libtal.so");
-    if !so.exists() {
-        return Err(format!("{} missing", so.display()));
-    }
-    let input = File::open(&so).map_err(|err| err.to_string())?;
-    let output = File::create(blob).map_err(|err| err.to_string())?;
-    let mut encoder = GzEncoder::new(BufWriter::new(output), Compression::best());
-    std::io::copy(&mut BufReader::new(input), &mut encoder).map_err(|err| err.to_string())?;
-    encoder.finish().map_err(|err| err.to_string())?;
+    println!("cargo:rustc-link-lib=dylib=m");
+    println!("cargo:rustc-link-lib=dylib=c");
     Ok(())
 }
 
-fn compress_cxx(blob: &Path) -> Result<(), String> {
-    let ndk = PathBuf::from(
-        std::env::var_os("ANDROID_NDK_HOME")
-            .or_else(|| std::env::var_os("NDK_PATH"))
-            .or_else(|| std::env::var_os("ANDROID_NDK"))
-            .unwrap_or_else(|| "/root/Android/Sdk/ndk/27.2.12479018".into()),
-    );
-    let so = ndk.join(
-        "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so",
-    );
-    if !so.exists() {
-        return Err(format!("{} missing", so.display()));
+fn ensure_tal_static(tal_build: &Path) -> Result<PathBuf, String> {
+    let archive = tal_build.join("libtal_static.a");
+    let mut objs = Vec::new();
+    collect_objs(&tal_build.join("CMakeFiles/tal.dir"), &mut objs);
+    if objs.is_empty() {
+        if archive.exists() {
+            return Ok(archive);
+        }
+        return Err(format!(
+            "no TAL objects under {}",
+            tal_build.join("CMakeFiles/tal.dir").display()
+        ));
     }
-    let input = File::open(&so).map_err(|err| err.to_string())?;
-    let output = File::create(blob).map_err(|err| err.to_string())?;
-    let mut encoder = GzEncoder::new(BufWriter::new(output), Compression::best());
-    std::io::copy(&mut BufReader::new(input), &mut encoder).map_err(|err| err.to_string())?;
-    encoder.finish().map_err(|err| err.to_string())?;
-    Ok(())
+    let ar = ndk_ar();
+    let status = Command::new(&ar)
+        .arg("crs")
+        .arg(&archive)
+        .args(&objs)
+        .status()
+        .map_err(|err| format!("{ar}: {err}"))?;
+    if !status.success() {
+        return Err(format!("{ar} crs libtal_static.a failed: {status}"));
+    }
+    Ok(archive)
+}
+
+fn collect_objs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_objs(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("o") {
+            out.push(path);
+        }
+    }
+}
+
+fn ndk_ar() -> String {
+    std::env::var("AR")
+        .or_else(|_| std::env::var("AR_aarch64_linux_android"))
+        .unwrap_or_else(|_| {
+            let ndk = std::env::var("ANDROID_NDK_HOME")
+                .or_else(|_| std::env::var("NDK"))
+                .unwrap_or_else(|_| "/root/Android/Sdk/ndk/27.2.12479018".into());
+            format!("{ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar")
+        })
 }

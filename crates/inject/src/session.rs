@@ -1,6 +1,7 @@
 //! Attach orchestration: stop threads, map the agent with the 自定义linker.
 
 use std::fs;
+use std::path::Path;
 
 use runtime::maps;
 use runtime::{Error, Result};
@@ -172,143 +173,57 @@ fn inject_locked(options: &AttachOptions, threads: &[u32]) -> Result<Session> {
 
     remote.write_cstr(config_ptr, &options.config)?;
 
-    let agent = fs::read(&options.agent).map_err(Error::Io)?;
-    let image = Image::parse(&agent)?;
-    let page = target_page_size(pid).unwrap_or(PAGE);
-    let span = image.span(page);
-    let load_start = loader::align_down(image.load_start, page as u64);
+    let name_ptr = config_ptr + 0x100;
+    let mut extras = Vec::new();
+    if let Some(dir) = Path::new(&options.agent).parent() {
+        let cxx_path = dir.join("libc++_shared.so");
+        if cxx_path.is_file() {
+            let cxx_bytes = fs::read(&cxx_path).map_err(Error::Io)?;
+            let mapped = load_elf_into(
+                pid,
+                &remote,
+                &mut regs,
+                mmap,
+                mprotect,
+                dlsym,
+                stack,
+                sentinel,
+                name_ptr,
+                caller_addr,
+                &cxx_bytes,
+                &extras,
+            )?;
+            eprintln!(
+                "[inject] libc++_shared map={:#x} span={:#x}",
+                mapped.map,
+                mapped.image.span(target_page_size(pid).unwrap_or(PAGE))
+            );
+            extras.push(mapped);
+        }
+    }
 
-    let map = remote_call(
+    let agent = fs::read(&options.agent).map_err(Error::Io)?;
+    let mapped = load_elf_into(
         pid,
         &remote,
         &mut regs,
         mmap,
-        &[0, span as u64, PROT_RW, MAP_PRIVATE_ANONYMOUS, u64::MAX, 0],
+        mprotect,
+        dlsym,
         stack,
         sentinel,
+        name_ptr,
+        caller_addr,
+        &agent,
+        &extras,
     )?;
-    if is_error(map) || map == 0 {
-        return Err(Error::Io(std::io::Error::from_raw_os_error(
-            (-(map as i64)) as i32,
-        )));
-    }
-    let map = map as usize;
-    eprintln!("[inject] custom linker map={map:#x} span={span:#x} (no dlopen)");
-
-    for segment in &image.segments {
-        let dest = map.wrapping_add((segment.vaddr - load_start) as usize);
-        let filesz = segment.filesz as usize;
-        if filesz == 0 {
-            continue;
-        }
-        let start = segment.offset as usize;
-        let src = agent
-            .get(start..start + filesz)
-            .ok_or_else(|| Error::Parse("PT_LOAD truncated".into()))?;
-        write_chunks(&remote, dest, src)?;
-    }
-
-    let name_ptr = config_ptr + 0x100;
-    let mut imports = std::collections::HashMap::new();
-    for reloc in &image.relocs {
-        let Some(name) = reloc.symbol.as_deref() else {
-            continue;
-        };
-        if name.is_empty() || image.symbols.contains_key(name) || imports.contains_key(name) {
-            continue;
-        }
-        remote.write_cstr(name_ptr, name)?;
-        let addr = remote_call(
-            pid,
-            &remote,
-            &mut regs,
-            dlsym,
-            &[0, name_ptr as u64, caller_addr],
-            stack,
-            sentinel,
-        )?;
-        if addr == 0 && !reloc.weak {
-            return Err(Error::NotFound(format!("dlsym({name})")));
-        }
-        imports.insert(name.to_owned(), addr);
-    }
-    loader::apply_relocs(
-        map,
-        load_start,
-        &image,
-        &mut |name| {
-            imports
-                .get(name)
-                .copied()
-                .ok_or_else(|| Error::NotFound(format!("import {name}")))
-        },
-        |slot, value| remote.write(slot, &value.to_le_bytes()),
-        |fn_addr| remote_call(pid, &remote, &mut regs, fn_addr, &[], stack, sentinel),
-    )?;
-
-    for segment in &image.segments {
-        let start =
-            loader::align_down(map as u64 + segment.vaddr - load_start, page as u64) as usize;
-        let end = loader::align_up(
-            map as u64 + segment.vaddr + segment.memsz - load_start,
-            page as u64,
-        ) as usize;
-        let len = end.saturating_sub(start);
-        if len == 0 {
-            continue;
-        }
-        let mut prot = loader::prot_from_flags(segment.flags, false) as u64;
-        let rc = remote_call(
-            pid,
-            &remote,
-            &mut regs,
-            mprotect,
-            &[start as u64, len as u64, prot],
-            stack,
-            sentinel,
-        )?;
-        if is_error(rc) && prot & PROT_BTI != 0 {
-            prot &= !PROT_BTI;
-            let rc = remote_call(
-                pid,
-                &remote,
-                &mut regs,
-                mprotect,
-                &[start as u64, len as u64, prot],
-                stack,
-                sentinel,
-            )?;
-            if is_error(rc) {
-                return Err(Error::Io(std::io::Error::from_raw_os_error(
-                    (-(rc as i64)) as i32,
-                )));
-            }
-        }
-    }
-    if let Some((vaddr, memsz)) = image.relro {
-        let start = loader::align_down(map as u64 + vaddr - load_start, page as u64) as usize;
-        let end = loader::align_up(map as u64 + vaddr + memsz - load_start, page as u64) as usize;
-        let len = end.saturating_sub(start);
-        if len > 0 {
-            let _ = remote_call(
-                pid,
-                &remote,
-                &mut regs,
-                mprotect,
-                &[start as u64, len as u64, 1],
-                stack,
-                sentinel,
-            );
-        }
-    }
-
-    let constructors = remote_constructors(&remote, map, load_start, &image)?;
-    for addr in constructors {
-        let rc = remote_call(pid, &remote, &mut regs, addr, &[], stack, sentinel)?;
-        if is_error(rc) {
-            eprintln!("[inject] init {addr:#x} returned {rc:#x}");
-        }
-    }
+    let map = mapped.map;
+    let load_start = mapped.load_start;
+    let image = mapped.image;
+    eprintln!(
+        "[inject] custom linker map={map:#x} span={:#x} (no dlopen)",
+        image.span(target_page_size(pid).unwrap_or(PAGE))
+    );
 
     let entry_off = image
         .symbol_value(&options.entrypoint)
@@ -333,6 +248,178 @@ fn inject_locked(options: &AttachOptions, threads: &[u32]) -> Result<Session> {
         threads: threads.to_vec(),
         scratch,
         resumed: false,
+    })
+}
+
+struct MappedElf {
+    map: usize,
+    load_start: u64,
+    image: Image,
+}
+
+fn load_elf_into(
+    pid: u32,
+    remote: &RemoteMemory,
+    regs: &mut UserPtRegs,
+    mmap: u64,
+    mprotect: u64,
+    dlsym: u64,
+    stack: usize,
+    sentinel: usize,
+    name_ptr: usize,
+    caller_addr: u64,
+    bytes: &[u8],
+    extras: &[MappedElf],
+) -> Result<MappedElf> {
+    let image = Image::parse(bytes)?;
+    let page = target_page_size(pid).unwrap_or(PAGE);
+    let span = image.span(page);
+    let load_start = loader::align_down(image.load_start, page as u64);
+    let map = remote_call(
+        pid,
+        remote,
+        regs,
+        mmap,
+        &[0, span as u64, PROT_RW, MAP_PRIVATE_ANONYMOUS, u64::MAX, 0],
+        stack,
+        sentinel,
+    )?;
+    if is_error(map) || map == 0 {
+        return Err(Error::Io(std::io::Error::from_raw_os_error(
+            (-(map as i64)) as i32,
+        )));
+    }
+    let map = map as usize;
+    for segment in &image.segments {
+        let dest = map.wrapping_add((segment.vaddr - load_start) as usize);
+        let filesz = segment.filesz as usize;
+        if filesz == 0 {
+            continue;
+        }
+        let start = segment.offset as usize;
+        let src = bytes
+            .get(start..start + filesz)
+            .ok_or_else(|| Error::Parse("PT_LOAD truncated".into()))?;
+        write_chunks(remote, dest, src)?;
+    }
+
+    let mut imports = std::collections::HashMap::new();
+    for reloc in &image.relocs {
+        let Some(name) = reloc.symbol.as_deref() else {
+            continue;
+        };
+        if name.is_empty() || image.symbols.contains_key(name) || imports.contains_key(name) {
+            continue;
+        }
+        if let Some(addr) = lookup_extra(extras, name) {
+            imports.insert(name.to_owned(), addr);
+            continue;
+        }
+        remote.write_cstr(name_ptr, name)?;
+        let addr = remote_call(
+            pid,
+            remote,
+            regs,
+            dlsym,
+            &[0, name_ptr as u64, caller_addr],
+            stack,
+            sentinel,
+        )?;
+        if addr == 0 && !reloc.weak {
+            return Err(Error::NotFound(format!("dlsym({name})")));
+        }
+        imports.insert(name.to_owned(), addr);
+    }
+    loader::apply_relocs(
+        map,
+        load_start,
+        &image,
+        &mut |name| {
+            imports
+                .get(name)
+                .copied()
+                .ok_or_else(|| Error::NotFound(format!("import {name}")))
+        },
+        |slot, value| remote.write(slot, &value.to_le_bytes()),
+        |fn_addr| remote_call(pid, remote, regs, fn_addr, &[], stack, sentinel),
+    )?;
+
+    for segment in &image.segments {
+        let start =
+            loader::align_down(map as u64 + segment.vaddr - load_start, page as u64) as usize;
+        let end = loader::align_up(
+            map as u64 + segment.vaddr + segment.memsz - load_start,
+            page as u64,
+        ) as usize;
+        let len = end.saturating_sub(start);
+        if len == 0 {
+            continue;
+        }
+        let mut prot = loader::prot_from_flags(segment.flags, false) as u64;
+        let rc = remote_call(
+            pid,
+            remote,
+            regs,
+            mprotect,
+            &[start as u64, len as u64, prot],
+            stack,
+            sentinel,
+        )?;
+        if is_error(rc) && prot & PROT_BTI != 0 {
+            prot &= !PROT_BTI;
+            let rc = remote_call(
+                pid,
+                remote,
+                regs,
+                mprotect,
+                &[start as u64, len as u64, prot],
+                stack,
+                sentinel,
+            )?;
+            if is_error(rc) {
+                return Err(Error::Io(std::io::Error::from_raw_os_error(
+                    (-(rc as i64)) as i32,
+                )));
+            }
+        }
+    }
+    if let Some((vaddr, memsz)) = image.relro {
+        let start = loader::align_down(map as u64 + vaddr - load_start, page as u64) as usize;
+        let end = loader::align_up(map as u64 + vaddr + memsz - load_start, page as u64) as usize;
+        let len = end.saturating_sub(start);
+        if len > 0 {
+            let _ = remote_call(
+                pid,
+                remote,
+                regs,
+                mprotect,
+                &[start as u64, len as u64, 1],
+                stack,
+                sentinel,
+            );
+        }
+    }
+
+    let constructors = remote_constructors(remote, map, load_start, &image)?;
+    for addr in constructors {
+        let rc = remote_call(pid, remote, regs, addr, &[], stack, sentinel)?;
+        if is_error(rc) {
+            eprintln!("[inject] init {addr:#x} returned {rc:#x}");
+        }
+    }
+    Ok(MappedElf {
+        map,
+        load_start,
+        image,
+    })
+}
+
+fn lookup_extra(extras: &[MappedElf], name: &str) -> Option<u64> {
+    extras.iter().find_map(|extra| {
+        extra
+            .image
+            .symbol_value(name)
+            .map(|off| extra.map as u64 + off - extra.load_start)
     })
 }
 
@@ -449,5 +536,12 @@ mod tests {
     fn reads_self_page_size() {
         let page = target_page_size(std::process::id()).unwrap();
         assert!(page == 0x1000 || page == 0x4000, "page={page}");
+    }
+
+    #[test]
+    fn maps_companion_cxx_from_agent_dir() {
+        let src = include_str!("session.rs");
+        assert!(src.contains("libc++_shared.so"));
+        assert!(src.contains("load_elf_into"));
     }
 }

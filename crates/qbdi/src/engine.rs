@@ -1,5 +1,5 @@
-//! TAL door via `libtal.so`. CommAnalyser Interceptor is the attach;
-//! TAL owns the QBDI VM (`tal_prepare` / `tal_enter`).
+//! TAL door via statically linked `tal_prepare` / `tal_enter`.
+//! CommAnalyser Interceptor is the attach; TAL owns the QBDI VM.
 
 use std::ptr;
 

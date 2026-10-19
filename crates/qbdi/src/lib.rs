@@ -1,7 +1,7 @@
 //! QBDI-backed function trace (TAL door: intercept, run under DBI, batch events).
 //!
-//! The `link` feature embeds a compressed `libtal.so` and dlopens it on
-//! first `Trace.function`. Host tests compile without that payload.
+//! The `link` feature statically links TAL (`tal_prepare` / `tal_enter`).
+//! Host tests compile without that payload.
 
 mod blacklist;
 mod probe;
@@ -25,7 +25,7 @@ use runtime::{Error, Result};
 /// QBDI version this crate is designed against.
 pub const QBDI_VERSION: &str = "0.12";
 
-/// Whether this build embeds a QBDI shared library payload.
+/// Whether this build statically links TAL.
 pub const fn linked() -> bool {
     cfg!(feature = "link")
 }
@@ -93,16 +93,18 @@ mod tests {
     }
 
     #[test]
-    fn link_feature_embeds_shared_payload() {
+    fn link_feature_statically_links_tal() {
         let build = include_str!("../build.rs");
-        assert!(build.contains("libtal.so.gz"));
-        assert!(
-            !build.contains("cargo:rustc-link-lib=static=QBDI"),
-            "TAL is a shared library, not statically linked QBDI"
-        );
+        assert!(build.contains("cargo:rustc-link-lib=static:+whole-archive=tal_static"));
+        assert!(build.contains("cargo:rustc-link-lib=static=QBDI"));
         let loader = include_str!("load.rs");
-        assert!(loader.contains("tal_prepare"));
-        assert!(loader.contains("tal_enter"));
+        assert!(loader.contains("fn tal_prepare"));
+        assert!(loader.contains("fn tal_enter"));
+        assert!(!loader.contains("memfd"));
+        assert!(!loader.contains("libtal.so.gz"));
+        let clear = include_str!("../../agent/clear_cache.c");
+        assert!(!clear.contains("__builtin___clear_cache"));
+        assert!(clear.contains("dc cvau"));
         let agent = include_str!("../../agent/Cargo.toml");
         assert!(agent.contains("qbdi-static"));
         assert!(agent.contains("qbdi/link"));

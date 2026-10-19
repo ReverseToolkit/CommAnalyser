@@ -53,4 +53,15 @@ mod tests {
         let rc = unsafe { super::agent_main(std::ptr::null()) };
         assert_eq!(rc, 0);
     }
+
+    #[test]
+    fn clear_cache_emits_aarch64_ops_not_the_builtin() {
+        let src = include_str!("../clear_cache.c");
+        assert!(
+            !src.contains("__builtin___clear_cache"),
+            "the builtin calls this symbol and overflows the JS worker stack"
+        );
+        assert!(src.contains("dc cvau"), "D-cache clean to PoU");
+        assert!(src.contains("ic ivau"), "I-cache invalidate");
+    }
 }

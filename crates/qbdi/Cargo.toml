@@ -8,15 +8,10 @@ rust-version.workspace = true
 
 [features]
 default = []
-link = ["dep:gum", "dep:flate2", "dep:inject"]
+link = ["dep:gum"]
 
 [dependencies]
 runtime.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 gum = { workspace = true, optional = true }
-flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
-inject = { workspace = true, optional = true }
-
-[build-dependencies]
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

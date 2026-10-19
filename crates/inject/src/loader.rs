@@ -230,12 +230,18 @@ impl MappedLibrary {
     /// # Errors
     /// Returns parse, mmap, relocation, or constructor errors.
     pub fn load(bytes: &[u8], resolve: impl FnMut(&str) -> Result<u64>) -> Result<Self> {
-        Self::load_with(bytes, resolve, true, true)
+        Self::load_with(bytes, resolve, true, true, cfg!(target_arch = "aarch64"))
     }
 
-    /// Map `bytes` without constructors or IFUNC resolvers (app-domain TAL).
-    pub fn load_no_init(bytes: &[u8], resolve: impl FnMut(&str) -> Result<u64>) -> Result<Self> {
-        Self::load_with(bytes, resolve, false, false)
+    /// Map `bytes` with explicit constructor, IFUNC, and BTI policy.
+    pub fn load_with_policy(
+        bytes: &[u8],
+        resolve: impl FnMut(&str) -> Result<u64>,
+        run_ctors: bool,
+        call_ifuncs: bool,
+        bti: bool,
+    ) -> Result<Self> {
+        Self::load_with(bytes, resolve, run_ctors, call_ifuncs, bti)
     }
 
     fn load_with(
@@ -243,6 +249,7 @@ impl MappedLibrary {
         mut resolve: impl FnMut(&str) -> Result<u64>,
         run_ctors: bool,
         call_ifuncs: bool,
+        bti: bool,
     ) -> Result<Self> {
         let image = Image::parse(bytes)?;
         let page = runtime::process::page_size();
@@ -270,7 +277,7 @@ impl MappedLibrary {
                 }
             },
         )?;
-        protect_segments(map, load_start, page, &image)?;
+        protect_segments(map, load_start, page, &image, bti)?;
         if run_ctors {
             run_local_inits(map, load_start, &image)?;
         }
@@ -443,8 +450,13 @@ pub fn prot_from_flags(flags: u32, bti: bool) -> i32 {
     prot
 }
 
-fn protect_segments(map: usize, load_start: u64, page: usize, image: &Image) -> Result<()> {
-    let bti = cfg!(target_arch = "aarch64");
+fn protect_segments(
+    map: usize,
+    load_start: u64,
+    page: usize,
+    image: &Image,
+    bti: bool,
+) -> Result<()> {
     for segment in &image.segments {
         let start = align_down(map as u64 + segment.vaddr - load_start, page as u64) as usize;
         let end = align_up(
