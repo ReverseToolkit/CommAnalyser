@@ -8,9 +8,10 @@ rust-version.workspace = true
 
 [features]
 default = []
-link = []
+link = ["dep:gum"]
 
 [dependencies]
 runtime.workspace = true
 libc.workspace = true
 thiserror.workspace = true
+gum = { workspace = true, optional = true }

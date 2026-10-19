@@ -671,6 +671,7 @@ pub fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>>) -> J
     install_script_and_file(ctx)?;
     crate::writer::install(ctx)?;
     crate::extras::install(ctx)?;
+    crate::trace::install(ctx)?;
     let instruction = Object::new(ctx.clone())?;
     instruction.set("parse", Func::from(crate::instruction::parse))?;
     ctx.globals().set("Instruction", instruction)?;

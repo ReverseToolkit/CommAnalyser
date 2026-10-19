@@ -8,6 +8,7 @@ mod elf;
 mod extras;
 mod instruction;
 mod java;
+mod trace;
 mod worker;
 mod writer;
 
@@ -566,6 +567,23 @@ mod api_tests {
             "#
         );
         assert_eq!(rt.eval(&script).unwrap(), "ok");
+    }
+
+    #[test]
+    fn trace_function_exists_and_errors_without_qbdi() {
+        let rt = ScriptRuntime::new().unwrap();
+        assert_eq!(rt.eval("typeof Trace").unwrap(), "object");
+        assert_eq!(rt.eval("typeof Trace.function").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Trace.exclude").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Trace.takeEvents").unwrap(), "function");
+        assert_eq!(rt.eval("Trace.takeEvents().length").unwrap(), "0");
+        rt.eval("Trace.exclude('libc.so')").unwrap();
+        let err = rt
+            .eval("Trace.function(ptr('0x1000'), { events: ['inst', 'mem'], exclude: ['libfoo.so'] })")
+            .unwrap_err();
+        assert!(err.to_string().contains("QBDI is not linked"), "{err}");
+        let err2 = rt.eval("Trace.function(ptr('0x2000'))").unwrap_err();
+        assert!(err2.to_string().contains("QBDI is not linked"), "{err2}");
     }
 
     #[test]
