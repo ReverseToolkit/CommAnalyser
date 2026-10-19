@@ -1802,6 +1802,25 @@ pub fn android_version() -> Result<String> {
     }
 }
 
+/// Load libopenjdkjvmti before any ArtMethod hook.
+///
+/// JVMTI plugin init walks every class and CAS-writes entrypoints
+/// (`Instrumentation::UpdateEntrypointsForDebuggable`).  That faults on
+/// read-only boot.art if we have already patched a boot image method.
+pub fn warm_jvmti() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static READY: AtomicBool = AtomicBool::new(false);
+    if READY.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if !ensure_plugin_call()? {
+        return Err(Error::Unsupported("EnsurePluginLoaded failed"));
+    }
+    let _ = jvmti_env_handle()?;
+    READY.store(true, Ordering::Release);
+    Ok(())
+}
+
 pub fn ensure_plugin_call() -> Result<bool> {
     let vm = JavaVm::get()?;
     let raw_vm = vm.vm_raw();

@@ -472,10 +472,6 @@ mod api_tests {
                     if (map.findName(Process.mainModule.base) !== Process.mainModule.name) return 'map-name';
                     const frames = Thread.backtrace();
                     if (!(frames instanceof Array)) return 'backtrace';
-                    Thread.setHardwareBreakpoint(0, buf);
-                    Thread.unsetHardwareBreakpoint(0);
-                    Thread.setHardwareWatchpoint(0, buf, 8);
-                    Thread.unsetHardwareWatchpoint(0);
                     if (buf.toJSON() !== buf.toString()) return 'toJSON';
                     if (buf.toMatchPattern().split(' ').length !== 8) return 'pattern';
                     const stripped = buf.strip();

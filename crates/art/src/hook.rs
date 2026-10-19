@@ -91,7 +91,10 @@ pub fn install(method: MethodId, dispatcher: usize, id: usize) -> Result<JavaHoo
     let original_flags = read_u32(art_method + ACCESS_FLAGS_OFFSET);
     let original_data = read_pointer(art_method + DATA_OFFSET);
     let native_trampoline = generic_jni_trampoline().unwrap_or(0);
-    let native_mode = native_trampoline != 0;
+    // Only JNI methods use the generic JNI stub + ACC_NATIVE rewrite.
+    // Marking a Java method native poisons JIT callers; later JVMTI heap
+    // walks (Java.choose) then abort the process.
+    let native_mode = native_trampoline != 0 && (original_flags & ACC_NATIVE) != 0;
     let hook = JavaHook {
         art_method,
         original,

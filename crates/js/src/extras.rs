@@ -20,8 +20,6 @@ thread_local! {
     static TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
     static NEXT_TIMER: Cell<u32> = const { Cell::new(1) };
     static RECV: RefCell<Option<Arc<RecvQueue>>> = const { RefCell::new(None) };
-    static HW_BREAK: RefCell<Vec<(u32, u64)>> = const { RefCell::new(Vec::new()) };
-    static HW_WATCH: RefCell<Vec<(u32, u64)>> = const { RefCell::new(Vec::new()) };
 }
 
 struct Timer {
@@ -574,30 +572,6 @@ impl<'js> IntoJsLocal<'js> for String {
         use rquickjs::IntoJs;
         self.into_js(ctx)
     }
-}
-
-pub fn hw_set_breakpoint(id: u32, address: u64) {
-    HW_BREAK.with(|slot| {
-        let mut table = slot.borrow_mut();
-        table.retain(|(existing, _)| *existing != id);
-        table.push((id, address));
-    });
-}
-
-pub fn hw_unset_breakpoint(id: u32) {
-    HW_BREAK.with(|slot| slot.borrow_mut().retain(|(existing, _)| *existing != id));
-}
-
-pub fn hw_set_watchpoint(id: u32, address: u64) {
-    HW_WATCH.with(|slot| {
-        let mut table = slot.borrow_mut();
-        table.retain(|(existing, _)| *existing != id);
-        table.push((id, address));
-    });
-}
-
-pub fn hw_unset_watchpoint(id: u32) {
-    HW_WATCH.with(|slot| slot.borrow_mut().retain(|(existing, _)| *existing != id));
 }
 
 pub fn load_module(path: &str) -> runtime::Result<module::Module> {

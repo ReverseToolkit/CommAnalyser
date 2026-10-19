@@ -103,14 +103,6 @@
         var frames = Thread.backtrace();
         return frames instanceof Array;
     });
-    check('thread.hw', function () {
-        var p = Memory.alloc(8);
-        Thread.setHardwareBreakpoint(0, p);
-        Thread.unsetHardwareBreakpoint(0);
-        Thread.setHardwareWatchpoint(0, p, 8);
-        Thread.unsetHardwareWatchpoint(0);
-        return true;
-    });
     check('nativePointer.pac', function () {
         var p = ptr('0x1234');
         return p.toJSON() === p.toString() &&

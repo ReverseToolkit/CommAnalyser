@@ -1756,30 +1756,6 @@ fn thread_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
             },
         ),
     )?;
-    obj.set(
-        "setHardwareBreakpoint",
-        Func::from(|id: u32, address: Value<'js>| -> JsResult<()> {
-            crate::extras::hw_set_breakpoint(id, parse_pointer(&address)?);
-            Ok(())
-        }),
-    )?;
-    obj.set(
-        "unsetHardwareBreakpoint",
-        Func::from(|id: u32| crate::extras::hw_unset_breakpoint(id)),
-    )?;
-    obj.set(
-        "setHardwareWatchpoint",
-        Func::from(
-            |id: u32, address: Value<'js>, _size: rquickjs::function::Opt<u32>| -> JsResult<()> {
-                crate::extras::hw_set_watchpoint(id, parse_pointer(&address)?);
-                Ok(())
-            },
-        ),
-    )?;
-    obj.set(
-        "unsetHardwareWatchpoint",
-        Func::from(|id: u32| crate::extras::hw_unset_watchpoint(id)),
-    )?;
     Ok(obj)
 }
 

@@ -291,6 +291,7 @@ fn vm_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
 
 fn perform<'js>(_ctx: Ctx<'js>, function: Function<'js>) -> JsResult<Value<'js>> {
     require_vm()?;
+    let _ = art::java::warm_jvmti();
     function.call::<_, Value<'js>>(())
 }
 
