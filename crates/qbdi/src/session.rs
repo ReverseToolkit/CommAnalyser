@@ -90,7 +90,14 @@ impl TraceConfig {
     }
 
     pub fn should_stop(&self, pc: u64) -> bool {
-        self.until == Some(pc) || self.escapes.iter().any(|escape| escape.break_at == pc)
+        let pc = pc & 0x0000_FFFF_FFFF_FFFF;
+        self.until
+            .map(|until| until & 0x0000_FFFF_FFFF_FFFF)
+            .is_some_and(|until| until == pc)
+            || self
+                .escapes
+                .iter()
+                .any(|escape| (escape.break_at & 0x0000_FFFF_FFFF_FFFF) == pc)
     }
 }
 

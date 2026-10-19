@@ -94,4 +94,22 @@ mod tests {
         assert!(agent.contains("qbdi-static"));
         assert!(agent.contains("qbdi/link"));
     }
+
+    #[test]
+    fn engine_follows_tal_door() {
+        let engine = include_str!("engine.rs");
+        assert!(
+            engine.contains("syn_reg_gum"),
+            "TAL copies Gum GPR into QBDI"
+        );
+        assert!(engine.contains("qbdi_getGPRState"));
+        assert!(engine.contains("qbdi_run"), "TAL uses VM::run, not callA");
+        assert!(
+            !engine.contains("qbdi_callA"),
+            "callA requires a virtual stack and overwrites live LR/SP"
+        );
+        assert!(engine.contains("InlineHook"), "TAL gum_attach door");
+        assert!(engine.contains("1 << 24"), "TAL 16MiB host stack");
+        assert!(engine.contains("GPR SP is 0"), "refuse to run with SP==0");
+    }
 }
