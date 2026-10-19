@@ -264,11 +264,27 @@ fn make_host_callback_stub(dispatcher: usize, id: usize) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    unsafe extern "C" fn ret_f64() -> f64 {
+        1.25
+    }
+
+    unsafe extern "C" fn ret_f32() -> f32 {
+        0.25
+    }
+
     #[test]
     fn stub_encodings_are_arm64() {
         // The stub is generated in make_stub(); this test only documents that
         // call() rejects trivial misuse before touching the target.
         let err = unsafe { super::call(0, &[]) }.unwrap_err();
         assert!(matches!(err, runtime::Error::Parse(_)));
+    }
+
+    #[test]
+    fn call_float_and_double_returns() {
+        let d = unsafe { super::call_f64(ret_f64 as *const () as usize, &[]) }.unwrap();
+        assert_eq!(d, 1.25);
+        let f = unsafe { super::call_f32(ret_f32 as *const () as usize, &[]) }.unwrap();
+        assert_eq!(f, 0.25);
     }
 }

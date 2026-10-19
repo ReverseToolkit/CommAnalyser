@@ -739,6 +739,17 @@ mod tests {
     }
 
     #[test]
+    fn set_timeout_fires_on_worker_after_delay() {
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        worker
+            .eval("globalThis.__delayed = 0; setTimeout(function () { __delayed = 1; }, 25); 'queued'")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(worker.eval("String(__delayed)").unwrap(), "1");
+    }
+
+    #[test]
     fn interceptor_frida_api_and_detach() {
         let (events, _received) = std::sync::mpsc::channel();
         let worker = JsWorker::spawn(events).unwrap();

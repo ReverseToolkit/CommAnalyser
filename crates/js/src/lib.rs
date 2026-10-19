@@ -438,49 +438,62 @@ mod api_tests {
                     const needle = ptr('0x1122334455667788');
                     buf.writePointer(needle);
                     const prot = Memory.queryProtection(buf);
-                    if (typeof prot !== 'string' || prot.length < 3) return 'prot:' + prot;
+                    if (prot[0] !== 'r') return 'prot:' + prot;
                     const u16 = Memory.allocUtf16String('ab');
                     if (u16.readU16() !== 0x61) return 'utf16';
                     const hits = Memory.findPointers(buf, 16, [needle]);
-                    if (!hits.length) return 'findPointers';
+                    if (hits[0].compare(buf) !== 0) return 'findPointers';
                     let scanned = 0;
+                    let matchAddr = null;
                     Memory.scan(buf, 16, '88 77 66 55', {
-                        onMatch: function () { scanned++; },
+                        onMatch: function (address, size) {
+                            scanned++;
+                            matchAddr = address;
+                            if (size !== 4) return 'stop';
+                        },
                         onComplete: function () {}
                     });
-                    if (scanned < 1) return 'scan';
+                    if (scanned !== 1 || matchAddr.compare(buf) !== 0) return 'scan';
+                    const sync = Memory.scanSync(buf, 16, '88 77 66 55');
+                    if (sync[0].address.compare(buf) !== 0) return 'scanSync';
                     if (!Process.mainModule || typeof Process.mainModule.name !== 'string') return 'mainModule';
                     if (!Process.findModuleByAddress(Process.mainModule.base)) return 'findModuleByAddress';
-                    if (!Process.enumerateThreads().length) return 'threads';
+                    if (!Process.enumerateThreads().some(t => t.id === Process.getCurrentThreadId())) return 'threads';
+                    const range = Process.findRangeByAddress(Process.mainModule.base);
+                    if (!range || range.base.compare(Process.mainModule.base) > 0) return 'findRange';
                     if (!Process.enumerateRanges('r--').length) return 'ranges';
-                    if (typeof Process.setExceptionHandler !== 'function') return 'exhandler';
-                    const libc = Process.findModuleByName(Process.mainModule.name);
-                    if (!libc.enumerateSections().length) return 'sections';
-                    try { libc.ensureInitialized(); } catch (e) {}
+                    Process.setExceptionHandler(null);
+                    const main = Process.findModuleByName(Process.mainModule.name);
+                    if (!main.enumerateSections().some(s => s.name === '.text' || s.name.length > 0)) return 'sections';
+                    if (!main.enumerateRanges().length) return 'mod-ranges';
+                    try { main.ensureInitialized(); } catch (e) {}
                     const map = new ModuleMap();
                     if (!map.has(Process.mainModule.base)) return 'modulemap';
+                    if (map.findName(Process.mainModule.base) !== Process.mainModule.name) return 'map-name';
                     const frames = Thread.backtrace();
                     if (!(frames instanceof Array)) return 'backtrace';
                     Thread.setHardwareBreakpoint(0, buf);
                     Thread.unsetHardwareBreakpoint(0);
                     Thread.setHardwareWatchpoint(0, buf, 8);
                     Thread.unsetHardwareWatchpoint(0);
-                    if (typeof buf.toJSON() !== 'string') return 'toJSON';
+                    if (buf.toJSON() !== buf.toString()) return 'toJSON';
                     if (buf.toMatchPattern().split(' ').length !== 8) return 'pattern';
-                    if (buf.strip().isNull()) return 'strip';
-                    buf.sign();
-                    buf.blend(1);
+                    const stripped = buf.strip();
+                    if ((stripped.compare(buf) !== 0) && stripped.isNull()) return 'strip';
+                    if (buf.blend(1).compare(buf) === 0) return 'blend';
                     const vol = buf.readVolatile(8);
                     buf.writeVolatile(vol);
-                    if (typeof setInterval !== 'function' || typeof clearTimeout !== 'function') return 'timers';
+                    if (buf.readPointer().compare(needle) !== 0) return 'volatile';
                     setTimeout(function () { globalThis.__timerHit = 1; }, 0);
-                    if (typeof File.readAllBytes !== 'function') return 'file';
-                    if (typeof File.SEEK_SET !== 'number') return 'seek';
-                    if (typeof recv !== 'function') return 'recv';
+                    const id = setInterval(function () { globalThis.__intervalHit = 1; }, 0);
+                    clearInterval(id);
                     if (typeof SystemFunction !== 'function') return 'system';
-                    if (typeof DebugSymbol.fromAddress !== 'function') return 'debug';
                     const malloc = DebugSymbol.fromName('malloc');
                     if (malloc.address.isNull()) return 'debug-name';
+                    const fromAddr = DebugSymbol.fromAddress(malloc.address);
+                    if (fromAddr.address.compare(malloc.address) !== 0) return 'debug-addr';
+                    const named = DebugSymbol.findFunctionsNamed('malloc');
+                    if (!named.length) return 'debug-named';
                     const writer = new Arm64Writer(Memory.alloc(16));
                     writer.putBrkImm(1);
                     writer.flush();
@@ -492,6 +505,71 @@ mod api_tests {
             .unwrap();
         assert_eq!(result, "ok");
         assert_eq!(rt.eval("String(__timerHit)").unwrap(), "1");
+    }
+
+    #[test]
+    fn file_read_write_roundtrip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("ca-gumjs-file.txt");
+        let path_js = path.to_string_lossy().replace('\\', "\\\\");
+        let rt = ScriptRuntime::new().unwrap();
+        let script = format!(
+            r#"
+            (function () {{
+                File.writeAllText("{path_js}", "hello\nworld\n");
+                if (File.readAllText("{path_js}") !== "hello\nworld\n") return 'readAllText';
+                const bytes = File.readAllBytes("{path_js}");
+                if (bytes.byteLength !== 12) return 'readAllBytes:' + bytes.byteLength;
+                File.writeAllBytes("{path_js}", bytes);
+                const f = new File("{path_js}", "r");
+                const line = f.readLine();
+                if (line.indexOf("hello") < 0) return 'readLine:' + line;
+                const pos = f.tell();
+                f.seek(0, File.SEEK_SET);
+                if (f.tell() !== 0) return 'seek';
+                f.close();
+                const w = new File("{path_js}", "w");
+                w.write("z");
+                w.flush();
+                w.close();
+                if (File.readAllText("{path_js}") !== "z") return 'write';
+                const _ = pos;
+                return 'ok';
+            }})()
+            "#
+        );
+        let result = rt.eval(&script).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, "ok");
+    }
+
+    unsafe extern "C" fn native_ret_f64() -> f64 {
+        2.5
+    }
+
+    unsafe extern "C" fn native_ret_f32() -> f32 {
+        0.5
+    }
+
+    #[test]
+    fn native_function_float_and_double_returns() {
+        let rt = ScriptRuntime::new().unwrap();
+        let f64_addr = native_ret_f64 as *const () as usize;
+        let f32_addr = native_ret_f32 as *const () as usize;
+        let script = format!(
+            r#"
+            (function () {{
+                const d = new NativeFunction(ptr("0x{f64_addr:x}"), "double", []);
+                if (d() !== 2.5) return "double:" + d();
+                const f = new NativeFunction(ptr("0x{f32_addr:x}"), "float", []);
+                if (f() !== 0.5) return "float:" + f();
+                const sys = new SystemFunction(ptr("0x{f64_addr:x}"), "double", []);
+                if (sys() !== 2.5) return "system";
+                return "ok";
+            }})()
+            "#
+        );
+        assert_eq!(rt.eval(&script).unwrap(), "ok");
     }
 
     #[test]

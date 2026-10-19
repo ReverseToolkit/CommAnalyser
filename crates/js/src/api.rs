@@ -1632,7 +1632,7 @@ fn process_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
     )?;
     obj.set(
         "setExceptionHandler",
-        Func::from(|_callback: rquickjs::function::Opt<Function<'js>>| {}),
+        Func::from(|_callback: rquickjs::function::Opt<Value<'js>>| {}),
     )?;
     obj.set(
         "attachThreadObserver",
