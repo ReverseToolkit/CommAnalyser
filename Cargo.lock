@@ -10,6 +10,7 @@ dependencies = [
  "gum",
  "js",
  "libc",
+ "qbdi",
  "runtime",
  "serde_json",
 ]
@@ -363,6 +364,7 @@ dependencies = [
  "goblin",
  "gum",
  "libc",
+ "qbdi",
  "rquickjs",
  "runtime",
  "thiserror",
@@ -459,6 +461,7 @@ dependencies = [
 name = "qbdi"
 version = "0.1.0"
 dependencies = [
+ "gum",
  "libc",
  "runtime",
  "thiserror",
