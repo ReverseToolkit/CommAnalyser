@@ -227,12 +227,15 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
         "#,
     )?;
 
+    let available = art::java::vm_available();
     let java = Object::new(ctx.clone())?;
-    java.set("available", true)?;
+    java.set("available", available)?;
     java.set("perform", Func::from(perform))?;
     java.set("performNow", Func::from(perform))?;
-    if let Ok(version) = art::java::android_version() {
-        java.set("androidVersion", version)?;
+    if available {
+        if let Ok(version) = art::java::android_version() {
+            java.set("androidVersion", version)?;
+        }
     }
     java.set("use", Func::from(use_class))?;
     java.set("array", Func::from(make_array))?;
@@ -247,15 +250,50 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
         Func::from(enumerate_loaded_classes),
     )?;
     java.set("choose", Func::from(choose))?;
+    java.set("ClassFactory", Func::from(class_factory))?;
+    java.set("classFactory", class_factory(ctx.clone())?)?;
+    java.set("vm", vm_object(ctx)?)?;
     ctx.globals().set("Java", java)?;
     Ok(())
 }
 
+fn require_vm() -> JsResult<()> {
+    if art::java::vm_available() {
+        Ok(())
+    } else {
+        Err(js_error("Java API not available"))
+    }
+}
+
+fn class_factory<'js>(ctx: Ctx<'js>) -> JsResult<Object<'js>> {
+    let factory = Object::new(ctx.clone())?;
+    factory.set("use", Func::from(use_class))?;
+    factory.set("choose", Func::from(choose))?;
+    factory.set("cast", Func::from(cast))?;
+    factory.set("retain", Func::from(retain))?;
+    factory.set("array", Func::from(make_array))?;
+    Ok(factory)
+}
+
+fn vm_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
+    let vm = Object::new(ctx.clone())?;
+    let handle = art::java::JavaVm::get()
+        .map(|vm| vm.vm_raw() as u64)
+        .unwrap_or(0);
+    vm.set(
+        "handle",
+        crate::api::NativePointer::instance(ctx.clone(), handle)?,
+    )?;
+    Ok(vm)
+}
+
 fn perform<'js>(_ctx: Ctx<'js>, function: Function<'js>) -> JsResult<Value<'js>> {
+    require_vm()?;
     function.call::<_, Value<'js>>(())
 }
 
 fn use_class<'js>(ctx: Ctx<'js>, name: String) -> JsResult<Object<'js>> {
+    require_vm()?;
     let class = JavaClass::find(&name).map_err(to_js_error)?;
     class_object(ctx, class)
 }
@@ -274,7 +312,7 @@ fn class_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>) -> JsResult<Object<'js
                 let ctor = choose_ctor(&ctor_class, &args.0)?;
                 let java_args = convert_args(&args.0, &ctor.params)?;
                 let method = ctor_method(ctor);
-                let hook = crate::worker::find_java_hook(&ctor_class.info.name, &method);
+                let hook = hook_for_original(&ctor_class.info.name, &method);
                 let object = call_with_hook(hook, || ctor_class.new_object_with(ctor, &java_args))
                     .map_err(to_js_error)?;
                 let id = register(object);
@@ -486,6 +524,16 @@ enum Target {
     Prototype,
 }
 
+fn hook_for_original(
+    class_name: &str,
+    method: &MethodInfo,
+) -> Option<Rc<RefCell<art::hook::JavaHook>>> {
+    if crate::worker::java_impl_depth() == 0 {
+        return None;
+    }
+    crate::worker::find_java_hook(class_name, method)
+}
+
 fn call_with_hook<R>(
     hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
     call: impl FnOnce() -> R,
@@ -517,7 +565,7 @@ fn method_function<'js>(
         move |args: Rest<Value<'js>>| -> JsResult<Value<'js>> {
             let method = choose_method(&methods, &args.0)?;
             let java_args = convert_args(&args.0, &method.params)?;
-            let hook = crate::worker::find_java_hook(&call_class.info.name, method);
+            let hook = hook_for_original(&call_class.info.name, method);
             let value = match &target {
                 Target::Static => {
                     call_with_hook(hook, || call_class.call_static(method, &java_args))
@@ -991,6 +1039,7 @@ fn original_args(
 }
 
 fn enumerate_loaded_classes_sync<'js>(ctx: Ctx<'js>) -> JsResult<Array<'js>> {
+    require_vm()?;
     let names = art::java::enumerate_loaded_classes().map_err(to_js_error)?;
     let result = Array::new(ctx)?;
     for (index, name) in names.into_iter().enumerate() {
@@ -1000,6 +1049,7 @@ fn enumerate_loaded_classes_sync<'js>(ctx: Ctx<'js>) -> JsResult<Array<'js>> {
 }
 
 fn choose<'js>(ctx: Ctx<'js>, class_name: String, callbacks: Object<'js>) -> JsResult<()> {
+    require_vm()?;
     let handles = art::java::choose_class_handles(&class_name).map_err(to_js_error)?;
     let class = JavaClass::find(&class_name).map_err(to_js_error)?;
     let on_match: Function<'js> = callbacks.get("onMatch")?;
@@ -1023,6 +1073,7 @@ fn choose<'js>(ctx: Ctx<'js>, class_name: String, callbacks: Object<'js>) -> JsR
 }
 
 fn enumerate_loaded_classes<'js>(_ctx: Ctx<'js>, callbacks: Object<'js>) -> JsResult<()> {
+    require_vm()?;
     let names = art::java::enumerate_loaded_classes().map_err(to_js_error)?;
     let on_match: Function<'js> = callbacks.get("onMatch")?;
     for name in names {
@@ -1035,6 +1086,7 @@ fn enumerate_loaded_classes<'js>(_ctx: Ctx<'js>, callbacks: Object<'js>) -> JsRe
 }
 
 fn retain<'js>(ctx: Ctx<'js>, value: Value<'js>) -> JsResult<Value<'js>> {
+    require_vm()?;
     let id = java_id(&value).ok_or_else(|| js_error("Java.retain expects a Java object"))?;
     let object = get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
     let cloned = object.recast(object.info.clone()).map_err(to_js_error)?;
@@ -1044,6 +1096,7 @@ fn retain<'js>(ctx: Ctx<'js>, value: Value<'js>) -> JsResult<Value<'js>> {
 }
 
 fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsResult<Value<'js>> {
+    require_vm()?;
     let (object, descriptor) = if type_name == "java.lang.String" {
         let mut strings = Vec::with_capacity(values.len());
         for index in 0..values.len() {
@@ -1104,6 +1157,7 @@ fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsRe
 }
 
 fn cast<'js>(ctx: Ctx<'js>, value: Value<'js>, klass: Value<'js>) -> JsResult<Value<'js>> {
+    require_vm()?;
     let class_name = if let Some(name) = klass.as_string() {
         name.to_string()?
     } else if let Some(wrapper) = klass.as_object() {

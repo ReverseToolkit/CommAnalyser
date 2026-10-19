@@ -55,6 +55,11 @@ impl JavaVm {
     }
 }
 
+/// Whether this process has a live JavaVM (ART).
+pub fn vm_available() -> bool {
+    JavaVm::get().is_ok()
+}
+
 #[derive(Clone, Debug)]
 pub enum Kind {
     Void,

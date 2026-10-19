@@ -104,7 +104,7 @@ impl ScriptRuntime {
                     java_hooks.clone(),
                     event_tx,
                 ),
-                _ => api::install(&ctx),
+                _ => api::install(&ctx, java_hooks.clone()),
             }
             .map_err(js_error)?;
             Ok(())
@@ -262,6 +262,7 @@ impl ScriptRuntime {
         let Some((function, class, method)) = entry else {
             return crate::worker::DispatchResult::default();
         };
+        let _guard = crate::worker::JavaImplGuard::enter();
         self.with_js(|ctx| {
             let Ok(function) = function.restore(&ctx) else {
                 return crate::worker::DispatchResult::default();
@@ -425,16 +426,43 @@ mod api_tests {
     }
 
     #[test]
-    fn java_bridge_is_installed() {
+    fn java_runtime_is_installed() {
         let rt = ScriptRuntime::new().unwrap();
         assert_eq!(rt.eval("typeof Java").unwrap(), "object");
-        assert_eq!(rt.eval("typeof Java.ClassFactory").unwrap(), "function");
-        assert_eq!(rt.eval("typeof Java.vm !== 'undefined'").unwrap(), "true");
-        assert_eq!(rt.eval("typeof Java.perform").unwrap(), "function");
         assert_eq!(rt.eval("typeof Java.use").unwrap(), "function");
-        // Host has no ART, so available is false; the object still comes from
-        // the vendored frida-java-bridge runtime.
+        assert_eq!(rt.eval("typeof Java.perform").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Java.performNow").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Java.choose").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Java.cast").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Java.retain").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Java.array").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Java.vm !== 'undefined'").unwrap(), "true");
+        assert_eq!(rt.eval("typeof Java.ClassFactory").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Java.available").unwrap(), "boolean");
+        // Host has no ART. ACC_PUBLIC is a java-bridge Runtime field; its
+        // absence shows eval installed the Rust Java object.
         assert_eq!(rt.eval("Java.available").unwrap(), "false");
+        assert_eq!(rt.eval("typeof Java.ACC_PUBLIC").unwrap(), "undefined");
+        assert_eq!(
+            rt.eval("typeof __analyser_java_set_impl").unwrap(),
+            "function"
+        );
+        assert_eq!(
+            rt.eval("typeof __analyser_make_java_method").unwrap(),
+            "function"
+        );
+        let use_err = rt.eval("Java.use('java.lang.String')").unwrap_err();
+        assert!(
+            use_err.to_string().contains("Java API not available"),
+            "use: {use_err}"
+        );
+        let perform_err = rt
+            .eval("Java.perform(function () { return 1; })")
+            .unwrap_err();
+        assert!(
+            perform_err.to_string().contains("Java API not available"),
+            "perform: {perform_err}"
+        );
     }
 
     #[test]

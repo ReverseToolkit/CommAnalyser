@@ -25,7 +25,28 @@ thread_local! {
     static JAVA_HOOKS_TLS: RefCell<Option<Rc<RefCell<JavaHookTable>>>> =
         const { RefCell::new(None) };
     static HOOK_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static JAVA_IMPL_DEPTH: Cell<u32> = const { Cell::new(0) };
     static RUNTIME: Cell<*const ScriptRuntime> = const { Cell::new(std::ptr::null()) };
+}
+
+/// How many Java `implementation` callbacks are on this thread's stack.
+pub(crate) fn java_impl_depth() -> u32 {
+    JAVA_IMPL_DEPTH.with(Cell::get)
+}
+
+pub(crate) struct JavaImplGuard;
+
+impl JavaImplGuard {
+    pub(crate) fn enter() -> Self {
+        JAVA_IMPL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for JavaImplGuard {
+    fn drop(&mut self) {
+        JAVA_IMPL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
 }
 
 fn is_js_thread() -> bool {
@@ -135,6 +156,7 @@ pub(crate) enum Job {
     Shutdown,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct JavaImplArgs {
     pub args: [u64; 8],
     pub fargs: [u64; 8],
@@ -462,12 +484,6 @@ pub(crate) extern "C" fn java_dispatch(
     fargs: *const u64,
     stack: *const u64,
 ) -> DispatchResult {
-    if is_js_thread() {
-        return DispatchResult::default();
-    }
-    let Some(tx) = JS_TX.get() else {
-        return DispatchResult::default();
-    };
     let mut saved = [0u64; 8];
     if !args.is_null() {
         // SAFETY: the hook stub passes a pointer to its saved x0-x7.
@@ -563,24 +579,53 @@ pub(crate) extern "C" fn java_dispatch(
             }
         }
     }
-    let (reply, response) = mpsc::channel();
-    if tx
-        .send(Job::JavaImpl {
-            id,
-            args: saved,
-            fargs: float_args,
-            params,
-            stack: stack_args,
-            globals,
-            reply,
+    let call = JavaImplArgs {
+        args: saved,
+        fargs: float_args,
+        params,
+        stack: stack_args,
+        globals,
+    };
+    let hook = JAVA_HOOKS_TLS.with(|slot| {
+        slot.borrow().as_ref().and_then(|table| {
+            table
+                .borrow()
+                .entries
+                .get(id)
+                .and_then(|entry| entry.as_ref().map(|entry| entry.hook.clone()))
         })
-        .is_err()
-    {
-        return DispatchResult::default();
-    }
-    let mut result = response
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap_or_default();
+    });
+    let mut result = if is_js_thread() {
+        let runtime = RUNTIME.with(Cell::get);
+        if runtime.is_null() {
+            DispatchResult::default()
+        } else {
+            // SAFETY: RUNTIME is the live ScriptRuntime on this JS worker.
+            unsafe { (*runtime).run_java_impl(id, call, hook) }
+        }
+    } else {
+        let Some(tx) = JS_TX.get() else {
+            return DispatchResult::default();
+        };
+        let (reply, response) = mpsc::channel();
+        if tx
+            .send(Job::JavaImpl {
+                id,
+                args: saved,
+                fargs: float_args,
+                params,
+                stack: stack_args,
+                globals,
+                reply,
+            })
+            .is_err()
+        {
+            return DispatchResult::default();
+        }
+        response
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_default()
+    };
     if let Some(message) = crate::java::take_java_error() {
         let _ = art::java::throw_runtime_exception(&message);
     }
@@ -616,6 +661,18 @@ mod tests {
         assert_eq!(worker.eval("typeof Java").unwrap(), "object");
         assert_eq!(worker.eval("typeof Java.ClassFactory").unwrap(), "function");
         assert_eq!(worker.eval("typeof Java.perform").unwrap(), "function");
+        assert_eq!(worker.eval("typeof Java.performNow").unwrap(), "function");
+        assert_eq!(worker.eval("typeof Java.use").unwrap(), "function");
+        assert_eq!(worker.eval("typeof Java.choose").unwrap(), "function");
+        assert_eq!(worker.eval("typeof Java.cast").unwrap(), "function");
+        assert_eq!(worker.eval("typeof Java.retain").unwrap(), "function");
+        assert_eq!(worker.eval("typeof Java.array").unwrap(), "function");
+        assert_eq!(
+            worker.eval("typeof Java.vm !== 'undefined'").unwrap(),
+            "true"
+        );
+        assert_eq!(worker.eval("Java.available").unwrap(), "false");
+        assert_eq!(worker.eval("typeof Java.ACC_PUBLIC").unwrap(), "undefined");
         worker
             .eval("rpc.exports.add = (a, b) => a + b; send({hello: 1}); 'ok'")
             .unwrap();

@@ -568,8 +568,8 @@ impl UInt64 {
     }
 }
 
-/// Install `ptr`, `NULL`, `Memory`, `Process`, `Module`, `Thread`.
-pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
+/// Install `ptr`, `NULL`, `Memory`, `Process`, `Module`, `Thread`, and Rust `Java`.
+pub fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>>) -> JsResult<()> {
     let globals = ctx.globals();
     Class::<NativePointer>::define(&globals)?;
     Class::<Retval>::define(&globals)?;
@@ -630,7 +630,7 @@ pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     let instruction = Object::new(ctx.clone())?;
     instruction.set("parse", Func::from(crate::instruction::parse))?;
     ctx.globals().set("Instruction", instruction)?;
-    load_java_bridge(ctx)?;
+    crate::java::install(ctx, java_hooks)?;
     Ok(())
 }
 
@@ -643,7 +643,7 @@ pub(crate) fn install_with_hooks<'js>(
     java_hooks: Rc<RefCell<JavaHookTable>>,
     event_tx: Sender<String>,
 ) -> JsResult<()> {
-    install(ctx)?;
+    install(ctx, java_hooks)?;
     ctx.globals().set(
         "__analyser_send",
         Func::from(move |text: String| {
@@ -759,7 +759,6 @@ pub(crate) fn install_with_hooks<'js>(
         };
         "#,
     )?;
-    let _ = java_hooks;
     Ok(())
 }
 
@@ -823,84 +822,6 @@ fn install_script_and_file<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
             }
             return 0;
         };
-        "#,
-    )?;
-    Ok(())
-}
-
-fn load_java_bridge<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
-    ctx.globals().set(
-        "__analyserChooseHandles",
-        Func::from(
-            |ctx: Ctx<'js>, class_name: String| -> JsResult<Array<'js>> {
-                let handles = art::java::choose_class_handles(&class_name).map_err(to_js_error)?;
-                let array = Array::new(ctx.clone())?;
-                for (index, handle) in handles.into_iter().enumerate() {
-                    array.set(index, NativePointer::instance(ctx.clone(), handle as u64)?)?;
-                }
-                Ok(array)
-            },
-        ),
-    )?;
-    ctx.globals().set(
-        "__analyserEnumerateLoadedClasses",
-        Func::from(|ctx: Ctx<'js>| -> JsResult<Array<'js>> {
-            let names = art::java::enumerate_loaded_classes().map_err(to_js_error)?;
-            let array = Array::new(ctx.clone())?;
-            for (index, name) in names.into_iter().enumerate() {
-                array.set(index, name)?;
-            }
-            Ok(array)
-        }),
-    )?;
-    const BRIDGE: &str = include_str!("../vendor/java-bridge.bundle.js");
-    ctx.eval::<(), _>(BRIDGE)?;
-    ctx.eval::<(), _>(
-        r#"
-        (function () {
-            if (typeof Java === 'undefined' || Java === null) return;
-            const proto = Object.getPrototypeOf(Java);
-            const origChoose = proto.choose;
-            proto.choose = function (specifier, callbacks) {
-                try {
-                    return origChoose.call(this, specifier, callbacks);
-                } catch (error) {
-                    if (!this.available) throw error;
-                    const handles = __analyserChooseHandles(String(specifier));
-                    const factory = this.classFactory;
-                    const env = this.vm.getEnv();
-                    const classWrapper = factory.use(specifier);
-                    try {
-                        for (let i = 0; i < handles.length; i++) {
-                            const instance = factory.cast(handles[i], classWrapper);
-                            if (callbacks.onMatch(instance) === 'stop') break;
-                        }
-                        if (typeof callbacks.onComplete === 'function') {
-                            callbacks.onComplete();
-                        }
-                    } finally {
-                        for (let i = 0; i < handles.length; i++) {
-                            env.deleteGlobalRef(handles[i]);
-                        }
-                    }
-                }
-            };
-            const origEnum = proto.enumerateLoadedClasses;
-            proto.enumerateLoadedClasses = function (callbacks) {
-                try {
-                    return origEnum.call(this, callbacks);
-                } catch (error) {
-                    if (!this.available) throw error;
-                    const names = __analyserEnumerateLoadedClasses();
-                    for (let i = 0; i < names.length; i++) {
-                        callbacks.onMatch(names[i]);
-                    }
-                    if (typeof callbacks.onComplete === 'function') {
-                        callbacks.onComplete();
-                    }
-                }
-            };
-        })();
         "#,
     )?;
     Ok(())
