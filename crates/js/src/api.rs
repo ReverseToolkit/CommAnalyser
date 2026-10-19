@@ -330,7 +330,7 @@ impl Retval {
     }
 }
 
-/// Frida `Int64` (signed 64-bit), used by java-bridge long fields and JVMTI tags.
+/// Frida `Int64` (signed 64-bit).
 #[derive(Clone, Trace, JsLifetime)]
 #[rquickjs::class]
 pub struct Int64 {
@@ -626,7 +626,6 @@ pub fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>>) -> J
     )?;
     install_script_and_file(ctx)?;
     crate::writer::install(ctx)?;
-    crate::artctl::install(ctx)?;
     let instruction = Object::new(ctx.clone())?;
     instruction.set("parse", Func::from(crate::instruction::parse))?;
     ctx.globals().set("Instruction", instruction)?;

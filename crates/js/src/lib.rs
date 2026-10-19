@@ -4,7 +4,6 @@
 //! Frida API objects are added incrementally in later milestones.
 
 mod api;
-mod artctl;
 mod elf;
 mod instruction;
 mod java;
