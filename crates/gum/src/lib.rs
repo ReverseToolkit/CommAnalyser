@@ -7,6 +7,7 @@ pub mod hook;
 pub mod interceptor;
 pub mod memory;
 pub mod native;
+pub mod replace;
 
 pub use arch_arm64 as arch;
 pub use runtime::{module, process, thread};
@@ -15,3 +16,4 @@ pub use runtime::{Error, Result};
 pub use hook::{HookCallback, InlineHook, SavedRegs};
 pub use interceptor::{HookListener, Interceptor, InvocationContext};
 pub use memory::{alloc, free, patch_code, protect, read, write};
+pub use replace::{original_trampoline, replace, revert};

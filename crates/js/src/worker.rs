@@ -25,6 +25,7 @@ thread_local! {
     static JAVA_HOOKS_TLS: RefCell<Option<Rc<RefCell<JavaHookTable>>>> =
         const { RefCell::new(None) };
     static HOOK_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static RUNTIME: Cell<*const ScriptRuntime> = const { Cell::new(std::ptr::null()) };
 }
 
 fn is_js_thread() -> bool {
@@ -40,7 +41,7 @@ pub(crate) struct Listener {
 /// All listeners for one target address, plus the single inline hook.
 pub(crate) struct HookGroup {
     pub(crate) target: usize,
-    pub(crate) listeners: Vec<Listener>,
+    pub(crate) listeners: Vec<Option<Listener>>,
     pub(crate) hook: Option<InlineHook>,
     pub(crate) bridge: *mut HookBridge,
 }
@@ -48,6 +49,8 @@ pub(crate) struct HookGroup {
 #[derive(Default)]
 pub(crate) struct HookTable {
     pub(crate) groups: Vec<HookGroup>,
+    /// Stable ids for `listener.detach()`.  Slot `None` is a detached listener.
+    pub(crate) listener_ids: Vec<Option<(usize, usize)>>,
 }
 
 pub(crate) struct HookBridge {
@@ -201,6 +204,46 @@ impl JsWorker {
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| Error::Unsupported("JS worker timed out"))?
     }
+
+    pub(crate) fn fire_enter(
+        &self,
+        group: usize,
+        target: usize,
+        regs: SavedRegs,
+    ) -> Result<SavedRegs> {
+        let (reply, response) = mpsc::channel();
+        self.tx
+            .send(Job::Enter {
+                group,
+                target,
+                regs,
+                reply,
+            })
+            .map_err(|_| Error::Unsupported("JS worker stopped"))?;
+        response
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| Error::Unsupported("JS worker timed out"))
+    }
+
+    pub(crate) fn fire_leave(
+        &self,
+        group: usize,
+        target: usize,
+        regs: SavedRegs,
+    ) -> Result<SavedRegs> {
+        let (reply, response) = mpsc::channel();
+        self.tx
+            .send(Job::Leave {
+                group,
+                target,
+                regs,
+                reply,
+            })
+            .map_err(|_| Error::Unsupported("JS worker stopped"))?;
+        response
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| Error::Unsupported("JS worker timed out"))
+    }
 }
 
 impl Drop for JsWorker {
@@ -229,6 +272,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
             return;
         }
     };
+    RUNTIME.with(|slot| slot.set(&runtime as *const ScriptRuntime));
 
     while let Ok(job) = rx.recv() {
         match job {
@@ -295,7 +339,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
 
 /// Trampoline for `Interceptor.attach` onEnter.
 pub(crate) unsafe extern "C" fn hook_enter(regs: *mut SavedRegs, data: *mut std::ffi::c_void) {
-    if regs.is_null() || data.is_null() || is_js_thread() {
+    if regs.is_null() || data.is_null() {
         return;
     }
     if HOOK_ACTIVE.with(Cell::get) {
@@ -305,6 +349,15 @@ pub(crate) unsafe extern "C" fn hook_enter(regs: *mut SavedRegs, data: *mut std:
 
     // SAFETY: `data` points to a HookBridge kept alive by HookGroup.
     let bridge = unsafe { &*(data as *const HookBridge) };
+    if is_js_thread() {
+        let runtime = RUNTIME.with(Cell::get);
+        if !runtime.is_null() {
+            let updated = unsafe { (*runtime).run_enter(bridge.group, bridge.target, *regs) };
+            unsafe { *regs = updated };
+        }
+        HOOK_ACTIVE.with(|flag| flag.set(false));
+        return;
+    }
     let (reply, response) = mpsc::channel();
     if bridge
         .tx
@@ -327,7 +380,7 @@ pub(crate) unsafe extern "C" fn hook_enter(regs: *mut SavedRegs, data: *mut std:
 
 /// Trampoline for `Interceptor.attach` onLeave.
 pub(crate) unsafe extern "C" fn hook_leave(regs: *mut SavedRegs, data: *mut std::ffi::c_void) {
-    if regs.is_null() || data.is_null() || is_js_thread() {
+    if regs.is_null() || data.is_null() {
         return;
     }
     if HOOK_ACTIVE.with(Cell::get) {
@@ -337,6 +390,15 @@ pub(crate) unsafe extern "C" fn hook_leave(regs: *mut SavedRegs, data: *mut std:
 
     // SAFETY: `data` points to a HookBridge kept alive by HookGroup.
     let bridge = unsafe { &*(data as *const HookBridge) };
+    if is_js_thread() {
+        let runtime = RUNTIME.with(Cell::get);
+        if !runtime.is_null() {
+            let updated = unsafe { (*runtime).run_leave(bridge.group, bridge.target, *regs) };
+            unsafe { *regs = updated };
+        }
+        HOOK_ACTIVE.with(|flag| flag.set(false));
+        return;
+    }
     let (reply, response) = mpsc::channel();
     if bridge
         .tx
@@ -359,15 +421,22 @@ pub(crate) unsafe extern "C" fn hook_leave(regs: *mut SavedRegs, data: *mut std:
 
 /// Dispatcher embedded in every NativeCallback stub.
 pub(crate) extern "C" fn callback_dispatch(id: usize, args: *const u64) -> u64 {
-    if args.is_null() || is_js_thread() {
+    if args.is_null() {
         return 0;
+    }
+    let mut raw = [0u64; 8];
+    // SAFETY: the callback stub guarantees a pointer to eight x-registers.
+    unsafe { std::ptr::copy_nonoverlapping(args, raw.as_mut_ptr(), 8) };
+    if is_js_thread() {
+        let runtime = RUNTIME.with(Cell::get);
+        if runtime.is_null() {
+            return 0;
+        }
+        return unsafe { (*runtime).run_callback(id, raw) };
     }
     let Some(tx) = JS_TX.get() else {
         return 0;
     };
-    let mut raw = [0u64; 8];
-    // SAFETY: the callback stub guarantees a pointer to eight x-registers.
-    unsafe { std::ptr::copy_nonoverlapping(args, raw.as_mut_ptr(), 8) };
     let (reply, response) = mpsc::channel();
     if tx
         .send(Job::Callback {
@@ -528,6 +597,7 @@ pub(crate) fn make_bridge(group: usize, target: usize, tx: Sender<Job>) -> *mut 
 #[cfg(test)]
 mod tests {
     use super::JsWorker;
+    use gum::SavedRegs;
 
     #[test]
     fn evaluates_on_worker() {
@@ -537,11 +607,178 @@ mod tests {
         assert_eq!(worker.eval("typeof Interceptor").unwrap(), "object");
         assert_eq!(worker.eval("typeof NativeFunction").unwrap(), "function");
         assert_eq!(worker.eval("typeof NativeCallback").unwrap(), "function");
+        assert_eq!(
+            worker
+                .eval("!new NativeCallback(function (p) { return p; }, 'pointer', ['pointer']).isNull()")
+                .unwrap(),
+            "true"
+        );
         assert_eq!(worker.eval("typeof Java").unwrap(), "object");
-        assert_eq!(worker.eval("Java.available").unwrap(), "true");
+        assert_eq!(worker.eval("typeof Java.ClassFactory").unwrap(), "function");
+        assert_eq!(worker.eval("typeof Java.perform").unwrap(), "function");
         worker
             .eval("rpc.exports.add = (a, b) => a + b; send({hello: 1}); 'ok'")
             .unwrap();
         assert_eq!(worker.rpc("add", "[1, 2]").unwrap(), "3");
+    }
+
+    #[test]
+    fn arm64_writer_relocator_roundtrip() {
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        let result = worker
+            .eval(
+                r#"
+                (function () {
+                    const buf = Memory.alloc(256);
+                    const writer = new Arm64Writer(buf, { pc: buf });
+                    writer.putPushAllXRegisters();
+                    writer.putCallAddressWithArguments(ptr(0x1000), ['x0']);
+                    writer.putPopAllXRegisters();
+                    writer.putLabel('done');
+                    writer.putBLabel('done');
+                    writer.putRet();
+                    writer.flush();
+                    const relocator = new Arm64Relocator(buf, writer);
+                    if (typeof relocator.dispose !== 'function') return 'reloc-dispose';
+                    const offset = relocator.readOne();
+                    if (!(offset > 0)) return 'reloc-offset:' + offset;
+                    if (!relocator.input || typeof relocator.input.mnemonic !== 'string') {
+                        return 'reloc-input';
+                    }
+                    relocator.writeAll();
+                    relocator.dispose();
+                    writer.dispose();
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn interceptor_frida_api_and_detach() {
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        let result = worker
+            .eval(
+                r#"
+                (function () {
+                    if (typeof Interceptor.attach !== 'function') return 'attach';
+                    if (typeof Interceptor.replace !== 'function') return 'replace';
+                    if (typeof Interceptor.revert !== 'function') return 'revert';
+                    if (typeof Interceptor.flush !== 'function') return 'flush';
+                    if (typeof Interceptor.detachAll !== 'function') return 'detachAll';
+                    const page = Memory.alloc(Process.pageSize);
+                    Memory.protect(page, Process.pageSize, 'rwx');
+                    page.writeU32(0xd503201f);
+                    page.add(4).writeU32(0xd503201f);
+                    page.add(8).writeU32(0xd503201f);
+                    page.add(12).writeU32(0xd503201f);
+                    const listener = Interceptor.attach(page, {
+                        onEnter: function () {},
+                        onLeave: function () {}
+                    });
+                    if (typeof listener.detach !== 'function') return 'listener-detach';
+                    const after = page.readU32() >>> 0;
+                    if ((after & 0xfc000000) !== 0x14000000) return 'patch:' + after.toString(16);
+                    listener.detach();
+                    const restored = page.readU32() >>> 0;
+                    if (restored !== 0xd503201f) return 'restored:' + restored.toString(16);
+                    const l2 = Interceptor.attach(page, { onEnter: function () {} });
+                    const again = page.readU32() >>> 0;
+                    if ((again & 0xfc000000) !== 0x14000000) return 'reattach:' + again.toString(16);
+                    Interceptor.detachAll();
+                    Interceptor.flush();
+                    const afterAll = page.readU32() >>> 0;
+                    if (afterAll !== 0xd503201f) return 'detachAll:' + afterAll.toString(16);
+                    const l3 = Interceptor.attach(page, { onEnter: function () {} });
+                    const againAll = page.readU32() >>> 0;
+                    if ((againAll & 0xfc000000) !== 0x14000000) {
+                        return 'reattachAll:' + againAll.toString(16);
+                    }
+                    Interceptor.detachAll();
+                    const afterAll2 = page.readU32() >>> 0;
+                    if (afterAll2 !== 0xd503201f) return 'detachAll2:' + afterAll2.toString(16);
+                    const _ = l2;
+                    const __ = l3;
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn interceptor_enter_rewrites_args_and_leave_replaces_retval() {
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        let addr = worker
+            .eval(
+                r#"
+                (function () {
+                    const page = Memory.alloc(Process.pageSize);
+                    Memory.protect(page, Process.pageSize, 'rwx');
+                    page.writeU32(0xd503201f);
+                    page.add(4).writeU32(0xd503201f);
+                    page.add(8).writeU32(0xd503201f);
+                    page.add(12).writeU32(0xd503201f);
+                    globalThis.__hookHits = [];
+                    Interceptor.attach(page, {
+                        onEnter: function (args) {
+                            __hookHits.push('e' + args[0].toInt32());
+                            args[0] = ptr(42);
+                        },
+                        onLeave: function (retval) {
+                            __hookHits.push('l');
+                            retval.replace(ptr(7));
+                        }
+                    });
+                    return page.toString();
+                })()
+                "#,
+            )
+            .unwrap();
+        let target = u64::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap() as usize;
+        let mut regs = SavedRegs::default();
+        regs.x[0] = 3;
+        let after_enter = worker.fire_enter(0, target, regs).unwrap();
+        assert_eq!(after_enter.x[0], 42, "onEnter must rewrite args[0]");
+        let mut leave_regs = SavedRegs::default();
+        leave_regs.x[0] = 99;
+        let after_leave = worker.fire_leave(0, target, leave_regs).unwrap();
+        assert_eq!(after_leave.x[0], 7, "onLeave must retval.replace");
+        let hits = worker.eval("__hookHits.join(',')").unwrap();
+        assert_eq!(hits, "e3,l");
+    }
+
+    #[test]
+    fn native_callback_from_js_thread() {
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        let result = worker
+            .eval(
+                r#"
+                (function () {
+                    const cb = new NativeCallback(function (p) {
+                        return p.add(1);
+                    }, 'pointer', ['pointer']);
+                    const fn = new NativeFunction(cb, 'pointer', ['pointer']);
+                    const got = fn(ptr('0x10'));
+                    if (got.toString() !== '0x11') return 'add:' + got;
+                    const argcCb = new NativeCallback(function () {
+                        return arguments.length;
+                    }, 'int', ['pointer', 'pointer']);
+                    const argcFn = new NativeFunction(argcCb, 'int', ['pointer', 'pointer']);
+                    const n = argcFn(ptr(1), ptr(2));
+                    if (n !== 2) return 'argc:' + n;
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
     }
 }

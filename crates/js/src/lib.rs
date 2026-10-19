@@ -4,17 +4,32 @@
 //! Frida API objects are added incrementally in later milestones.
 
 mod api;
+mod artctl;
 mod elf;
+mod instruction;
 mod java;
 mod worker;
+mod writer;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use gum::SavedRegs;
-use rquickjs::{CatchResultExt, Context, Function, Runtime};
+use rquickjs::{CatchResultExt, Context, Ctx, Function, Runtime};
 use runtime::{Error, Result};
+
+thread_local! {
+    static JS_ENTER_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct JsEnterGuard;
+
+impl Drop for JsEnterGuard {
+    fn drop(&mut self) {
+        JS_ENTER_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
 
 pub use java::last_java_error;
 pub use worker::JsWorker;
@@ -106,7 +121,7 @@ impl ScriptRuntime {
 
     /// Evaluate a script/expression and return `String(value)`.
     pub fn eval(&self, source: &str) -> Result<String> {
-        self.ctx.with(|ctx| {
+        self.with_js(|ctx| {
             let stringify: Function = ctx.globals().get("__analyser_string").map_err(js_error)?;
             let value: rquickjs::Value = ctx
                 .eval(source)
@@ -124,6 +139,32 @@ impl ScriptRuntime {
         &self.rt
     }
 
+    /// Enter QuickJS, reusing the already-held runtime lock on nested
+    /// NativeCallback / Interceptor dispatch from the JS thread.
+    ///
+    /// rquickjs `Context::with` borrows a `RefCell` and panics (or deadlocks
+    /// with the `parallel` feature) when the JS thread re-enters it.
+    fn with_js<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(Ctx<'_>) -> R,
+    {
+        let depth = JS_ENTER_DEPTH.with(|slot| {
+            let depth = slot.get();
+            slot.set(depth + 1);
+            depth
+        });
+        let _guard = JsEnterGuard;
+        if depth == 0 {
+            self.ctx.with(f)
+        } else {
+            // SAFETY: depth > 0 means this thread already holds the rquickjs
+            // runtime lock inside `Context::with`. `from_raw` only dups the
+            // live JSContext belonging to `self.ctx`.
+            let ctx = unsafe { Ctx::from_raw(self.ctx.as_raw()) };
+            f(ctx)
+        }
+    }
+
     pub(crate) fn run_enter(&self, group: usize, target: usize, mut regs: SavedRegs) -> SavedRegs {
         let listeners: Vec<_> = self
             .hooks
@@ -134,11 +175,12 @@ impl ScriptRuntime {
                 group
                     .listeners
                     .iter()
+                    .flatten()
                     .filter_map(|listener| listener.on_enter.clone())
                     .collect()
             })
             .unwrap_or_default();
-        self.ctx.with(|ctx| {
+        self.with_js(|ctx| {
             for on_enter in listeners {
                 let _ = api::invoke_enter(&ctx, on_enter, target, &mut regs);
             }
@@ -157,11 +199,12 @@ impl ScriptRuntime {
                     .listeners
                     .iter()
                     .rev()
+                    .flatten()
                     .filter_map(|listener| listener.on_leave.clone())
                     .collect()
             })
             .unwrap_or_default();
-        self.ctx.with(|ctx| {
+        self.with_js(|ctx| {
             for on_leave in listeners {
                 let _ = api::invoke_leave(&ctx, on_leave, target, &mut regs);
             }
@@ -182,7 +225,7 @@ impl ScriptRuntime {
         let Some((function, arg_types, ret_void, ret_signed, ret_pointer)) = entry else {
             return 0;
         };
-        self.ctx.with(|ctx| {
+        self.with_js(|ctx| {
             api::invoke_callback(
                 &ctx,
                 function,
@@ -219,7 +262,7 @@ impl ScriptRuntime {
         let Some((function, class, method)) = entry else {
             return crate::worker::DispatchResult::default();
         };
-        self.ctx.with(|ctx| {
+        self.with_js(|ctx| {
             let Ok(function) = function.restore(&ctx) else {
                 return crate::worker::DispatchResult::default();
             };
@@ -248,8 +291,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn run_rpc(&self, name: &str, args: &str) -> Result<String> {
-        self.ctx
-            .with(|ctx| api::invoke_rpc(&ctx, name, args))
+        self.with_js(|ctx| api::invoke_rpc(&ctx, name, args))
             .map_err(|err| Error::Parse(format!("rpc: {err}")))
     }
 }
@@ -379,6 +421,176 @@ mod api_tests {
     #[test]
     fn thread_sleep() {
         let rt = ScriptRuntime::new().unwrap();
-        assert_eq!(rt.eval("Thread.sleep(1)").unwrap(), "undefined");
+        assert_eq!(rt.eval("Thread.sleep(0)").unwrap(), "undefined");
+    }
+
+    #[test]
+    fn java_bridge_is_installed() {
+        let rt = ScriptRuntime::new().unwrap();
+        assert_eq!(rt.eval("typeof Java").unwrap(), "object");
+        assert_eq!(rt.eval("typeof Java.ClassFactory").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Java.vm !== 'undefined'").unwrap(), "true");
+        assert_eq!(rt.eval("typeof Java.perform").unwrap(), "function");
+        assert_eq!(rt.eval("typeof Java.use").unwrap(), "function");
+        // Host has no ART, so available is false; the object still comes from
+        // the vendored frida-java-bridge runtime.
+        assert_eq!(rt.eval("Java.available").unwrap(), "false");
+    }
+
+    #[test]
+    fn pointer_and_memory_primitives() {
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    const p = Memory.alloc(16);
+                    p.writePointer(ptr('0x1122334455667788'));
+                    if (p.readPointer().toString() !== '0x1122334455667788') return 'pointer';
+                    const src = Memory.allocUtf8String('abcd');
+                    const d = Memory.dup(src, 5);
+                    Memory.copy(d, src, 5);
+                    if (d.readCString() !== 'abcd') return 'dup';
+                    if (Memory.protect(Memory.alloc(32), 32, 'rw-') !== true) return 'protect';
+                    const codeBuf = Memory.alloc(8);
+                    Memory.patchCode(codeBuf, 4, code => { code.writeU32(0xd503201f); });
+                    if ((codeBuf.readU32() >>> 0).toString(16) !== 'd503201f') return 'patch:' + (codeBuf.readU32() >>> 0).toString(16);
+                    if (!(Process.getModuleByName(Process.enumerateModules()[0].name).name.length > 0)) return 'module';
+                    const nop = Memory.alloc(4);
+                    nop.writeU32(0xd503201f);
+                    if (Instruction.parse(nop).mnemonic !== 'nop') return 'nop';
+                    const ldr = Memory.alloc(4);
+                    ldr.writeU32(0xf9400c20);
+                    const insn = Instruction.parse(ldr);
+                    if (insn.mnemonic + ':' + insn.operands[1].value.base + ':' + insn.operands[1].value.disp !== 'ldr:x1:24') {
+                        return 'ldr:' + insn.mnemonic;
+                    }
+                    const mallocPtr = Module.getExportByName(null, 'malloc');
+                    if (!mallocPtr) return 'malloc-export';
+                    const malloc = new NativeFunction(mallocPtr, 'pointer', ['int']);
+                    const free = new NativeFunction(Module.getExportByName(null, 'free'), 'void', ['pointer']);
+                    const block = malloc(32);
+                    block.writeU32(0x41);
+                    const v = block.readU32();
+                    free(block);
+                    if (v !== 65) return 'native:' + v;
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn interceptor_replace_rewrites_arm64_bytes() {
+        let rt = ScriptRuntime::new().unwrap();
+        // Interceptor lives on the worker; drive it through eval after hooks install.
+        // ScriptRuntime::new() does not install Interceptor; the worker does.
+        let (events, _rx) = std::sync::mpsc::channel();
+        let worker = super::JsWorker::spawn(events).unwrap();
+        let result = worker
+            .eval(
+                r#"
+                (function () {
+                    const page = Memory.alloc(Process.pageSize);
+                    Memory.protect(page, Process.pageSize, 'rwx');
+                    page.writeU32(0xd503201f);
+                    page.add(4).writeU32(0xd503201f);
+                    page.add(8).writeU32(0xd503201f);
+                    page.add(12).writeU32(0xd503201f);
+                    const replacement = Memory.alloc(16);
+                    try {
+                        Interceptor.replace(page, replacement);
+                    } catch (e) {
+                        return 'replace-error:' + e;
+                    }
+                    const after = page.readU32();
+                    Interceptor.revert(page);
+                    const restored = page.readU32();
+                    return 'after=' + (after >>> 0).toString(16) + ',restored=' + (restored >>> 0).toString(16);
+                })()
+                "#,
+            )
+            .unwrap();
+        assert!(
+            result.contains("after=58000050") && result.contains("restored=d503201f"),
+            "{result}"
+        );
+        let _ = rt;
+    }
+
+    #[test]
+    fn arm64_writer_exposes_exception_clear_api() {
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    const proto = Arm64Writer.prototype;
+                    const needed = [
+                        'putPushAllXRegisters', 'putPopAllXRegisters',
+                        'putCallAddressWithArguments', 'putBLabel', 'putBCondLabel',
+                        'putCbzRegLabel', 'putCbnzRegLabel', 'putTbzRegImmLabel',
+                        'putTbnzRegImmLabel', 'putPushRegReg', 'putPopRegReg',
+                        'putMovRegReg', 'putBlImm', 'putLdrRegRegOffset',
+                        'putRet', 'flush', 'dispose', 'putBCondLabelWide'
+                    ];
+                    for (const name of needed) {
+                        if (typeof proto[name] !== 'function') return 'missing:' + name;
+                    }
+                    if (typeof Arm64Relocator !== 'function') return 'reloc-ctor';
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn int64_roundtrip_and_pointer_write() {
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    if (!(int64(1) instanceof Int64)) return 'ctor';
+                    if (int64('0x10').add(1).toString() !== '17') return 'add';
+                    if (int64(-1).toString() !== '-1') return 'neg';
+                    const p = Memory.alloc(8);
+                    p.writeS64(int64(-1));
+                    const got = p.readS64();
+                    if (!(got instanceof Int64)) return 'read-type';
+                    if (got.toString() !== '-1') return 'read:' + got;
+                    if (uint64('0xff').and(1).toString() !== '1') return 'uint';
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn native_function_is_instance() {
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    const malloc = new NativeFunction(
+                        Module.getExportByName(null, 'malloc'),
+                        'pointer',
+                        ['int']
+                    );
+                    if (!(malloc instanceof NativeFunction)) return 'instanceof';
+                    if (typeof malloc.isNull !== 'function') return 'isnull';
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
     }
 }

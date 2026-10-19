@@ -148,6 +148,180 @@ pub fn patch_code(addr: usize, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Copy `len` bytes from `src` to `dst` in the current process.
+pub fn copy(dst: usize, src: usize, len: usize) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    if dst == 0 || src == 0 {
+        return Err(Error::Parse("null copy".into()));
+    }
+    // SAFETY: scripting contract; a bad address faults like Frida.
+    unsafe {
+        ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+    }
+    Ok(())
+}
+
+/// Allocate a fresh buffer and copy `len` bytes from `src` into it.
+pub fn dup(src: usize, len: usize) -> Result<*mut u8> {
+    let dst = alloc(len.max(1))?;
+    copy(dst as usize, src, len)?;
+    Ok(dst)
+}
+
+/// Parse a Frida protection string such as `rwx` / `r-x`.
+pub fn parse_prot(spec: &str) -> Result<i32> {
+    let bytes = spec.as_bytes();
+    if bytes.len() < 3 {
+        return Err(Error::Parse(format!("bad prot: {spec}")));
+    }
+    let mut prot = 0;
+    match bytes[0] {
+        b'r' => prot |= libc::PROT_READ,
+        b'-' => {}
+        _ => return Err(Error::Parse(format!("bad prot: {spec}"))),
+    }
+    match bytes[1] {
+        b'w' => prot |= libc::PROT_WRITE,
+        b'-' => {}
+        _ => return Err(Error::Parse(format!("bad prot: {spec}"))),
+    }
+    match bytes[2] {
+        b'x' => prot |= libc::PROT_EXEC,
+        b'-' => {}
+        _ => return Err(Error::Parse(format!("bad prot: {spec}"))),
+    }
+    Ok(prot)
+}
+
+/// Make `[addr, addr + len)` writable, run `f`, restore RX, flush icache.
+pub fn with_writable<T>(addr: usize, len: usize, f: impl FnOnce() -> T) -> Result<T> {
+    if len == 0 {
+        return Ok(f());
+    }
+    let page = runtime::process::page_size();
+    let start = addr & !(page - 1);
+    let end = (addr + len + page - 1) & !(page - 1);
+    let span = end - start;
+    let mut writable = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+    if protect(start, span, writable).is_err() {
+        writable = libc::PROT_READ | libc::PROT_WRITE;
+        protect(start, span, writable)?;
+    }
+    let result = f();
+    flush_icache(addr, len);
+    let _ = protect(start, span, libc::PROT_READ | libc::PROT_EXEC);
+    Ok(result)
+}
+
+/// One `Memory.scanSync` match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanMatch {
+    pub address: usize,
+    pub size: usize,
+}
+
+/// Scan `[base, base + size)` for a space-separated hex pattern (`??` wildcards).
+pub fn scan_sync(base: usize, size: usize, pattern: &str) -> Result<Vec<ScanMatch>> {
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let (needle, mask) = parse_scan_pattern(pattern)?;
+    if needle.is_empty() || size < needle.len() {
+        return Ok(Vec::new());
+    }
+    let haystack = read(base, size)?;
+    let mut matches = Vec::new();
+    let last = haystack.len() - needle.len();
+    for offset in 0..=last {
+        if haystack[offset..offset + needle.len()]
+            .iter()
+            .zip(needle.iter().zip(mask.iter()))
+            .all(|(byte, (want, keep))| !keep || byte == want)
+        {
+            matches.push(ScanMatch {
+                address: base + offset,
+                size: needle.len(),
+            });
+        }
+    }
+    Ok(matches)
+}
+
+fn parse_scan_pattern(pattern: &str) -> Result<(Vec<u8>, Vec<bool>)> {
+    let mut needle = Vec::new();
+    let mut mask = Vec::new();
+    for token in pattern.split_whitespace() {
+        if token == "?" || token == "??" {
+            needle.push(0);
+            mask.push(false);
+            continue;
+        }
+        let byte = u8::from_str_radix(token, 16)
+            .map_err(|_| Error::Parse(format!("bad scan token: {token}")))?;
+        needle.push(byte);
+        mask.push(true);
+    }
+    Ok((needle, mask))
+}
+
+/// Allocate `size` bytes near `near` (within `max_distance`), preferring RX later.
+pub fn alloc_near(size: usize, near: usize, max_distance: usize) -> Result<*mut u8> {
+    let page = runtime::process::page_size();
+    let rounded = size.div_ceil(page) * page;
+    let base = near & !(page - 1);
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | 0x10_0000; // MAP_FIXED_NOREPLACE
+    let mut delta = 0usize;
+    while delta <= max_distance {
+        for candidate in [base.checked_add(delta), base.checked_sub(delta)]
+            .into_iter()
+            .flatten()
+        {
+            if candidate == 0 {
+                continue;
+            }
+            let p = unsafe {
+                libc::mmap(
+                    candidate as *mut libc::c_void,
+                    rounded,
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    flags,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED && p as usize == candidate {
+                return Ok(p as *mut u8);
+            }
+            if p != libc::MAP_FAILED {
+                unsafe { libc::munmap(p, rounded) };
+            }
+            let p = unsafe {
+                libc::mmap(
+                    candidate as *mut libc::c_void,
+                    rounded,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    flags,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED && p as usize == candidate {
+                return Ok(p as *mut u8);
+            }
+            if p != libc::MAP_FAILED {
+                unsafe { libc::munmap(p, rounded) };
+            }
+        }
+        delta = delta.saturating_add(page.max(0x10000));
+        if delta == 0 {
+            break;
+        }
+    }
+    alloc(size)
+}
+
 /// Flush the instruction cache for `[addr, addr + len)`.
 ///
 /// bionic does not export `__clear_cache`, so emit the AArch64 cache
@@ -213,5 +387,27 @@ mod tests {
         }
         protect(p as usize, 32, libc::PROT_READ).unwrap();
         free(p, 32);
+    }
+
+    #[test]
+    fn copy_dup_and_scan() {
+        let mut buf = [0u8, 1, 2, 0xff, 0xaa, 3, 4, 5];
+        let addr = buf.as_mut_ptr() as usize;
+        let duped = dup(addr, 8).unwrap();
+        assert_eq!(read(duped as usize, 8).unwrap(), buf);
+        let matches = scan_sync(addr, 8, "ff aa").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].address, addr + 3);
+        let wild = scan_sync(addr, 8, "01 ?? ff").unwrap();
+        assert_eq!(wild[0].address, addr + 1);
+        assert_eq!(
+            parse_prot("rwx").unwrap(),
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC
+        );
+        assert_eq!(
+            parse_prot("r-x").unwrap(),
+            libc::PROT_READ | libc::PROT_EXEC
+        );
+        free(duped, 8);
     }
 }

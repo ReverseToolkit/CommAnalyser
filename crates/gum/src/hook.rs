@@ -219,6 +219,10 @@ impl InlineHook {
         self.trampoline
     }
 
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     /// Restore the original prologue word.
     pub fn detach(&mut self) -> Result<()> {
         if !self.active {
@@ -240,7 +244,7 @@ impl Drop for InlineHook {
 }
 
 fn emit_trampoline(w: &mut CodeWriter, entry: *mut HookEntry, prologue: &[u8], resume: usize) {
-    w.bti_c();
+    w.bti_jc();
     w.sub_sp(SAVE_SIZE);
     for i in 0..9u8 {
         w.stp(i * 2, i * 2 + 1, 31, (i as i64) * 16);
@@ -304,7 +308,7 @@ fn make_return_stub() -> Option<usize> {
 }
 
 fn emit_return_stub(w: &mut CodeWriter) {
-    w.bti_c();
+    w.bti_jc();
     w.sub_sp(SAVE_SIZE);
     for i in 0..9u8 {
         w.stp(i * 2, i * 2 + 1, 31, (i as i64) * 16);
@@ -486,5 +490,36 @@ mod tests {
         assert!(is_bti_or_pac(0xD503_245F));
         assert!(is_bti_or_pac(0xD503_233F));
         assert!(!is_bti_or_pac(0xD503_201F));
+    }
+
+    unsafe extern "C" fn empty_enter(_regs: *mut SavedRegs, _data: *mut c_void) {}
+
+    #[test]
+    fn attach_patches_prologue_and_detach_restores() {
+        let page = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        let target = page as usize;
+        unsafe {
+            ptr::write_unaligned(target as *mut u32, 0xD503_201F);
+            ptr::write_unaligned((target + 4) as *mut u32, 0xD503_201F);
+        }
+        let mut hook =
+            unsafe { InlineHook::attach(target, empty_enter, ptr::null_mut()) }.expect("attach");
+        let patched = unsafe { ptr::read_unaligned(target as *const u32) };
+        assert_ne!(patched, 0xD503_201F, "prologue must be overwritten with B");
+        assert_eq!(patched & 0xFC00_0000, 0x1400_0000, "ARM64 B encoding");
+        hook.detach().unwrap();
+        let restored = unsafe { ptr::read_unaligned(target as *const u32) };
+        assert_eq!(restored, 0xD503_201F);
+        unsafe { libc::munmap(page, PAGE) };
     }
 }

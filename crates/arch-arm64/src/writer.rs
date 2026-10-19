@@ -246,6 +246,57 @@ impl CodeWriter {
         self.put(0x9100_0000 | (imm << 10) | (31 << 5) | 31);
     }
 
+    /// `STP Xt, Xt2, [Xn, #imm]!` (pre-index).
+    pub fn stp_pre(&mut self, rt: u8, rt2: u8, rn: u8, offset: i64) {
+        debug_assert!(offset % 8 == 0 && (-512..512).contains(&offset));
+        let imm7 = ((offset / 8) as u32) & 0x7F;
+        self.put(
+            0xA980_0000 | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt as u32,
+        );
+    }
+
+    /// `LDP Xt, Xt2, [Xn], #imm` (post-index).
+    pub fn ldp_post(&mut self, rt: u8, rt2: u8, rn: u8, offset: i64) {
+        debug_assert!(offset % 8 == 0 && (-512..512).contains(&offset));
+        let imm7 = ((offset / 8) as u32) & 0x7F;
+        self.put(
+            0xA8C0_0000 | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt as u32,
+        );
+    }
+
+    /// `ADRP Xd, page`.
+    pub fn adrp(&mut self, rd: u8, pc: u64, target: u64) -> bool {
+        let page_pc = pc & !0xFFF;
+        let page_tgt = target & !0xFFF;
+        let delta = (page_tgt as i64).wrapping_sub(page_pc as i64);
+        if !(-(1 << 32)..(1 << 32)).contains(&delta) {
+            return false;
+        }
+        let imm = (delta >> 12) as u32;
+        let immlo = imm & 3;
+        let immhi = (imm >> 2) & 0x7_FFFF;
+        self.put(0x9000_0000 | (immlo << 29) | (immhi << 5) | rd as u32);
+        true
+    }
+
+    /// `ADD Xd, Xn, #imm` (12-bit, unshifted).
+    pub fn add_imm(&mut self, rd: u8, rn: u8, imm: u32) {
+        debug_assert!(imm < 4096);
+        self.put(0x9100_0000 | (imm << 10) | ((rn as u32) << 5) | rd as u32);
+    }
+
+    /// `STR Xt, [Xn, #imm]` signed offset (unscaled) when imm is not a multiple of 8.
+    pub fn str_reg_offset(&mut self, rt: u8, rn: u8, offset: i64, is_32: bool) {
+        if offset >= 0 && offset % 8 == 0 && offset < 32768 && !is_32 {
+            self.str_imm(rt, rn, offset as u32);
+            return;
+        }
+        let size = if is_32 { 0xB8u32 } else { 0xF8 };
+        // STUR signed 9-bit
+        let imm9 = (offset as u32) & 0x1FF;
+        self.put((size << 24) | (imm9 << 12) | ((rn as u32) << 5) | rt as u32);
+    }
+
     /// Absolute unconditional branch: `ldr x16, #8; br x16; .quad target`.
     pub fn abs_b(&mut self, target: usize) {
         self.ldr_literal_x(16, 8);
