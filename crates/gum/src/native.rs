@@ -46,6 +46,50 @@ pub unsafe fn call(target: usize, args: &[u64]) -> Result<u64> {
     Ok(ret)
 }
 
+/// Call `target` and read a `double` return (ARM64 `d0` / x86_64 `xmm0`).
+///
+/// # Safety
+/// Same contract as [`call`].
+pub unsafe fn call_f64(target: usize, args: &[u64]) -> Result<f64> {
+    if target == 0 {
+        return Err(Error::Parse("native call: null target".into()));
+    }
+    if args.len() > 8 {
+        return Err(Error::Unsupported("native call: more than 8 arguments"));
+    }
+    let mut a = [0u64; 8];
+    a[..args.len()].copy_from_slice(args);
+    let function = unsafe {
+        std::mem::transmute::<
+            usize,
+            unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> f64,
+        >(target)
+    };
+    Ok(unsafe { function(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]) })
+}
+
+/// Call `target` and read a `float` return.
+///
+/// # Safety
+/// Same contract as [`call`].
+pub unsafe fn call_f32(target: usize, args: &[u64]) -> Result<f32> {
+    if target == 0 {
+        return Err(Error::Parse("native call: null target".into()));
+    }
+    if args.len() > 8 {
+        return Err(Error::Unsupported("native call: more than 8 arguments"));
+    }
+    let mut a = [0u64; 8];
+    a[..args.len()].copy_from_slice(args);
+    let function = unsafe {
+        std::mem::transmute::<
+            usize,
+            unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> f32,
+        >(target)
+    };
+    Ok(unsafe { function(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]) })
+}
+
 #[inline(never)]
 unsafe fn invoke_eight(
     function: unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64,

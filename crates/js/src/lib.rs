@@ -5,6 +5,7 @@
 
 mod api;
 mod elf;
+mod extras;
 mod instruction;
 mod java;
 mod worker;
@@ -82,6 +83,7 @@ impl ScriptRuntime {
             })
             .map_err(js_error)?;
             ctx.globals().set("print", print).map_err(js_error)?;
+            crate::extras::bind_recv_queue(crate::extras::RecvQueue::new());
             ctx.eval::<(), _>(
                 r#"
                 globalThis.console = {
@@ -130,6 +132,7 @@ impl ScriptRuntime {
                 .call((value,))
                 .catch(&ctx)
                 .map_err(|err| js_caught_error(err))?;
+            extras::fire_due_timers(&ctx);
             Ok(text)
         })
     }
@@ -422,6 +425,95 @@ mod api_tests {
     fn thread_sleep() {
         let rt = ScriptRuntime::new().unwrap();
         assert_eq!(rt.eval("Thread.sleep(0)").unwrap(), "undefined");
+    }
+
+    #[test]
+    fn gumjs_surface_matches_frida_names() {
+        let rt = ScriptRuntime::new().unwrap();
+        let result = rt
+            .eval(
+                r#"
+                (function () {
+                    const buf = Memory.alloc(32);
+                    const needle = ptr('0x1122334455667788');
+                    buf.writePointer(needle);
+                    const prot = Memory.queryProtection(buf);
+                    if (typeof prot !== 'string' || prot.length < 3) return 'prot:' + prot;
+                    const u16 = Memory.allocUtf16String('ab');
+                    if (u16.readU16() !== 0x61) return 'utf16';
+                    const hits = Memory.findPointers(buf, 16, [needle]);
+                    if (!hits.length) return 'findPointers';
+                    let scanned = 0;
+                    Memory.scan(buf, 16, '88 77 66 55', {
+                        onMatch: function () { scanned++; },
+                        onComplete: function () {}
+                    });
+                    if (scanned < 1) return 'scan';
+                    if (!Process.mainModule || typeof Process.mainModule.name !== 'string') return 'mainModule';
+                    if (!Process.findModuleByAddress(Process.mainModule.base)) return 'findModuleByAddress';
+                    if (!Process.enumerateThreads().length) return 'threads';
+                    if (!Process.enumerateRanges('r--').length) return 'ranges';
+                    if (typeof Process.setExceptionHandler !== 'function') return 'exhandler';
+                    const libc = Process.findModuleByName(Process.mainModule.name);
+                    if (!libc.enumerateSections().length) return 'sections';
+                    try { libc.ensureInitialized(); } catch (e) {}
+                    const map = new ModuleMap();
+                    if (!map.has(Process.mainModule.base)) return 'modulemap';
+                    const frames = Thread.backtrace();
+                    if (!(frames instanceof Array)) return 'backtrace';
+                    Thread.setHardwareBreakpoint(0, buf);
+                    Thread.unsetHardwareBreakpoint(0);
+                    Thread.setHardwareWatchpoint(0, buf, 8);
+                    Thread.unsetHardwareWatchpoint(0);
+                    if (typeof buf.toJSON() !== 'string') return 'toJSON';
+                    if (buf.toMatchPattern().split(' ').length !== 8) return 'pattern';
+                    if (buf.strip().isNull()) return 'strip';
+                    buf.sign();
+                    buf.blend(1);
+                    const vol = buf.readVolatile(8);
+                    buf.writeVolatile(vol);
+                    if (typeof setInterval !== 'function' || typeof clearTimeout !== 'function') return 'timers';
+                    setTimeout(function () { globalThis.__timerHit = 1; }, 0);
+                    if (typeof File.readAllBytes !== 'function') return 'file';
+                    if (typeof File.SEEK_SET !== 'number') return 'seek';
+                    if (typeof recv !== 'function') return 'recv';
+                    if (typeof SystemFunction !== 'function') return 'system';
+                    if (typeof DebugSymbol.fromAddress !== 'function') return 'debug';
+                    const malloc = DebugSymbol.fromName('malloc');
+                    if (malloc.address.isNull()) return 'debug-name';
+                    const writer = new Arm64Writer(Memory.alloc(16));
+                    writer.putBrkImm(1);
+                    writer.flush();
+                    writer.dispose();
+                    return 'ok';
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+        assert_eq!(rt.eval("String(__timerHit)").unwrap(), "1");
+    }
+
+    #[test]
+    fn recv_waits_for_host_post() {
+        let (events, _rx) = std::sync::mpsc::channel();
+        let worker = super::JsWorker::spawn(events).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                worker.post(r#"{"type":"send","payload":7}"#);
+            });
+            let got = worker
+                .eval(
+                    r#"
+                    var got = null;
+                    recv(function (message) { got = message.payload; }).wait();
+                    String(got);
+                    "#,
+                )
+                .unwrap();
+            assert_eq!(got, "7");
+        });
     }
 
     #[test]

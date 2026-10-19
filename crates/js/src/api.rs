@@ -296,6 +296,50 @@ impl NativePointer {
     pub fn value_of(&self) -> f64 {
         self.value as f64
     }
+
+    #[qjs(rename = "toJSON")]
+    pub fn to_json(&self) -> String {
+        self.as_string()
+    }
+
+    pub fn to_match_pattern(&self) -> String {
+        self.value
+            .to_le_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn strip<'js>(&self, ctx: Ctx<'js>) -> JsResult<Class<'js, Self>> {
+        Self::instance(ctx, self.value & 0x0000_FFFF_FFFF_FFFF)
+    }
+
+    pub fn sign<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        _key: rquickjs::function::Opt<String>,
+    ) -> JsResult<Class<'js, Self>> {
+        Self::instance(ctx, self.value)
+    }
+
+    pub fn blend<'js>(&self, ctx: Ctx<'js>, small: u32) -> JsResult<Class<'js, Self>> {
+        Self::instance(ctx, self.value ^ u64::from(small & 0xff))
+    }
+
+    pub fn read_volatile<'js>(&self, ctx: Ctx<'js>, size: usize) -> JsResult<ArrayBuffer<'js>> {
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        self.read_byte_array(ctx, size)
+    }
+
+    pub fn write_volatile<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        data: ArrayBuffer<'js>,
+    ) -> JsResult<Class<'js, Self>> {
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        self.write_byte_array(ctx, data)
+    }
 }
 
 /// JavaScript `retval` object passed to `onLeave`.
@@ -626,6 +670,7 @@ pub fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>>) -> J
     )?;
     install_script_and_file(ctx)?;
     crate::writer::install(ctx)?;
+    crate::extras::install(ctx)?;
     let instruction = Object::new(ctx.clone())?;
     instruction.set("parse", Func::from(crate::instruction::parse))?;
     ctx.globals().set("Instruction", instruction)?;
@@ -723,11 +768,6 @@ pub(crate) fn install_with_hooks<'js>(
                   ret_type: String,
                   arg_types: Value<'js>|
                   -> JsResult<Class<'js, NativePointer>> {
-                if matches!(ret_type.as_str(), "float" | "double") {
-                    return Err(js_error(
-                        "NativeCallback: float returns are not supported yet",
-                    ));
-                }
                 let array: Array<'js> = arg_types.get()?;
                 let mut types = Vec::with_capacity(array.len());
                 for index in 0..array.len() {
@@ -776,29 +816,43 @@ fn install_script_and_file<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     script.set("unbindWeak", Func::from(|_id: u32| {}))?;
     ctx.globals().set("Script", script)?;
 
-    let file = Object::new(ctx.clone())?;
-    file.set(
-        "readAllText",
-        Func::from(|path: String| -> JsResult<String> {
-            std::fs::read_to_string(&path).map_err(|err| js_error(err.to_string()))
-        }),
-    )?;
-    ctx.globals().set("File", file)?;
-
     let debug = Object::new(ctx.clone())?;
     debug.set(
         "fromName",
         Func::from(|ctx: Ctx<'js>, name: String| -> JsResult<Object<'js>> {
-            let address = crate::elf::find_export(None, &name)
-                .ok()
-                .flatten()
-                .map(|(addr, _)| addr)
-                .unwrap_or(0);
-            let obj = Object::new(ctx.clone())?;
-            obj.set("address", NativePointer::instance(ctx, address as u64)?)?;
-            obj.set("name", name)?;
-            Ok(obj)
+            debug_symbol_from_name(ctx, name)
         }),
+    )?;
+    debug.set(
+        "fromAddress",
+        Func::from(
+            |ctx: Ctx<'js>, address: Value<'js>| -> JsResult<Object<'js>> {
+                debug_symbol_from_address(ctx, parse_pointer(&address)? as usize)
+            },
+        ),
+    )?;
+    debug.set(
+        "findFunctionsNamed",
+        Func::from(|ctx: Ctx<'js>, name: String| -> JsResult<Array<'js>> {
+            debug_functions_named(ctx, &name, false)
+        }),
+    )?;
+    debug.set(
+        "findFunctionsMatching",
+        Func::from(|ctx: Ctx<'js>, name: String| -> JsResult<Array<'js>> {
+            debug_functions_named(ctx, &name, true)
+        }),
+    )?;
+    debug.set(
+        "getFunctionByName",
+        Func::from(
+            |ctx: Ctx<'js>, name: String| -> JsResult<Class<'js, NativePointer>> {
+                match crate::elf::find_export(None, &name).map_err(to_js_error)? {
+                    Some((address, _)) => NativePointer::instance(ctx, address as u64),
+                    None => Err(js_error(format!("function not found: {name}"))),
+                }
+            },
+        ),
     )?;
     ctx.globals().set("DebugSymbol", debug)?;
 
@@ -811,19 +865,91 @@ fn install_script_and_file<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
              -> JsResult<Object<'js>> { Object::new(ctx) },
         ),
     )?;
-    ctx.eval::<(), _>(
-        r#"
-        globalThis.setTimeout = function (fn, ms) {
-            if (typeof Script !== 'undefined' && Script.nextTick) {
-                Script.nextTick(fn);
-            } else if (typeof fn === 'function') {
-                fn();
-            }
-            return 0;
-        };
-        "#,
-    )?;
     Ok(())
+}
+
+fn debug_symbol_from_name<'js>(ctx: Ctx<'js>, name: String) -> JsResult<Object<'js>> {
+    let found = crate::elf::find_export(None, &name).ok().flatten();
+    let address = found.as_ref().map(|(addr, _)| *addr).unwrap_or(0);
+    debug_symbol_object(
+        ctx,
+        address,
+        Some(&name),
+        found.as_ref().map(|(_, n)| n.as_str()),
+    )
+}
+
+fn debug_symbol_from_address<'js>(ctx: Ctx<'js>, address: usize) -> JsResult<Object<'js>> {
+    let module = module::find_by_address(address).ok().flatten();
+    let mut name: Option<String> = None;
+    if let Some(module) = module.as_ref() {
+        if let Ok(symbols) = crate::elf::enumerate_symbols(&module.path, module.base) {
+            name = symbols
+                .into_iter()
+                .filter(|symbol| symbol.address <= address)
+                .max_by_key(|symbol| symbol.address)
+                .map(|symbol| symbol.name);
+        }
+    }
+    debug_symbol_object(
+        ctx,
+        address,
+        name.as_deref(),
+        module.as_ref().map(|module| module.name.as_str()),
+    )
+}
+
+fn debug_symbol_object<'js>(
+    ctx: Ctx<'js>,
+    address: usize,
+    name: Option<&str>,
+    module_name: Option<&str>,
+) -> JsResult<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    obj.set(
+        "address",
+        NativePointer::instance(ctx.clone(), address as u64)?,
+    )?;
+    obj.set("name", name.unwrap_or(""))?;
+    obj.set("moduleName", module_name.unwrap_or(""))?;
+    obj.set(
+        "fileName",
+        module::find_by_address(address)
+            .ok()
+            .flatten()
+            .map(|module| module.path)
+            .unwrap_or_default(),
+    )?;
+    obj.set("lineNumber", 0u32)?;
+    Ok(obj)
+}
+
+fn debug_functions_named<'js>(ctx: Ctx<'js>, pattern: &str, glob: bool) -> JsResult<Array<'js>> {
+    let array = Array::new(ctx.clone())?;
+    let mut index = 0usize;
+    for module in module::enumerate().map_err(to_js_error)? {
+        let Ok(symbols) = crate::elf::enumerate_exports(&module.path, module.base) else {
+            continue;
+        };
+        for symbol in symbols {
+            if symbol.kind != "function" {
+                continue;
+            }
+            let matches = if glob {
+                symbol.name.contains(pattern.trim_matches('*'))
+            } else {
+                symbol.name == pattern
+            };
+            if matches {
+                array.set(
+                    index,
+                    NativePointer::instance(ctx.clone(), symbol.address as u64)?,
+                )?;
+                index += 1;
+            }
+        }
+    }
+    Ok(array)
 }
 
 fn listener_object<'js>(
@@ -1281,6 +1407,91 @@ fn memory_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
             },
         ),
     )?;
+    obj.set(
+        "scan",
+        Func::from(
+            |ctx: Ctx<'js>,
+             address: Value<'js>,
+             size: usize,
+             pattern: String,
+             callbacks: Object<'js>|
+             -> JsResult<()> {
+                let matches =
+                    match memory::scan_sync(parse_pointer(&address)? as usize, size, &pattern) {
+                        Ok(matches) => matches,
+                        Err(err) => {
+                            if let Ok(on_error) = callbacks.get::<_, Function<'js>>("onError") {
+                                let _ = on_error.call::<_, ()>((err.to_string(),));
+                            }
+                            if let Ok(on_complete) = callbacks.get::<_, Function<'js>>("onComplete")
+                            {
+                                let _ = on_complete.call::<_, ()>(());
+                            }
+                            return Ok(());
+                        }
+                    };
+                let on_match: Option<Function<'js>> = callbacks.get("onMatch")?;
+                for item in matches {
+                    if let Some(on_match) = on_match.as_ref() {
+                        let result: Value<'js> = on_match.call((
+                            NativePointer::instance(ctx.clone(), item.address as u64)?,
+                            item.size,
+                        ))?;
+                        if result
+                            .as_string()
+                            .and_then(|text| text.to_string().ok())
+                            .as_deref()
+                            == Some("stop")
+                        {
+                            break;
+                        }
+                    }
+                }
+                if let Ok(on_complete) = callbacks.get::<_, Function<'js>>("onComplete") {
+                    let _ = on_complete.call::<_, ()>(());
+                }
+                Ok(())
+            },
+        ),
+    )?;
+    obj.set(
+        "queryProtection",
+        Func::from(|address: Value<'js>| -> JsResult<String> {
+            memory::query_protection(parse_pointer(&address)? as usize).map_err(to_js_error)
+        }),
+    )?;
+    obj.set(
+        "allocUtf16String",
+        Func::from(
+            |ctx: Ctx<'js>, text: String| -> JsResult<Class<'js, NativePointer>> {
+                let pointer = memory::alloc_utf16(&text).map_err(to_js_error)?;
+                NativePointer::instance(ctx, pointer as u64)
+            },
+        ),
+    )?;
+    obj.set(
+        "findPointers",
+        Func::from(
+            |ctx: Ctx<'js>,
+             address: Value<'js>,
+             size: usize,
+             values: Array<'js>|
+             -> JsResult<Array<'js>> {
+                let mut needles = Vec::with_capacity(values.len());
+                for index in 0..values.len() {
+                    let value: Value<'js> = values.get(index)?;
+                    needles.push(parse_pointer(&value)?);
+                }
+                let hits = memory::find_pointers(parse_pointer(&address)? as usize, size, &needles)
+                    .map_err(to_js_error)?;
+                let array = Array::new(ctx.clone())?;
+                for (index, hit) in hits.into_iter().enumerate() {
+                    array.set(index, NativePointer::instance(ctx.clone(), hit as u64)?)?;
+                }
+                Ok(array)
+            },
+        ),
+    )?;
     Ok(obj)
 }
 
@@ -1324,7 +1535,158 @@ fn process_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
             Ok(array)
         }),
     )?;
+    if let Ok(Some(main)) = module::main_module() {
+        obj.set("mainModule", module_object_from(ctx.clone(), &main)?)?;
+    }
+    obj.set(
+        "findModuleByName",
+        Func::from(|ctx: Ctx<'js>, name: String| -> JsResult<Value<'js>> {
+            match module::find_by_name(&name).map_err(to_js_error)? {
+                Some(found) => Ok(module_object_from(ctx, &found)?.into_value()),
+                None => Ok(Value::new_null(ctx)),
+            }
+        }),
+    )?;
+    obj.set(
+        "findModuleByAddress",
+        Func::from(
+            |ctx: Ctx<'js>, address: Value<'js>| -> JsResult<Value<'js>> {
+                match module::find_by_address(parse_pointer(&address)? as usize)
+                    .map_err(to_js_error)?
+                {
+                    Some(found) => Ok(module_object_from(ctx, &found)?.into_value()),
+                    None => Ok(Value::new_null(ctx)),
+                }
+            },
+        ),
+    )?;
+    obj.set(
+        "enumerateThreads",
+        Func::from(|ctx: Ctx<'js>| -> JsResult<Array<'js>> {
+            let threads = thread::enumerate().map_err(to_js_error)?;
+            let array = Array::new(ctx.clone())?;
+            for (index, info) in threads.into_iter().enumerate() {
+                let item = Object::new(ctx.clone())?;
+                item.set("id", info.id)?;
+                item.set("name", info.name)?;
+                item.set("state", info.state)?;
+                array.set(index, item)?;
+            }
+            Ok(array)
+        }),
+    )?;
+    obj.set(
+        "enumerateRanges",
+        Func::from(
+            |ctx: Ctx<'js>, protection: rquickjs::function::Opt<String>| -> JsResult<Array<'js>> {
+                enumerate_process_ranges(ctx, protection.0.as_deref())
+            },
+        ),
+    )?;
+    obj.set(
+        "findRangeByAddress",
+        Func::from(
+            |ctx: Ctx<'js>, address: Value<'js>| -> JsResult<Value<'js>> {
+                let addr = parse_pointer(&address)? as usize;
+                let maps = runtime::maps::read_self_maps().map_err(to_js_error)?;
+                match maps
+                    .into_iter()
+                    .find(|mapping| mapping.range.contains(addr))
+                {
+                    Some(mapping) => Ok(crate::extras::range_object(
+                        ctx,
+                        mapping.range.start,
+                        mapping.range.len(),
+                        &gum::memory::format_prot(
+                            mapping.perms.read,
+                            mapping.perms.write,
+                            mapping.perms.exec,
+                        ),
+                        mapping.path.as_deref(),
+                    )?
+                    .into_value()),
+                    None => Ok(Value::new_null(ctx)),
+                }
+            },
+        ),
+    )?;
+    obj.set(
+        "getCurrentDir",
+        Func::from(|| -> String {
+            std::env::current_dir()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/".into())
+        }),
+    )?;
+    obj.set(
+        "getHomeDir",
+        Func::from(|| -> String { std::env::var("HOME").unwrap_or_else(|_| "/".into()) }),
+    )?;
+    obj.set(
+        "getTmpDir",
+        Func::from(|| -> String { std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()) }),
+    )?;
+    obj.set(
+        "isDebuggerAttached",
+        Func::from(|| crate::extras::debugger_attached()),
+    )?;
+    obj.set(
+        "setExceptionHandler",
+        Func::from(|_callback: rquickjs::function::Opt<Function<'js>>| {}),
+    )?;
+    obj.set(
+        "attachThreadObserver",
+        Func::from(
+            |ctx: Ctx<'js>, _callbacks: Value<'js>| -> JsResult<Object<'js>> { observer_stub(ctx) },
+        ),
+    )?;
+    obj.set(
+        "attachModuleObserver",
+        Func::from(
+            |ctx: Ctx<'js>, _callbacks: Value<'js>| -> JsResult<Object<'js>> { observer_stub(ctx) },
+        ),
+    )?;
     Ok(obj)
+}
+
+fn observer_stub<'js>(ctx: Ctx<'js>) -> JsResult<Object<'js>> {
+    let obj = Object::new(ctx)?;
+    obj.set("detach", Func::from(|| {}))?;
+    Ok(obj)
+}
+
+fn enumerate_process_ranges<'js>(ctx: Ctx<'js>, protection: Option<&str>) -> JsResult<Array<'js>> {
+    let maps = runtime::maps::read_self_maps().map_err(to_js_error)?;
+    let array = Array::new(ctx.clone())?;
+    let mut index = 0usize;
+    for mapping in maps {
+        let prot =
+            gum::memory::format_prot(mapping.perms.read, mapping.perms.write, mapping.perms.exec);
+        if let Some(filter) = protection {
+            if filter.len() >= 3 {
+                let want = filter.as_bytes();
+                let have = prot.as_bytes();
+                if (want[0] == b'r' && have[0] != b'r')
+                    || (want[1] == b'w' && have[1] != b'w')
+                    || (want[2] == b'x' && have[2] != b'x')
+                {
+                    continue;
+                }
+            }
+        }
+        array.set(
+            index,
+            crate::extras::range_object(
+                ctx.clone(),
+                mapping.range.start,
+                mapping.range.len(),
+                &prot,
+                mapping.path.as_deref(),
+            )?,
+        )?;
+        index += 1;
+    }
+    Ok(array)
 }
 
 fn module_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
@@ -1359,6 +1721,13 @@ fn module_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
             }
         }),
     )?;
+    obj.set(
+        "load",
+        Func::from(|ctx: Ctx<'js>, path: String| -> JsResult<Object<'js>> {
+            let loaded = crate::extras::load_module(&path).map_err(to_js_error)?;
+            module_object_from(ctx, &loaded)
+        }),
+    )?;
     Ok(obj)
 }
 
@@ -1371,10 +1740,50 @@ fn thread_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
             std::thread::sleep(std::time::Duration::from_millis(millis));
         }),
     )?;
+    obj.set(
+        "backtrace",
+        Func::from(
+            |ctx: Ctx<'js>,
+             _cpu: rquickjs::function::Opt<Value<'js>>,
+             _kind: rquickjs::function::Opt<Value<'js>>|
+             -> JsResult<Array<'js>> {
+                let frames = thread::backtrace(32);
+                let array = Array::new(ctx.clone())?;
+                for (index, frame) in frames.into_iter().enumerate() {
+                    array.set(index, NativePointer::instance(ctx.clone(), frame as u64)?)?;
+                }
+                Ok(array)
+            },
+        ),
+    )?;
+    obj.set(
+        "setHardwareBreakpoint",
+        Func::from(|id: u32, address: Value<'js>| -> JsResult<()> {
+            crate::extras::hw_set_breakpoint(id, parse_pointer(&address)?);
+            Ok(())
+        }),
+    )?;
+    obj.set(
+        "unsetHardwareBreakpoint",
+        Func::from(|id: u32| crate::extras::hw_unset_breakpoint(id)),
+    )?;
+    obj.set(
+        "setHardwareWatchpoint",
+        Func::from(
+            |id: u32, address: Value<'js>, _size: rquickjs::function::Opt<u32>| -> JsResult<()> {
+                crate::extras::hw_set_watchpoint(id, parse_pointer(&address)?);
+                Ok(())
+            },
+        ),
+    )?;
+    obj.set(
+        "unsetHardwareWatchpoint",
+        Func::from(|id: u32| crate::extras::hw_unset_watchpoint(id)),
+    )?;
     Ok(obj)
 }
 
-fn module_object_from<'js>(
+pub(crate) fn module_object_from<'js>(
     ctx: Ctx<'js>,
     module: &runtime::module::Module,
 ) -> JsResult<Object<'js>> {
@@ -1458,12 +1867,100 @@ fn module_object_from<'js>(
     obj.set(
         "enumerateImports",
         Func::from({
-            let path = path;
+            let path = path.clone();
             move |ctx: Ctx<'js>| -> JsResult<Array<'js>> {
                 symbols_array(
                     ctx,
                     crate::elf::enumerate_imports(&path, base).map_err(to_js_error)?,
                 )
+            }
+        }),
+    )?;
+    obj.set(
+        "enumerateSections",
+        Func::from({
+            let path = path.clone();
+            move |ctx: Ctx<'js>| -> JsResult<Array<'js>> {
+                let sections = crate::elf::enumerate_sections(&path, base).map_err(to_js_error)?;
+                let array = Array::new(ctx.clone())?;
+                for (index, section) in sections.into_iter().enumerate() {
+                    let item = Object::new(ctx.clone())?;
+                    item.set("id", section.name.clone())?;
+                    item.set("name", section.name)?;
+                    item.set(
+                        "address",
+                        NativePointer::instance(ctx.clone(), section.address as u64)?,
+                    )?;
+                    item.set("size", section.size)?;
+                    array.set(index, item)?;
+                }
+                Ok(array)
+            }
+        }),
+    )?;
+    obj.set(
+        "enumerateDependencies",
+        Func::from({
+            let path = path.clone();
+            move |ctx: Ctx<'js>| -> JsResult<Array<'js>> {
+                let deps = crate::elf::enumerate_dependencies(&path).map_err(to_js_error)?;
+                let array = Array::new(ctx.clone())?;
+                for (index, name) in deps.into_iter().enumerate() {
+                    array.set(index, name)?;
+                }
+                Ok(array)
+            }
+        }),
+    )?;
+    obj.set(
+        "enumerateRanges",
+        Func::from({
+            let ranges = module.ranges.clone();
+            move |ctx: Ctx<'js>,
+                  protection: rquickjs::function::Opt<String>|
+                  -> JsResult<Array<'js>> {
+                let maps = runtime::maps::read_self_maps().map_err(to_js_error)?;
+                let array = Array::new(ctx.clone())?;
+                let mut index = 0usize;
+                for range in &ranges {
+                    let Some(mapping) = maps
+                        .iter()
+                        .find(|mapping| mapping.range.start == range.start)
+                    else {
+                        continue;
+                    };
+                    let prot = gum::memory::format_prot(
+                        mapping.perms.read,
+                        mapping.perms.write,
+                        mapping.perms.exec,
+                    );
+                    if let Some(filter) = protection.0.as_deref() {
+                        if filter.contains('x') && !mapping.perms.exec {
+                            continue;
+                        }
+                    }
+                    array.set(
+                        index,
+                        crate::extras::range_object(
+                            ctx.clone(),
+                            range.start,
+                            range.len(),
+                            &prot,
+                            mapping.path.as_deref(),
+                        )?,
+                    )?;
+                    index += 1;
+                }
+                Ok(array)
+            }
+        }),
+    )?;
+    obj.set(
+        "ensureInitialized",
+        Func::from({
+            let path = path;
+            move || -> JsResult<()> {
+                crate::extras::ensure_initialized(&path).map_err(to_js_error)
             }
         }),
     )?;
@@ -1625,11 +2122,11 @@ fn read_cstring(addr: u64) -> runtime::Result<String> {
     ))
 }
 
-fn to_js_error(error: runtime::Error) -> rquickjs::Error {
+pub(crate) fn to_js_error(error: runtime::Error) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("comm-analyser", "memory", error.to_string())
 }
 
-fn js_error(message: impl Into<String>) -> rquickjs::Error {
+pub(crate) fn js_error(message: impl Into<String>) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("comm-analyser", "pointer", message.into())
 }
 
@@ -1648,11 +2145,8 @@ fn make_native_function<'js>(
 ) -> JsResult<Function<'js>> {
     let target = usize::try_from(parse_pointer(&address)?)
         .map_err(|_| js_error("native function address does not fit in usize"))?;
-    if matches!(ret_type.as_str(), "float" | "double") {
-        return Err(js_error(
-            "NativeFunction: float returns are not supported yet",
-        ));
-    }
+    let returns_float = ret_type == "float";
+    let returns_double = ret_type == "double";
     let returns_void = ret_type == "void";
     let returns_signed = is_signed_type(&ret_type);
 
@@ -1685,9 +2179,17 @@ fn make_native_function<'js>(
                 };
             }
             let argc = values.0.len().min(8);
+            let slice = &raw[..argc.max(types.len()).min(8)];
             // SAFETY: the caller supplied the function address and signature.
-            let result = unsafe { native::call(target, &raw[..argc.max(types.len()).min(8)]) }
-                .map_err(to_js_error)?;
+            if returns_double {
+                let result = unsafe { native::call_f64(target, slice) }.map_err(to_js_error)?;
+                return result.into_js(&call_ctx);
+            }
+            if returns_float {
+                let result = unsafe { native::call_f32(target, slice) }.map_err(to_js_error)?;
+                return f64::from(result).into_js(&call_ctx);
+            }
+            let result = unsafe { native::call(target, slice) }.map_err(to_js_error)?;
             if returns_void {
                 Ok(Value::new_undefined(call_ctx.clone()))
             } else if returns_pointer {

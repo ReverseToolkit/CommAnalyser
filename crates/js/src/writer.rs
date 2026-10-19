@@ -118,6 +118,11 @@ impl Arm64Writer {
         self.code.nop();
     }
 
+    pub fn put_brk_imm(&mut self, imm: rquickjs::function::Opt<u32>) {
+        let imm16 = imm.0.unwrap_or(0) & 0xffff;
+        self.code.put(0xD420_0000 | (imm16 << 5));
+    }
+
     pub fn put_ret(&mut self) {
         self.code.ret(30);
     }

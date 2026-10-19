@@ -97,9 +97,29 @@ pub fn aggregate(maps: &[Mapping]) -> Vec<Module> {
     result
 }
 
+/// The module covering the process executable, Frida's `Process.mainModule`.
+pub fn main_module() -> Result<Option<Module>> {
+    let exe = std::fs::read_link("/proc/self/exe")
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    let modules = enumerate()?;
+    if let Some(exe) = exe {
+        if let Some(module) = modules
+            .iter()
+            .find(|module| module.path == exe || exe.ends_with(&module.name))
+            .cloned()
+        {
+            return Ok(Some(module));
+        }
+    }
+    Ok(modules.into_iter().next())
+}
+
 /// Find a module by exact basename.
 pub fn find_by_name(name: &str) -> Result<Option<Module>> {
-    Ok(enumerate()?.into_iter().find(|m| m.name == name))
+    Ok(enumerate()?
+        .into_iter()
+        .find(|m| m.name == name || m.path == name))
 }
 
 /// Find the module containing `addr`.

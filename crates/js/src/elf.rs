@@ -126,6 +126,46 @@ pub fn enumerate_imports(path: &str, base: usize) -> Result<Vec<SymbolInfo>> {
     Ok(out)
 }
 
+/// One ELF section for `Module.enumerateSections`.
+#[derive(Clone, Debug)]
+pub struct SectionInfo {
+    pub name: String,
+    pub address: usize,
+    pub size: usize,
+}
+
+pub fn enumerate_sections(path: &str, base: usize) -> Result<Vec<SectionInfo>> {
+    let data = fs::read(path).map_err(runtime::Error::Io)?;
+    let elf =
+        Elf::parse(&data).map_err(|err| runtime::Error::Parse(format!("ELF {path}: {err}")))?;
+    let mut out = Vec::new();
+    for section in &elf.section_headers {
+        let Some(name) = elf.shdr_strtab.get_at(section.sh_name) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        out.push(SectionInfo {
+            name: name.to_owned(),
+            address: base.wrapping_add(section.sh_addr as usize),
+            size: section.sh_size as usize,
+        });
+    }
+    Ok(out)
+}
+
+pub fn enumerate_dependencies(path: &str) -> Result<Vec<String>> {
+    let data = fs::read(path).map_err(runtime::Error::Io)?;
+    let elf =
+        Elf::parse(&data).map_err(|err| runtime::Error::Parse(format!("ELF {path}: {err}")))?;
+    Ok(elf
+        .libraries
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect())
+}
+
 fn symbol_value(path: &str, symbol: &str, include_symtab: bool) -> Result<Option<usize>> {
     let data = fs::read(path).map_err(runtime::Error::Io)?;
     let elf =

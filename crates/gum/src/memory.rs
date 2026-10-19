@@ -322,6 +322,58 @@ pub fn alloc_near(size: usize, near: usize, max_distance: usize) -> Result<*mut 
     alloc(size)
 }
 
+/// Frida protection string `rwx` / `r-x` / `rw-` / `---`.
+pub fn format_prot(read: bool, write: bool, exec: bool) -> String {
+    format!(
+        "{}{}{}",
+        if read { 'r' } else { '-' },
+        if write { 'w' } else { '-' },
+        if exec { 'x' } else { '-' }
+    )
+}
+
+/// `Memory.queryProtection(address)` from `/proc/self/maps`.
+pub fn query_protection(addr: usize) -> Result<String> {
+    let maps = runtime::maps::read_self_maps()?;
+    maps.iter()
+        .find(|mapping| mapping.range.contains(addr))
+        .map(|mapping| format_prot(mapping.perms.read, mapping.perms.write, mapping.perms.exec))
+        .ok_or_else(|| Error::NotFound(format!("no mapping for {addr:#x}")))
+}
+
+/// NUL-terminated UTF-16LE string, as `Memory.allocUtf16String`.
+pub fn alloc_utf16(text: &str) -> Result<*mut u8> {
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+    let bytes = units.len().saturating_mul(2);
+    let pointer = alloc(bytes.max(1))?;
+    // SAFETY: freshly allocated buffer of `bytes` bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(units.as_ptr().cast::<u8>(), pointer, bytes);
+    }
+    Ok(pointer)
+}
+
+/// Addresses in `[base, base+size)` that hold one of `needles` as a pointer.
+pub fn find_pointers(base: usize, size: usize, needles: &[u64]) -> Result<Vec<usize>> {
+    let width = std::mem::size_of::<usize>();
+    if size < width || needles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let haystack = read(base, size)?;
+    let mut found = Vec::new();
+    let last = haystack.len() - width;
+    let mut offset = 0usize;
+    while offset <= last {
+        let slot = u64::from_le_bytes(haystack[offset..offset + width].try_into().unwrap());
+        if needles.contains(&slot) {
+            found.push(base + offset);
+        }
+        offset += width;
+    }
+    Ok(found)
+}
+
 /// Flush the instruction cache for `[addr, addr + len)`.
 ///
 /// bionic does not export `__clear_cache`, so emit the AArch64 cache
@@ -409,5 +461,21 @@ mod tests {
             libc::PROT_READ | libc::PROT_EXEC
         );
         free(duped, 8);
+    }
+
+    #[test]
+    fn query_protection_and_find_pointers() {
+        let mut buf = [0u8; 16];
+        let addr = buf.as_mut_ptr() as usize;
+        let prot = query_protection(addr).unwrap();
+        assert!(prot.starts_with('r'), "{prot}");
+        let needle = 0x1122_3344_5566_7788u64;
+        buf[..8].copy_from_slice(&needle.to_le_bytes());
+        let hits = find_pointers(addr, 16, &[needle]).unwrap();
+        assert_eq!(hits, vec![addr]);
+        let utf16 = alloc_utf16("hi").unwrap();
+        let bytes = read(utf16 as usize, 6).unwrap();
+        assert_eq!(&bytes, &[b'h', 0, b'i', 0, 0, 0]);
+        free(utf16, 6);
     }
 }

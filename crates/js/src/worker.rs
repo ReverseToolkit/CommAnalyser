@@ -187,17 +187,25 @@ pub(crate) fn find_java_hook(
 #[derive(Clone)]
 pub struct JsWorker {
     tx: Sender<Job>,
+    recv: std::sync::Arc<crate::extras::RecvQueue>,
 }
 
 impl JsWorker {
     pub fn spawn(event_tx: Sender<String>) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let worker_tx = tx.clone();
+        let recv = crate::extras::RecvQueue::new();
+        let recv_worker = recv.clone();
         std::thread::Builder::new()
             .name("js".to_owned())
-            .spawn(move || worker_loop(rx, worker_tx, event_tx))
+            .spawn(move || worker_loop(rx, worker_tx, event_tx, recv_worker))
             .map_err(Error::Io)?;
-        Ok(Self { tx })
+        Ok(Self { tx, recv })
+    }
+
+    /// Host → script message, consumed by `recv().wait()`.
+    pub fn post(&self, json: impl Into<String>) {
+        self.recv.post(json.into());
     }
 
     pub fn rpc(&self, name: &str, args: &str) -> Result<String> {
@@ -274,7 +282,13 @@ impl Drop for JsWorker {
     }
 }
 
-fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
+fn worker_loop(
+    rx: Receiver<Job>,
+    tx: Sender<Job>,
+    event_tx: Sender<String>,
+    recv: std::sync::Arc<crate::extras::RecvQueue>,
+) {
+    crate::extras::bind_recv_queue(recv);
     JS_THREAD.with(|flag| flag.set(true));
     let _ = JS_TX.set(tx.clone());
     let hooks = Rc::new(RefCell::new(HookTable::default()));
@@ -296,7 +310,16 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
     };
     RUNTIME.with(|slot| slot.set(&runtime as *const ScriptRuntime));
 
-    while let Ok(job) = rx.recv() {
+    loop {
+        let wait = crate::extras::next_timer_wait();
+        let job = match rx.recv_timeout(wait) {
+            Ok(job) => job,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                runtime.with_js(|ctx| crate::extras::fire_due_timers(&ctx));
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match job {
             Job::Eval { code, reply } => {
                 let _ = reply.send(runtime.eval(&code));
@@ -351,6 +374,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Job>, event_tx: Sender<String>) {
             }
             Job::Shutdown => break,
         }
+        runtime.with_js(|ctx| crate::extras::fire_due_timers(&ctx));
     }
     // QuickJS can assert in JS_FreeRuntime when the host closes the control
     // channel while any JS closure is still reachable.  Hooks are detached
