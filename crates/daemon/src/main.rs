@@ -150,6 +150,35 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
                 Err(err) => error_response(format!("inject: {err}")),
             }
         }
+        "spawn" => {
+            let agent = request
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or("/data/local/tmp/libagent.so");
+            let package = request.get("package").and_then(Value::as_str);
+            let exec = request.get("exec").and_then(Value::as_str);
+            let args = request
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            match spawn(package, exec, &args, agent) {
+                Ok((pid, hello)) => json!({
+                    "ok": true,
+                    "pid": pid,
+                    "agent": agent,
+                    "hello": hello,
+                    "spawn": true
+                })
+                .to_string(),
+                Err(err) => error_response(format!("spawn: {err}")),
+            }
+        }
         "agent" => {
             let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
             let command = request.get("command").and_then(Value::as_str).unwrap_or("");
@@ -214,6 +243,23 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
         "" => error_response("missing op".to_owned()),
         other => error_response(format!("unknown op: {other}")),
     }
+}
+
+fn spawn(
+    package: Option<&str>,
+    exec: Option<&str>,
+    args: &[String],
+    agent: &str,
+) -> Result<(u32, String), String> {
+    let pid = if let Some(package) = package {
+        inject::start_package(package).map_err(|err| format!("{err}"))?
+    } else if let Some(path) = exec {
+        inject::start_executable(path, args).map_err(|err| format!("{err}"))?
+    } else {
+        return Err("package or exec required".to_owned());
+    };
+    let hello = inject(pid, agent)?;
+    Ok((pid, hello))
 }
 
 fn inject(pid: u32, agent: &str) -> Result<String, String> {

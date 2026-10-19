@@ -1,19 +1,21 @@
-//! Attach injection for CommAnalyser.
+//! Attach and spawn injection for CommAnalyser.
 //!
-//! M1 implements the aarch64 attach path: stop every thread, use remote calls
-//! into libc/linker to create a memfd, `dlopen()` the agent, resolve
-//! `agent_main`, and call it.  The daemon then waits for the agent's hello
-//! before resuming the target.
+//! The agent `.so` is mapped by the 自定义linker in [`loader`]: PT_LOAD +
+//! reloc + init, not bionic `dlopen`.  Spawn starts a package or executable
+//! and runs the same inject session on the new pid.
 
 pub mod elf;
+pub mod loader;
 pub mod ptrace;
 pub mod remote;
 pub mod session;
+pub mod spawn;
 
 #[cfg(test)]
 use runtime::Error;
 
 pub use session::{attach, Session};
+pub use spawn::{pids_named, start_executable, start_package};
 
 /// Whether injection is supported on this build target.
 pub const fn supported() -> bool {

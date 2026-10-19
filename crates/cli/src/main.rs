@@ -39,7 +39,7 @@ fn run() -> Result<(), String> {
     }
 
     let command = command.ok_or_else(|| {
-        "usage: comm-analyser [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|agent|eval|call|rpc>"
+        "usage: comm-analyser [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|spawn|agent|eval|call|rpc>"
             .to_owned()
     })?;
 
@@ -69,6 +69,7 @@ fn run() -> Result<(), String> {
                 .unwrap_or("/data/local/tmp/libagent.so");
             json!({"op": "inject", "pid": pid, "agent": agent})
         }
+        "spawn" => spawn_request(&rest)?,
         "agent" => {
             let pid = rest
                 .first()
@@ -224,6 +225,66 @@ fn print_help() {
            ping              check daemon liveness\n\
            version           daemon version/arch\n\
            ps                list processes\n\
-           attach <pid>      attach to a process (M1)\n"
+           attach <pid>      attach to a process (M1)\n\
+           inject <pid>      inject agent into a running pid\n\
+           spawn --package P | --exec PATH [args]   start then inject\n"
     );
+}
+
+fn spawn_request(rest: &[String]) -> Result<Value, String> {
+    let mut package = None;
+    let mut exec = None;
+    let mut agent = "/data/local/tmp/libagent.so".to_owned();
+    let mut args = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--package" => {
+                i += 1;
+                package = Some(rest.get(i).ok_or("usage: spawn --package NAME")?.clone());
+            }
+            "--exec" => {
+                i += 1;
+                exec = Some(rest.get(i).ok_or("usage: spawn --exec PATH")?.clone());
+            }
+            "--agent" => {
+                i += 1;
+                agent = rest.get(i).ok_or("usage: spawn ... --agent PATH")?.clone();
+            }
+            "--" => {
+                let mut j = i + 1;
+                while j < rest.len() {
+                    if rest[j] == "--agent" {
+                        j += 1;
+                        agent = rest.get(j).ok_or("usage: spawn ... --agent PATH")?.clone();
+                    } else {
+                        args.push(rest[j].clone());
+                    }
+                    j += 1;
+                }
+                break;
+            }
+            other if package.is_none() && exec.is_none() => {
+                if other.contains('.') && !other.contains('/') {
+                    package = Some(other.to_owned());
+                } else {
+                    exec = Some(other.to_owned());
+                }
+            }
+            other => args.push(other.to_owned()),
+        }
+        i += 1;
+    }
+    if package.is_none() && exec.is_none() {
+        return Err(
+            "usage: spawn --package NAME | --exec PATH [--agent PATH] [-- args]".to_owned(),
+        );
+    }
+    Ok(json!({
+        "op": "spawn",
+        "package": package,
+        "exec": exec,
+        "args": args,
+        "agent": agent
+    }))
 }
