@@ -70,6 +70,8 @@ pub struct Image {
     pub init: Option<u64>,
     pub init_array: Option<(u64, usize)>,
     pub relro: Option<(u64, u64)>,
+    /// `DT_NEEDED` sonames, in dynamic-section order.
+    pub needed: Vec<String>,
 }
 
 impl Image {
@@ -158,6 +160,8 @@ impl Image {
             }
         }
 
+        let needed = elf.libraries.iter().map(|name| (*name).to_owned()).collect();
+
         Ok(Self {
             load_start,
             load_end,
@@ -167,6 +171,7 @@ impl Image {
             init,
             init_array,
             relro,
+            needed,
         })
     }
 

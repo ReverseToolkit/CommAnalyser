@@ -8,10 +8,7 @@ fn main() {
     if std::env::var("CARGO_FEATURE_LINK").is_err() {
         return;
     }
-    match link_tal_static() {
-        Ok(()) => {}
-        Err(err) => println!("cargo:warning=TAL static link: {err}"),
-    }
+    link_tal_static().unwrap_or_else(|err| panic!("TAL static link: {err}"));
 }
 
 fn link_tal_static() -> Result<(), String> {

@@ -1,9 +1,10 @@
 //! Attach orchestration: stop threads, map the agent with the 自定义linker.
 
+use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use runtime::maps;
+use runtime::maps::{self, Mapping};
 use runtime::{Error, Result};
 
 use crate::elf::{self, SymbolCache};
@@ -175,48 +176,54 @@ fn inject_locked(options: &AttachOptions, threads: &[u32]) -> Result<Session> {
 
     let name_ptr = config_ptr + 0x100;
     let mut extras = Vec::new();
-    if let Some(dir) = Path::new(&options.agent).parent() {
-        let cxx_path = dir.join("libc++_shared.so");
-        if cxx_path.is_file() {
-            let cxx_bytes = fs::read(&cxx_path).map_err(Error::Io)?;
-            let mapped = load_elf_into(
-                pid,
-                &remote,
-                &mut regs,
-                mmap,
-                mprotect,
-                dlsym,
-                stack,
-                sentinel,
-                name_ptr,
-                caller_addr,
-                &cxx_bytes,
-                &extras,
-            )?;
-            eprintln!(
-                "[inject] libc++_shared map={:#x} span={:#x}",
-                mapped.map,
-                mapped.image.span(target_page_size(pid).unwrap_or(PAGE))
-            );
-            extras.push(mapped);
+    let plan = link_plan(Path::new(&options.agent), &maps)?;
+    let mut mapped = None;
+    for step in plan {
+        match step {
+            PlanItem::Map(path) => {
+                let bytes = fs::read(&path).map_err(Error::Io)?;
+                let loaded = load_elf_into(
+                    pid,
+                    &remote,
+                    &mut regs,
+                    mmap,
+                    mprotect,
+                    dlsym,
+                    stack,
+                    sentinel,
+                    name_ptr,
+                    caller_addr,
+                    &bytes,
+                    &extras,
+                )?;
+                eprintln!(
+                    "[inject] {} map={:#x} span={:#x}",
+                    path.display(),
+                    loaded.map,
+                    loaded.image.span(target_page_size(pid).unwrap_or(PAGE))
+                );
+                extras.push(loaded);
+            }
+            PlanItem::AgentEntry => {
+                let agent = fs::read(&options.agent).map_err(Error::Io)?;
+                mapped = Some(load_elf_into(
+                    pid,
+                    &remote,
+                    &mut regs,
+                    mmap,
+                    mprotect,
+                    dlsym,
+                    stack,
+                    sentinel,
+                    name_ptr,
+                    caller_addr,
+                    &agent,
+                    &extras,
+                )?);
+            }
         }
     }
-
-    let agent = fs::read(&options.agent).map_err(Error::Io)?;
-    let mapped = load_elf_into(
-        pid,
-        &remote,
-        &mut regs,
-        mmap,
-        mprotect,
-        dlsym,
-        stack,
-        sentinel,
-        name_ptr,
-        caller_addr,
-        &agent,
-        &extras,
-    )?;
+    let mapped = mapped.ok_or_else(|| Error::Parse("link plan has no agent entry".into()))?;
     let map = mapped.map;
     let load_start = mapped.load_start;
     let image = mapped.image;
@@ -249,6 +256,68 @@ fn inject_locked(options: &AttachOptions, threads: &[u32]) -> Result<Session> {
         scratch,
         resumed: false,
     })
+}
+
+/// One step of the inject load. Companion DSOs are mapped before the agent entry.
+#[derive(Debug, PartialEq, Eq)]
+enum PlanItem {
+    Map(PathBuf),
+    AgentEntry,
+}
+
+/// `DT_NEEDED` entries the process does not already provide, found beside the
+/// agent, followed by the agent entry. Dependencies are listed before the DSO
+/// that needs them.
+fn link_plan(agent: &Path, maps: &[Mapping]) -> Result<Vec<PlanItem>> {
+    let agent_dir = agent.parent().unwrap_or_else(|| Path::new("."));
+    let provided = maps
+        .iter()
+        .filter_map(|mapping| mapping.clean_path())
+        .filter_map(file_name)
+        .map(str::to_owned)
+        .collect();
+    let mut planned = Vec::new();
+    let mut seen = HashSet::new();
+    schedule(agent, agent_dir, &provided, &mut planned, &mut seen, true)?;
+    let mut items = planned.into_iter().map(PlanItem::Map).collect::<Vec<_>>();
+    items.push(PlanItem::AgentEntry);
+    Ok(items)
+}
+
+fn schedule(
+    path: &Path,
+    agent_dir: &Path,
+    provided: &HashSet<String>,
+    planned: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    is_agent: bool,
+) -> Result<()> {
+    let key = path.to_path_buf();
+    if !seen.insert(key.clone()) {
+        return Ok(());
+    }
+    let bytes = fs::read(path).map_err(Error::Io)?;
+    let image = Image::parse(&bytes)?;
+    for soname in &image.needed {
+        if provided.contains(soname) {
+            continue;
+        }
+        let dep = agent_dir.join(soname);
+        if !dep.is_file() {
+            return Err(Error::NotFound(format!(
+                "DT_NEEDED {soname} is not loaded and not next to the agent"
+            )));
+        }
+        schedule(&dep, agent_dir, provided, planned, seen, false)?;
+    }
+    if !is_agent {
+        planned.push(key);
+    }
+    Ok(())
+}
+
+fn file_name(path: &str) -> Option<&str> {
+    Path::new(path).file_name().and_then(|name| name.to_str())
 }
 
 struct MappedElf {
@@ -530,7 +599,9 @@ fn is_error(value: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::target_page_size;
+    use super::{link_plan, target_page_size, PlanItem};
+    use crate::loader::Image;
+    use runtime::maps;
 
     #[test]
     fn reads_self_page_size() {
@@ -539,9 +610,65 @@ mod tests {
     }
 
     #[test]
-    fn maps_companion_cxx_from_agent_dir() {
-        let src = include_str!("session.rs");
-        assert!(src.contains("libc++_shared.so"));
-        assert!(src.contains("load_elf_into"));
+    fn maps_only_the_missing_needed_dso_before_entry() {
+        let dir = std::env::temp_dir().join(format!("commanalyser-needed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let companion_src = dir.join("companion.c");
+        let agent_src = dir.join("agent.c");
+        let companion = dir.join("libcompanion.so");
+        let agent = dir.join("libagent.so");
+        std::fs::write(&companion_src, "void companion_ready(void) {}\n").unwrap();
+        std::fs::write(
+            &agent_src,
+            "#include <string.h>\nextern void companion_ready(void);\nint agent_main(const char *s) {\n    companion_ready();\n    return (int)strlen(s);\n}\n",
+        )
+        .unwrap();
+        let cc = |output: &std::path::Path, extra: &[&str]| {
+            let status = std::process::Command::new("cc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(output)
+                .args(extra)
+                .status()
+                .expect("cc");
+            assert!(status.success(), "cc {output:?} failed: {status}");
+        };
+        cc(&companion, &[companion_src.to_str().unwrap()]);
+        cc(
+            &agent,
+            &[
+                agent_src.to_str().unwrap(),
+                "-L",
+                dir.to_str().unwrap(),
+                "-lcompanion",
+            ],
+        );
+
+        let image = Image::parse(&std::fs::read(&agent).unwrap()).unwrap();
+        assert!(
+            image.needed.iter().any(|name| name == "libcompanion.so"),
+            "needed={:?}",
+            image.needed
+        );
+        assert!(
+            image.needed.iter().any(|name| name != "libcompanion.so"),
+            "fixture should also need a DSO the process already has"
+        );
+        let mut lines = String::new();
+        let mut addr = 0x1000u64;
+        for name in &image.needed {
+            if name == "libcompanion.so" {
+                continue;
+            }
+            lines.push_str(&format!(
+                "{addr:x}-{:x} r-xp 00000000 00:01 1 /lib/{name}\n",
+                addr + 0x1000
+            ));
+            addr += 0x1000;
+        }
+        let loaded = maps::parse_maps(&lines).unwrap();
+        let plan = link_plan(&agent, &loaded).unwrap();
+        assert_eq!(plan, vec![PlanItem::Map(companion), PlanItem::AgentEntry]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

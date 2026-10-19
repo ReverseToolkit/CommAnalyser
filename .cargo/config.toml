@@ -1,4 +1,18 @@
 [target.aarch64-linux-android]
-# NDK default outline-atomics pulls compiler-rt aarch64.c constructors into
-# the agent cdylib; those SIGSEGV on dlopen. LL/SC atomics are enough.
+# Absolute path so a shell without the NDK on PATH still links with it.
+# Outline atomics would pull compiler-rt aarch64.c constructors into the
+# cdylib; those call getauxval during load. LL/SC atomics avoid that object.
+linker = "/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
 rustflags = ["-C", "target-feature=-outline-atomics"]
+
+[env]
+# cc-rs (rquickjs-sys) looks up CC_<triple>, not cargo's linker key.
+CC_aarch64_linux_android = { value = "/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang", force = true }
+CXX_aarch64_linux_android = { value = "/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++", force = true }
+AR_aarch64_linux_android = { value = "/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar", force = true }
+# bindgen (rquickjs-sys on Android) parses QuickJS with this libclang.
+LIBCLANG_PATH = { value = "/usr/lib/llvm-15/lib", force = true }
+# Host clang has no Android sysroot. Without android24 + the NDK sysroot it
+# treats the pointer width as 32-bit and turns on QuickJS NAN boxing, which
+# does not match the 64-bit JSValue the crate's inlines use.
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = { value = "--target=aarch64-linux-android24 --sysroot=/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot", force = true }
