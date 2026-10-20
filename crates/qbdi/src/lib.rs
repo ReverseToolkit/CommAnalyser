@@ -1,6 +1,4 @@
-//! QBDI-backed function trace (TAL door: intercept, run under DBI, batch events).
-//!
-//! The `link` feature statically links TAL (`tal_prepare` / `tal_enter`).
+//! QBDI-backed function trace. The `link` feature statically links QBDI.
 //! Host tests compile without that payload.
 
 mod blacklist;
@@ -25,7 +23,7 @@ use runtime::{Error, Result};
 /// QBDI version this crate is designed against.
 pub const QBDI_VERSION: &str = "0.12";
 
-/// Whether this build statically links TAL.
+/// Whether this build statically links QBDI.
 pub const fn linked() -> bool {
     cfg!(feature = "link")
 }
@@ -93,15 +91,17 @@ mod tests {
     }
 
     #[test]
-    fn link_feature_statically_links_tal() {
+    fn link_feature_statically_links_qbdi() {
         let build = include_str!("../build.rs");
-        assert!(build.contains("cargo:rustc-link-lib=static:+whole-archive=tal_static"));
         assert!(build.contains("cargo:rustc-link-lib=static=QBDI"));
+        assert!(build.contains("cargo:rustc-link-lib=static=qbdi-llvm"));
+        assert!(!build.contains("tal_static"));
+        assert!(!build.contains("frida-gum"));
         let loader = include_str!("load.rs");
-        assert!(loader.contains("fn tal_prepare"));
-        assert!(loader.contains("fn tal_enter"));
-        assert!(!loader.contains("memfd"));
-        assert!(!loader.contains("libtal.so.gz"));
+        assert!(loader.contains("qbdi_initVM"));
+        assert!(loader.contains("qbdi_run"));
+        assert!(loader.contains("SKIP_PATCH"));
+        assert!(!loader.contains("tal_prepare"));
         let clear = include_str!("../../agent/clear_cache.c");
         assert!(!clear.contains("__builtin___clear_cache"));
         assert!(clear.contains("dc cvau"));
@@ -111,14 +111,14 @@ mod tests {
     }
 
     #[test]
-    fn engine_follows_tal_door() {
+    fn engine_uses_qbdi_not_tal() {
         let engine = include_str!("engine.rs");
         assert!(engine.contains("InlineHook"), "our Interceptor is the door");
-        assert!(engine.contains("attach_and_return"), "TAL already ran the body");
+        assert!(engine.contains("attach_and_return"), "QBDI already ran the body");
         assert!(engine.contains("orig_lr"), "keep SP-PAC'd LR for trampoline ret");
-        assert!(engine.contains("tal_prepare") || include_str!("load.rs").contains("tal_prepare"));
-        assert!(include_str!("load.rs").contains("pub q"));
-        assert!(!engine.contains("qbdi_callA"));
+        assert!(engine.contains("load::prepare"));
+        assert!(engine.contains("load::run"));
+        assert!(!engine.contains("tal_prepare"));
         assert!(!engine.contains("gum_attach"));
     }
 }

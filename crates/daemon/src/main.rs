@@ -6,7 +6,7 @@
 mod control_server;
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
@@ -14,7 +14,11 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
+use flate2::read::GzDecoder;
+
 use inject::AttachOptions;
+
+include!(concat!(env!("OUT_DIR"), "/agent_blob.rs"));
 
 struct AgentChannel {
     writer: UnixStream,
@@ -139,22 +143,12 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
         "detach" => error_response("detach: M2".to_owned()),
         "inject" => {
             let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let agent = request
-                .get("agent")
-                .and_then(Value::as_str)
-                .unwrap_or("/data/local/tmp/libagent.so");
-            match inject(pid, agent) {
-                Ok(hello) => {
-                    json!({"ok": true, "pid": pid, "agent": agent, "hello": hello}).to_string()
-                }
+            match inject(pid) {
+                Ok(hello) => json!({"ok": true, "pid": pid, "hello": hello}).to_string(),
                 Err(err) => error_response(format!("inject: {err}")),
             }
         }
         "spawn" => {
-            let agent = request
-                .get("agent")
-                .and_then(Value::as_str)
-                .unwrap_or("/data/local/tmp/libagent.so");
             let package = request.get("package").and_then(Value::as_str);
             let exec = request.get("exec").and_then(Value::as_str);
             let args = request
@@ -167,11 +161,10 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            match spawn(package, exec, &args, agent) {
+            match spawn(package, exec, &args) {
                 Ok((pid, hello)) => json!({
                     "ok": true,
                     "pid": pid,
-                    "agent": agent,
                     "hello": hello,
                     "spawn": true
                 })
@@ -249,7 +242,6 @@ fn spawn(
     package: Option<&str>,
     exec: Option<&str>,
     args: &[String],
-    agent: &str,
 ) -> Result<(u32, String), String> {
     let pid = if let Some(package) = package {
         inject::start_package(package).map_err(|err| format!("{err}"))?
@@ -258,17 +250,30 @@ fn spawn(
     } else {
         return Err("package or exec required".to_owned());
     };
-    let hello = inject(pid, agent)?;
+    let hello = inject(pid)?;
     Ok((pid, hello))
 }
 
-fn inject(pid: u32, agent: &str) -> Result<String, String> {
+fn embedded_agent() -> Result<Vec<u8>, String> {
+    if AGENT_GZ.is_empty() {
+        return Err("embedded agent is empty (build the android daemon after the agent)".into());
+    }
+    let mut decoder = GzDecoder::new(AGENT_GZ);
+    let mut bytes = Vec::new();
+    decoder
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("inflate agent: {err}"))?;
+    if bytes.is_empty() {
+        return Err("embedded agent is empty".into());
+    }
+    Ok(bytes)
+}
+
+fn inject(pid: u32) -> Result<String, String> {
     if pid == 0 {
         return Err("invalid pid".to_owned());
     }
-    if !std::path::Path::new(agent).exists() {
-        return Err(format!("agent not found: {agent}"));
-    }
+    let agent = embedded_agent()?;
 
     let socket_name = format!(
         "agent-{pid}-{:x}",
@@ -281,7 +286,7 @@ fn inject(pid: u32, agent: &str) -> Result<String, String> {
     let listener = control_server::Listener::bind(&socket_name)
         .map_err(|err| format!("bind {socket_name}: {err}"))?;
 
-    let options = AttachOptions::new(pid, agent).with_config(socket_name.clone());
+    let options = AttachOptions::from_bytes(pid, agent).with_config(socket_name.clone());
     let mut session = inject::attach(&options).map_err(|err| format!("{err}"))?;
 
     let stream = listener
@@ -480,7 +485,7 @@ mod tests {
     fn ops_without_session_return_ok_false() {
         for (line, needle) in [
             (
-                r#"{"op":"inject","pid":1,"agent":"/no/such/agent.so"}"#,
+                r#"{"op":"inject","pid":1}"#,
                 "inject:",
             ),
             (r#"{"op":"spawn"}"#, "spawn:"),

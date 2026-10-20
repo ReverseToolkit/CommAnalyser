@@ -22,11 +22,20 @@ pub const fn supported() -> bool {
     cfg!(target_os = "android") || cfg!(target_os = "linux")
 }
 
+/// Where the agent ELF comes from.
+#[derive(Clone, Debug)]
+pub enum AgentSource {
+    /// A file on the target (tests and companion `DT_NEEDED` lookup).
+    Path(String),
+    /// Bytes already in this process. Every `DT_NEEDED` entry must already
+    /// be loaded in the target; nothing is read from disk.
+    Bytes(Vec<u8>),
+}
+
 #[derive(Clone, Debug)]
 pub struct AttachOptions {
     pub pid: u32,
-    /// Path to the agent `.so` on the device.
-    pub agent: String,
+    pub agent: AgentSource,
     /// Entrypoint symbol, default `agent_main`.
     pub entrypoint: String,
     /// Abstract socket name the agent should connect to.
@@ -37,7 +46,16 @@ impl AttachOptions {
     pub fn new(pid: u32, agent: impl Into<String>) -> Self {
         Self {
             pid,
-            agent: agent.into(),
+            agent: AgentSource::Path(agent.into()),
+            entrypoint: "agent_main".to_owned(),
+            config: String::new(),
+        }
+    }
+
+    pub fn from_bytes(pid: u32, agent: Vec<u8>) -> Self {
+        Self {
+            pid,
+            agent: AgentSource::Bytes(agent),
             entrypoint: "agent_main".to_owned(),
             config: String::new(),
         }
@@ -81,7 +99,7 @@ mod tests {
         assert!(matches!(err, Error::Parse(_)));
         let options = AttachOptions::new(1, "agent.so").with_config("sock");
         assert_eq!(options.pid, 1);
-        assert_eq!(options.agent, "agent.so");
+        assert!(matches!(options.agent, AgentSource::Path(ref path) if path == "agent.so"));
         assert_eq!(options.entrypoint, "agent_main");
         assert_eq!(options.config, "sock");
         assert!(supported());

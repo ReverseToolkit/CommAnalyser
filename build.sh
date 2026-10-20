@@ -3,4 +3,5 @@
 set -eu
 cd "$(dirname "$0")"
 
-exec cargo build --release --target aarch64-linux-android -p agent --features qbdi-static "$@"
+cargo build --release --target aarch64-linux-android -p agent --features qbdi-static "$@"
+exec cargo build --release --target aarch64-linux-android -p daemon "$@"

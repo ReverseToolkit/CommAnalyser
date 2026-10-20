@@ -192,16 +192,13 @@ fn command_to_json(command: &str, rest: &[String]) -> Result<Value, String> {
         "inject" => {
             let pid = rest
                 .first()
-                .ok_or("usage: comm-analyser inject <pid> [--agent PATH]")?
+                .ok_or("usage: comm-analyser inject <pid>")?
                 .parse::<u32>()
                 .map_err(|_| "invalid pid".to_owned())?;
-            let agent = rest
-                .iter()
-                .position(|v| v == "--agent")
-                .and_then(|i| rest.get(i + 1))
-                .map(String::as_str)
-                .unwrap_or("/data/local/tmp/libagent.so");
-            Ok(json!({"op": "inject", "pid": pid, "agent": agent}))
+            if rest.len() != 1 {
+                return Err("usage: comm-analyser inject <pid>".to_owned());
+            }
+            Ok(json!({"op": "inject", "pid": pid}))
         }
         "spawn" => spawn_request(rest),
         "agent" => {
@@ -263,7 +260,6 @@ fn command_to_json(command: &str, rest: &[String]) -> Result<Value, String> {
 fn spawn_request(rest: &[String]) -> Result<Value, String> {
     let mut package = None;
     let mut exec = None;
-    let mut agent = "/data/local/tmp/libagent.so".to_owned();
     let mut args = Vec::new();
     let mut i = 0;
     while i < rest.len() {
@@ -276,21 +272,8 @@ fn spawn_request(rest: &[String]) -> Result<Value, String> {
                 i += 1;
                 exec = Some(rest.get(i).ok_or("usage: spawn --exec PATH")?.clone());
             }
-            "--agent" => {
-                i += 1;
-                agent = rest.get(i).ok_or("usage: spawn ... --agent PATH")?.clone();
-            }
             "--" => {
-                let mut j = i + 1;
-                while j < rest.len() {
-                    if rest[j] == "--agent" {
-                        j += 1;
-                        agent = rest.get(j).ok_or("usage: spawn ... --agent PATH")?.clone();
-                    } else {
-                        args.push(rest[j].clone());
-                    }
-                    j += 1;
-                }
+                args.extend(rest[i + 1..].iter().cloned());
                 break;
             }
             other if package.is_none() && exec.is_none() => {
@@ -306,15 +289,14 @@ fn spawn_request(rest: &[String]) -> Result<Value, String> {
     }
     if package.is_none() && exec.is_none() {
         return Err(
-            "usage: spawn --package NAME | --exec PATH [--agent PATH] [-- args]".to_owned(),
+            "usage: spawn --package NAME | --exec PATH [-- args]".to_owned(),
         );
     }
     Ok(json!({
         "op": "spawn",
         "package": package,
         "exec": exec,
-        "args": args,
-        "agent": agent
+        "args": args
     }))
 }
 
@@ -336,13 +318,11 @@ mod tests {
         assert_eq!(attach["op"], "attach");
         assert_eq!(attach["pid"], 42);
 
-        let inject = command_to_json("inject", &args(&["7", "--agent", "/tmp/a.so"])).unwrap();
+        let inject = command_to_json("inject", &args(&["7"])).unwrap();
         assert_eq!(inject["op"], "inject");
         assert_eq!(inject["pid"], 7);
-        assert_eq!(inject["agent"], "/tmp/a.so");
-
-        let inject_default = command_to_json("inject", &args(&["8"])).unwrap();
-        assert_eq!(inject_default["agent"], "/data/local/tmp/libagent.so");
+        assert!(inject.get("agent").is_none());
+        assert!(command_to_json("inject", &args(&["7", "--agent", "/tmp/a.so"])).is_err());
 
         let spawn = command_to_json("spawn", &args(&["--package", "com.foo"])).unwrap();
         assert_eq!(spawn["op"], "spawn");

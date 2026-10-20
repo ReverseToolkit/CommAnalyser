@@ -1,14 +1,13 @@
-//! TAL door via statically linked `tal_prepare` / `tal_enter`.
-//! CommAnalyser Interceptor is the attach; TAL owns the QBDI VM.
+//! Trace door. CommAnalyser Interceptor is the attach; QBDI runs the body.
 
 use std::ptr;
 
 use gum::hook::{InlineHook, SavedRegs};
 use runtime::{Error, Result};
 
-use crate::load;
+use crate::load::{self, GuestRegs};
 use crate::session::TraceConfig;
-use crate::{EventKind, EventRing, TraceEvent};
+use crate::{EventRing, TraceEvent};
 
 struct EngineState {
     hook: Option<SendHook>,
@@ -26,20 +25,16 @@ fn sessions() -> std::sync::MutexGuard<'static, Vec<Option<EngineState>>> {
 }
 
 pub fn install(config: TraceConfig) -> Result<u32> {
-    let api = load::api()?;
     let target = usize::try_from(config.target)
         .map_err(|_| Error::Parse("Trace.function: target does not fit".into()))?;
     if target == 0 {
         return Err(Error::Parse("Trace.function: null target".into()));
     }
-    let until = config.until.unwrap_or(0);
-    if unsafe { (api.prepare)(config.target, until, 0, 3) } != 0 {
-        return Err(Error::Parse("tal_prepare failed".into()));
-    }
+    load::prepare(config.target, config.until.unwrap_or(0), &config.events)?;
     for escape in &config.escapes {
-        unsafe { (api.add_escape)(escape.break_at, escape.resume) };
+        load::add_escape(escape.break_at, escape.resume);
     }
-    // SAFETY: on_enter only uses process-lifetime session state. TAL already
+    // SAFETY: on_enter only uses process-lifetime session state. QBDI already
     // ran the function; the trampoline must return to LR instead of the
     // relocated original (that would sqrt(d0) a second time).
     let hook = unsafe { InlineHook::attach_and_return(target, on_enter, ptr::null_mut())? };
@@ -80,60 +75,35 @@ unsafe extern "C" fn on_enter(regs: *mut SavedRegs, _data: *mut std::ffi::c_void
     if let Some(SendHook(ref mut hook)) = hook {
         let _ = hook.detach();
     }
-    let Ok(api) = load::api() else {
-        return;
-    };
     let orig_lr = unsafe { (*regs).lr };
-    let mut cpu = load::TalCpuContext {
+    let start = strip_pac(unsafe { (*regs).pc });
+    // hypot's paciasp already signed LR with the real SP. The VM skips
+    // autiasp, so the copy it runs with must be the stripped address. The
+    // trampoline still returns through the original signed LR.
+    let stop = strip_pac(orig_lr);
+    let mut guest = GuestRegs {
         x: unsafe { (*regs).x },
         fp: unsafe { (*regs).fp },
-        // hypot's paciasp already signed LR with the real SP. The VM saves
-        // that register and later skips autiasp, so the copy it runs with
-        // must be the stripped address. The trampoline still returns through
-        // the original signed LR.
-        lr: strip_pac(orig_lr),
+        lr: stop,
         sp: unsafe { (*regs).sp },
         nzcv: unsafe { (*regs).nzcv },
-        pc: unsafe { (*regs).pc },
-        q: {
-            let mut q = [0u128; 8];
-            q.copy_from_slice(&unsafe { (*regs).q }[..8]);
-            q
-        },
+        pc: start,
+        q: unsafe { (*regs).q },
     };
-    let _ = unsafe { (api.enter)(&mut cpu) };
+    if load::run(&mut guest, start, stop).is_err() {
+        return;
+    }
     unsafe {
-        (*regs).x = cpu.x;
-        (*regs).fp = cpu.fp;
-        // Leave signs this LR (xpaci; paciza; braaz). RET of the signed
-        // value would fetch the PAC bits.
+        (*regs).x = guest.x;
+        (*regs).fp = guest.fp;
         (*regs).lr = orig_lr;
-        (*regs).sp = cpu.sp;
-        (*regs).nzcv = cpu.nzcv;
-        (*regs).pc = cpu.pc;
-        (*regs).q[..8].copy_from_slice(&cpu.q);
+        (*regs).sp = guest.sp;
+        (*regs).nzcv = guest.nzcv;
+        (*regs).pc = guest.pc;
+        (*regs).q = guest.q;
     }
 }
 
 pub fn drain_events() -> Vec<TraceEvent> {
-    let Ok(api) = load::api() else {
-        return Vec::new();
-    };
-    let mut buf = vec![load::TalEvent::default(); 4096];
-    let n = unsafe { (api.take_events)(buf.as_mut_ptr(), buf.len()) };
-    buf.truncate(n);
-    buf.into_iter()
-        .map(|event| TraceEvent {
-            kind: match event.kind {
-                1 => EventKind::Mem,
-                2 => EventKind::Call,
-                _ => EventKind::Inst,
-            },
-            pc: event.pc,
-            size: event.size as u16,
-            mem_addr: event.mem_addr,
-            mem_value: event.mem_value,
-            is_write: event.is_write != 0,
-        })
-        .collect()
+    load::take_events()
 }

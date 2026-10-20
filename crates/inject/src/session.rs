@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use runtime::maps::{self, Mapping};
 use runtime::{Error, Result};
 
+use crate::AgentSource;
+
 use crate::elf::{self, SymbolCache};
 use crate::loader::{self, Image};
 use crate::ptrace::{self, UserPtRegs};
@@ -176,7 +178,14 @@ fn inject_locked(options: &AttachOptions, threads: &[u32]) -> Result<Session> {
 
     let name_ptr = config_ptr + 0x100;
     let mut extras = Vec::new();
-    let plan = link_plan(Path::new(&options.agent), &maps)?;
+    let agent_bytes = match &options.agent {
+        AgentSource::Path(path) => fs::read(path).map_err(Error::Io)?,
+        AgentSource::Bytes(bytes) => bytes.clone(),
+    };
+    let plan = match &options.agent {
+        AgentSource::Path(path) => link_plan(Path::new(path), &maps)?,
+        AgentSource::Bytes(_) => plan_embedded(&agent_bytes, &maps)?,
+    };
     let mut mapped = None;
     for step in plan {
         match step {
@@ -205,7 +214,6 @@ fn inject_locked(options: &AttachOptions, threads: &[u32]) -> Result<Session> {
                 extras.push(loaded);
             }
             PlanItem::AgentEntry => {
-                let agent = fs::read(&options.agent).map_err(Error::Io)?;
                 mapped = Some(load_elf_into(
                     pid,
                     &remote,
@@ -217,7 +225,7 @@ fn inject_locked(options: &AttachOptions, threads: &[u32]) -> Result<Session> {
                     sentinel,
                     name_ptr,
                     caller_addr,
-                    &agent,
+                    &agent_bytes,
                     &extras,
                 )?);
             }
@@ -282,6 +290,25 @@ fn link_plan(agent: &Path, maps: &[Mapping]) -> Result<Vec<PlanItem>> {
     let mut items = planned.into_iter().map(PlanItem::Map).collect::<Vec<_>>();
     items.push(PlanItem::AgentEntry);
     Ok(items)
+}
+
+/// Embedded agent: every `DT_NEEDED` library must already be in the process.
+fn plan_embedded(bytes: &[u8], maps: &[Mapping]) -> Result<Vec<PlanItem>> {
+    let image = Image::parse(bytes)?;
+    let provided: HashSet<String> = maps
+        .iter()
+        .filter_map(|mapping| mapping.clean_path())
+        .filter_map(file_name)
+        .map(str::to_owned)
+        .collect();
+    for soname in &image.needed {
+        if !provided.contains(soname) {
+            return Err(Error::NotFound(format!(
+                "DT_NEEDED {soname} is not loaded in the target"
+            )));
+        }
+    }
+    Ok(vec![PlanItem::AgentEntry])
 }
 
 fn schedule(

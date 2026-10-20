@@ -2,103 +2,49 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=TAL_LIB_DIR");
-    println!("cargo:rerun-if-changed=../../native/tal/build-android/CMakeFiles/tal.dir");
-    println!("cargo:rerun-if-changed=../../native/tal/android-arm64/libtal.so");
+    println!("cargo:rerun-if-env-changed=QBDI_LIB_DIR");
     if std::env::var("CARGO_FEATURE_LINK").is_err() {
         return;
     }
-    link_tal_static().unwrap_or_else(|err| panic!("TAL static link: {err}"));
+    link_qbdi().unwrap_or_else(|err| panic!("QBDI static link: {err}"));
 }
 
-fn link_tal_static() -> Result<(), String> {
+fn link_qbdi() -> Result<(), String> {
     let manifest =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()));
     let root = manifest.join("../..");
-    let tal_build = std::env::var("TAL_LIB_DIR")
+    let qbdi = std::env::var("QBDI_LIB_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| root.join("native/tal/build-android"));
-    let archive = ensure_tal_static(&tal_build)?;
-    let search = archive
-        .parent()
-        .ok_or_else(|| "tal_static parent".to_owned())?;
+        .unwrap_or_else(|_| root.join("native/tal/build-android/qbdi-src"));
+    if !qbdi.join("libQBDI.a").is_file() {
+        return Err(format!("missing {}", qbdi.join("libQBDI.a").display()));
+    }
 
     // Outline-atomic helpers in compiler_builtins read this flag and fall
     // back to LL/SC when it is zero. Defining it here, before that archive
     // is scanned, keeps compiler-rt's aarch64.c.o (and its .init_array
     // getauxval constructor) out of the link.
-    let flag = lse_flag_archive(&tal_build)?;
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_else(|_| ".".into()));
+    let flag = lse_flag_archive(&out)?;
     println!(
         "cargo:rustc-link-search=native={}",
-        flag.parent().unwrap_or(search).display()
+        flag.parent().unwrap_or(out.as_path()).display()
     );
     println!("cargo:rustc-link-lib=static:+whole-archive=aarch64_lse_flag");
 
-    println!("cargo:rustc-link-search=native={}", search.display());
-    println!(
-        "cargo:rustc-link-search=native={}",
-        tal_build.join("qbdi-src").display()
-    );
-    println!(
-        "cargo:rustc-link-search=native={}",
-        tal_build.join("boost-lite/libs/context").display()
-    );
-    println!(
-        "cargo:rustc-link-search=native={}",
-        root.join("native/tal/libs/frida-gum/android").display()
-    );
-
-    println!("cargo:rustc-link-lib=static:+whole-archive=tal_static");
+    println!("cargo:rustc-link-search=native={}", qbdi.display());
     println!("cargo:rustc-link-lib=static=QBDI");
     println!("cargo:rustc-link-lib=static=qbdi-llvm");
-    println!("cargo:rustc-link-lib=static=boost_context");
-    println!("cargo:rustc-link-lib=static=frida-gum");
+    // NDK libc++ and unwind, inside the agent. The system libc++.so uses a
+    // different ABI namespace, so it cannot satisfy these symbols.
+    // Static libc++_static pulls scudo, and those constructors SIGSEGV
+    // during inject. The NDK shared library keeps new/delete on bionic.
     println!("cargo:rustc-link-lib=dylib=c++_shared");
     println!("cargo:rustc-link-lib=dylib=log");
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=m");
     println!("cargo:rustc-link-lib=dylib=c");
     Ok(())
-}
-
-fn ensure_tal_static(tal_build: &Path) -> Result<PathBuf, String> {
-    let archive = tal_build.join("libtal_static.a");
-    let mut objs = Vec::new();
-    collect_objs(&tal_build.join("CMakeFiles/tal.dir"), &mut objs);
-    if objs.is_empty() {
-        if archive.exists() {
-            return Ok(archive);
-        }
-        return Err(format!(
-            "no TAL objects under {}",
-            tal_build.join("CMakeFiles/tal.dir").display()
-        ));
-    }
-    let ar = ndk_ar();
-    let status = Command::new(&ar)
-        .arg("crs")
-        .arg(&archive)
-        .args(&objs)
-        .status()
-        .map_err(|err| format!("{ar}: {err}"))?;
-    if !status.success() {
-        return Err(format!("{ar} crs libtal_static.a failed: {status}"));
-    }
-    Ok(archive)
-}
-
-fn collect_objs(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_objs(&path, out);
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("o") {
-            out.push(path);
-        }
-    }
 }
 
 fn lse_flag_archive(dir: &Path) -> Result<PathBuf, String> {
