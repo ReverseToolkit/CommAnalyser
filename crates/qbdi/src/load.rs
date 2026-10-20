@@ -23,7 +23,6 @@ const ANALYSIS_INSTRUCTION: u32 = 1;
 const MEMORY_READ_WRITE: u32 = 3;
 const MEMORY_WRITE: u32 = 2;
 
-const VM_STACK: usize = 16 << 20;
 const EXEC_TRANSFER: u32 = policy::EXEC_TRANSFER_CALL | policy::EXEC_TRANSFER_RETURN;
 
 /// Guest registers copied into QBDI before `qbdi_run` and back afterwards.
@@ -89,16 +88,8 @@ struct Vm(*mut c_void);
 
 unsafe impl Send for Vm {}
 
-struct HostStack {
-    base: *mut u8,
-    size: usize,
-}
-
-unsafe impl Send for HostStack {}
-
 struct Door {
     vm: Vm,
-    stack: HostStack,
     events: Vec<TraceEvent>,
     escapes: Vec<(u64, u64)>,
     until: u64,
@@ -179,21 +170,12 @@ pub fn prepare(target: u64, until: u64, events: &EventMask, extra: &[String]) ->
         }
         drop_conflict_ranges(vm, extra);
     }
-    let stack = match map_stack() {
-        Ok(stack) => stack,
-        Err(err) => {
-            unsafe { qbdi_terminateVM(vm) };
-            return Err(err);
-        }
-    };
     let mut slot = door();
     if let Some(previous) = slot.take() {
         unsafe { qbdi_terminateVM(previous.vm.0) };
-        unmap_stack(&previous.stack);
     }
     *slot = Some(Door {
         vm: Vm(vm),
-        stack,
         events: Vec::new(),
         escapes: Vec::new(),
         until,
@@ -229,75 +211,13 @@ pub fn run(regs: &mut GuestRegs, start: u64, stop: u64) -> Result<()> {
         }
         copy_gpr_in(gpr, regs);
         (*fpr).v = regs.q;
-        let top = {
-            let slot = door();
-            let door = slot.as_ref().expect("VM prepared");
-            policy::aligned_stack_top(door.stack.base as usize, door.stack.size)
-        };
-        qbdi_run_on_stack(top as *mut u8, vm, start, stop);
+        // Guest SP stays the hooked thread's stack. qbdi_run uses that same
+        // stack; it does not switch to a side buffer.
+        qbdi_run(vm, start, stop);
         copy_gpr_out(regs, gpr);
         regs.q = (*fpr).v;
     }
     Ok(())
-}
-
-fn map_stack() -> Result<HostStack> {
-    let base = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            VM_STACK,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if base == libc::MAP_FAILED {
-        return Err(Error::Parse("VM stack mmap failed".into()));
-    }
-    Ok(HostStack {
-        base: base.cast(),
-        size: VM_STACK,
-    })
-}
-
-fn unmap_stack(stack: &HostStack) {
-    if !stack.base.is_null() {
-        unsafe { libc::munmap(stack.base.cast(), stack.size) };
-    }
-}
-
-/// Run `qbdi_run` on `stack_top` so QBDI's frames are not the hook frame.
-unsafe fn qbdi_run_on_stack(stack_top: *mut u8, vm: *mut c_void, start: u64, stop: u64) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        core::arch::asm!(
-            "mov x9, sp",
-            "mov sp, x10",
-            "stp x29, x30, [sp, #-32]!",
-            "str x9, [sp, #16]",
-            "mov x29, sp",
-            "mov x0, x11",
-            "mov x1, x12",
-            "mov x2, x13",
-            "blr x14",
-            "ldr x9, [sp, #16]",
-            "ldp x29, x30, [sp], #32",
-            "mov sp, x9",
-            in("x10") stack_top,
-            in("x11") vm,
-            in("x12") start,
-            in("x13") stop,
-            in("x14") qbdi_run as *const (),
-            out("x9") _,
-            out("x0") _,
-            clobber_abi("C"),
-        );
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = (stack_top, vm, start, stop);
-    }
 }
 
 pub fn take_events() -> Vec<TraceEvent> {

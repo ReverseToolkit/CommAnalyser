@@ -44,11 +44,6 @@ pub fn apply_transfer(event: u32, sp: u64, saved: u64) -> (u64, u64) {
     }
 }
 
-/// Top of a dedicated VM stack, 16-byte aligned, below `base + size`.
-pub fn aligned_stack_top(base: usize, size: usize) -> usize {
-    (base + size) & !15
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,11 +77,5 @@ mod tests {
         assert_eq!((sp, saved), (0x7fff_0000, 0x7fff_0000));
         let (sp, saved) = apply_transfer(0, 0x55, 0x66);
         assert_eq!((sp, saved), (0x55, 0x66));
-    }
-
-    #[test]
-    fn stack_top_is_16_byte_aligned() {
-        assert_eq!(aligned_stack_top(0x1000, 0x10000) & 15, 0);
-        assert!(aligned_stack_top(0x1001, 0x20) <= 0x1001 + 0x20);
     }
 }
