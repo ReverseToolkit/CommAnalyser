@@ -321,19 +321,6 @@ pub(crate) fn handle_op(op: &str, request: &Value, worker: Option<&JsWorker>) ->
                 None => json!({"ok": false, "error": "QuickJS unavailable"}),
             }
         }
-        "call_int1" => {
-            let address = request.get("address").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let arg = request.get("arg").and_then(Value::as_i64).unwrap_or(0) as u64;
-            if address == 0 {
-                json!({"ok": false, "error": "null callback"})
-            } else {
-                // SAFETY: the caller passes a NativeCallback stub with this ABI.
-                let function: unsafe extern "C" fn(u64) -> u64 =
-                    unsafe { std::mem::transmute(address) };
-                let result = unsafe { function(arg) };
-                json!({"ok": true, "result": result})
-            }
-        }
         "call_getpid" => {
             let mut last = 0;
             for _ in 0..5 {
@@ -402,12 +389,8 @@ mod tests {
     use super::handle_op;
     use serde_json::json;
 
-    unsafe extern "C" fn twice(value: u64) -> u64 {
-        value.wrapping_mul(2)
-    }
-
     #[test]
-    fn ping_unknown_and_null_call() {
+    fn ping_and_unknown_command() {
         let ping = handle_op("ping", &json!({}), None).unwrap();
         assert_eq!(ping["ok"], true);
         assert_eq!(ping["pong"], true);
@@ -422,22 +405,12 @@ mod tests {
             "{unknown}"
         );
 
-        let null_call = handle_op("call_int1", &json!({"address": 0, "arg": 1}), None).unwrap();
-        assert_eq!(null_call["ok"], false);
-        assert_eq!(null_call["error"], "null callback");
-
         assert!(handle_op("bye", &json!({}), None).is_none());
         assert!(handle_op("exit", &json!({}), None).is_none());
     }
 
     #[test]
-    fn call_int1_and_getpid_run_on_host() {
-        let address = twice as *const () as u64;
-        let response =
-            handle_op("call_int1", &json!({"address": address, "arg": 21}), None).unwrap();
-        assert_eq!(response["ok"], true);
-        assert_eq!(response["result"], 42);
-
+    fn getpid_runs_on_host() {
         let pid = handle_op("call_getpid", &json!({}), None).unwrap();
         assert_eq!(pid["ok"], true);
         assert_eq!(pid["pid"], std::process::id());

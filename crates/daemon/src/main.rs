@@ -208,24 +208,6 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
                 Err(err) => error_response(format!("rpc: {err}")),
             }
         }
-        "call" => {
-            let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let address = request.get("address").and_then(Value::as_u64).unwrap_or(0);
-            let arg = request.get("arg").and_then(Value::as_i64).unwrap_or(0);
-            match agent_request(
-                pid,
-                &json!({"op": "call_int1", "address": address, "arg": arg}),
-            ) {
-                Ok(response) => json!({
-                    "ok": true,
-                    "pid": pid,
-                    "response": response,
-                    "messages": take_messages(),
-                })
-                .to_string(),
-                Err(err) => error_response(format!("call: {err}")),
-            }
-        }
         "selftest" => {
             let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
             let suite = request.get("suite").and_then(Value::as_str);
@@ -505,7 +487,6 @@ mod tests {
             (r#"{"op":"agent","pid":1,"command":"ping"}"#, "agent:"),
             (r#"{"op":"eval","pid":1,"code":"1"}"#, "eval:"),
             (r#"{"op":"rpc","pid":1,"name":"add","args":[]}"#, "rpc:"),
-            (r#"{"op":"call","pid":1,"address":1,"arg":0}"#, "call:"),
             (
                 r#"{"op":"selftest","pid":1,"suite":"runtime"}"#,
                 "selftest:",

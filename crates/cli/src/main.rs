@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: comm-analyser [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|spawn|agent|eval|call|rpc|selftest>";
+const USAGE: &str = "usage: comm-analyser [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|spawn|agent|eval|rpc|selftest>";
 
 fn main() -> ExitCode {
     match run() {
@@ -139,7 +139,6 @@ fn print_help() {
            spawn --package P | --exec PATH [args]   start then inject\n\
            agent <pid> <command>  send a command to an injected agent\n\
            eval <pid> <expression>  evaluate JS in the agent\n\
-           call <pid> <address> [arg]  call a native function\n\
            rpc <pid> <name> [json-args]  invoke rpc.exports\n\
            selftest <pid> [suite]  run in-process agent tests\n"
     );
@@ -232,29 +231,6 @@ fn command_to_json(command: &str, rest: &[String]) -> Result<Value, String> {
                 .map_err(|err| format!("invalid args: {err}"))?
                 .unwrap_or_else(|| json!([]));
             Ok(json!({"op": "rpc", "pid": pid, "name": name, "args": args}))
-        }
-        "call" => {
-            let pid = rest
-                .first()
-                .ok_or("usage: comm-analyser call <pid> <address> <arg>")?
-                .parse::<u32>()
-                .map_err(|_| "invalid pid".to_owned())?;
-            let address = rest
-                .get(1)
-                .ok_or("usage: comm-analyser call <pid> <address> <arg>")?;
-            let address = address
-                .strip_prefix("0x")
-                .or_else(|| address.strip_prefix("0X"))
-                .unwrap_or(address);
-            let address =
-                u64::from_str_radix(address, 16).map_err(|_| "invalid address".to_owned())?;
-            let arg = rest
-                .get(2)
-                .map(String::as_str)
-                .unwrap_or("0")
-                .parse::<i64>()
-                .map_err(|_| "invalid arg".to_owned())?;
-            Ok(json!({"op": "call", "pid": pid, "address": address, "arg": arg}))
         }
         "eval" => {
             let pid = rest
@@ -387,11 +363,6 @@ mod tests {
         assert_eq!(eval["pid"], 3);
         assert_eq!(eval["code"], "1 + 2");
 
-        let call = command_to_json("call", &args(&["4", "0x10", "7"])).unwrap();
-        assert_eq!(call["op"], "call");
-        assert_eq!(call["address"], 16);
-        assert_eq!(call["arg"], 7);
-
         let rpc = command_to_json("rpc", &args(&["5", "add", "[1,2]"])).unwrap();
         assert_eq!(rpc["op"], "rpc");
         assert_eq!(rpc["name"], "add");
@@ -416,7 +387,7 @@ mod tests {
     #[test]
     fn help_lists_every_usage_command() {
         for command in [
-            "ping", "version", "ps", "attach", "inject", "spawn", "agent", "eval", "call", "rpc",
+            "ping", "version", "ps", "attach", "inject", "spawn", "agent", "eval", "rpc",
             "selftest",
         ] {
             assert!(USAGE.contains(command), "{command}");
