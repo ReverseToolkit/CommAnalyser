@@ -1264,6 +1264,40 @@ fn apply_context(this: Object<'_>, regs: &mut SavedRegs) -> JsResult<()> {
             regs.x[index] = value;
         }
     }
+    apply_vector(&context, regs)?;
+    Ok(())
+}
+
+/// Q0–Q7 are the AAPCS64 float/vector argument and return registers.
+/// `qN` is the full 16 bytes. `dN` is the low f64 and `sN` the low f32.
+fn apply_vector(context: &Object<'_>, regs: &mut SavedRegs) -> JsResult<()> {
+    for index in 0..regs.q.len() {
+        let original = regs.q[index].to_le_bytes();
+        let mut next = original;
+        if let Ok(buffer) = context.get::<_, ArrayBuffer<'_>>(format!("q{index}")) {
+            // SAFETY: the ArrayBuffer is a live JS value for this call.
+            if let Some(bytes) = unsafe { buffer.as_bytes() } {
+                if bytes.len() >= 16 && bytes[..16] != original[..] {
+                    next.copy_from_slice(&bytes[..16]);
+                    regs.q[index] = u128::from_le_bytes(next);
+                    continue;
+                }
+            }
+        }
+        if let Ok(value) = context.get::<_, f64>(format!("s{index}")) {
+            let bits = (value as f32).to_le_bytes();
+            if bits != original[..4] {
+                next[..4].copy_from_slice(&bits);
+            }
+        }
+        if let Ok(value) = context.get::<_, f64>(format!("d{index}")) {
+            let bits = value.to_le_bytes();
+            if bits != original[..8] {
+                next[..8].copy_from_slice(&bits);
+            }
+        }
+        regs.q[index] = u128::from_le_bytes(next);
+    }
     Ok(())
 }
 
@@ -1286,6 +1320,19 @@ fn make_this<'js>(
             None => NativePointer::instance(ctx.clone(), regs.x[index])?,
         };
         context.set(format!("x{index}"), pointer)?;
+    }
+    for index in 0..regs.q.len() {
+        let bytes = regs.q[index].to_le_bytes();
+        context.set(
+            format!("q{index}"),
+            ArrayBuffer::new(ctx.clone(), bytes.to_vec())?,
+        )?;
+        let mut d_bytes = [0u8; 8];
+        d_bytes.copy_from_slice(&bytes[..8]);
+        let mut s_bytes = [0u8; 4];
+        s_bytes.copy_from_slice(&bytes[..4]);
+        context.set(format!("d{index}"), f64::from_le_bytes(d_bytes))?;
+        context.set(format!("s{index}"), f32::from_le_bytes(s_bytes) as f64)?;
     }
 
     let this = Object::new(ctx.clone())?;

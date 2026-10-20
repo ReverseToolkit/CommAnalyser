@@ -945,6 +945,53 @@ mod tests {
     }
 
     #[test]
+    fn interceptor_enter_rewrites_context_vectors() {
+        let _js = crate::js_test_guard();
+        let (events, _received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        let addr = worker
+            .eval(
+                r#"
+                (function () {
+                    const page = Memory.alloc(Process.pageSize);
+                    Memory.protect(page, Process.pageSize, 'rwx');
+                    page.writeU32(0xd503201f);
+                    page.add(4).writeU32(0xd503201f);
+                    page.add(8).writeU32(0xd503201f);
+                    page.add(12).writeU32(0xd503201f);
+                    Interceptor.attach(page, {
+                        onEnter: function () {
+                            if (this.context.q0.byteLength !== 16) {
+                                throw new Error('q0');
+                            }
+                            if (this.context.d0 !== 1.5) {
+                                throw new Error('d0=' + this.context.d0);
+                            }
+                            if (this.context.s1 !== 2) {
+                                throw new Error('s1=' + this.context.s1);
+                            }
+                            this.context.d0 = 4;
+                            this.context.s1 = 0.25;
+                            const bytes = new Uint8Array(this.context.q2);
+                            bytes[0] = 0x11;
+                        }
+                    });
+                    return page.toString();
+                })()
+                "#,
+            )
+            .unwrap();
+        let target = u64::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap() as usize;
+        let mut regs = SavedRegs::default();
+        regs.q[0] = 1.5f64.to_bits() as u128;
+        regs.q[1] = 2.0f32.to_bits() as u128;
+        let after = worker.fire_enter(0, target, regs).unwrap();
+        assert_eq!(after.q[0] as u64, 4.0f64.to_bits(), "d0");
+        assert_eq!(after.q[1] as u32, 0.25f32.to_bits(), "s1");
+        assert_eq!(after.q[2] as u8, 0x11, "q2 byte 0");
+    }
+
+    #[test]
     fn interceptor_enter_rewrites_context_x0() {
         let _js = crate::js_test_guard();
         let (events, _received) = std::sync::mpsc::channel();
