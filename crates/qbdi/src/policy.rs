@@ -30,6 +30,12 @@ pub fn escape_resume(escapes: &[(u64, u64)], pc: u64) -> Option<u64> {
     })
 }
 
+/// Top of the host stack used only by `qbdi_run`, 16-byte aligned.
+/// The guest GPR `SP` is not this address.
+pub fn aligned_stack_top(base: usize, size: usize) -> usize {
+    (base + size) & !15
+}
+
 /// Stack pointer after an execution transfer.
 ///
 /// A call keeps the guest stack and remembers it. A return puts that saved
@@ -77,5 +83,15 @@ mod tests {
         assert_eq!((sp, saved), (0x7fff_0000, 0x7fff_0000));
         let (sp, saved) = apply_transfer(0, 0x55, 0x66);
         assert_eq!((sp, saved), (0x55, 0x66));
+    }
+
+    #[test]
+    fn host_stack_top_is_aligned_and_not_the_guest_base() {
+        let base = 0x1000usize;
+        let size = 0x10000usize;
+        let top = aligned_stack_top(base, size);
+        assert_eq!(top & 15, 0);
+        assert_ne!(top, base);
+        assert!(top <= base + size);
     }
 }
