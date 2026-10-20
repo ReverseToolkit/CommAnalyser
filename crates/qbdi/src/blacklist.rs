@@ -60,6 +60,11 @@ mod tests {
         assert!(is_conflict("boot.oat"));
         assert!(is_conflict("/data/local/tmp/libagent.so"));
         assert!(!is_conflict("libfoo.so"));
-        assert!(is_excluded("libfoo.so", &["libfoo".into()]));
+        assert!(!is_conflict("/system/lib64/libm.so"));
+        assert!(is_excluded(
+            "/data/app/libextra.so",
+            &["libextra.so".into()]
+        ));
+        assert!(!is_excluded("/system/lib64/libm.so", &["libextra.so".into()]));
     }
 }

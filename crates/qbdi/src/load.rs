@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use runtime::{Error, Result};
 
 use crate::blacklist;
+use crate::policy;
 use crate::session::EventMask;
 use crate::TraceEvent;
 use crate::EventKind;
@@ -22,16 +23,8 @@ const ANALYSIS_INSTRUCTION: u32 = 1;
 const MEMORY_READ_WRITE: u32 = 3;
 const MEMORY_WRITE: u32 = 2;
 
-const PAC_HINTS: [u32; 8] = [
-    0xD503_233F, // PACIASP
-    0xD503_237F, // PACIBSP
-    0xD503_23BF, // AUTIASP
-    0xD503_23FF, // AUTIBSP
-    0xD503_231F, // PACIAZ
-    0xD503_235F, // PACIBZ
-    0xD503_239F, // AUTIAZ
-    0xD503_23DF, // AUTIBZ
-];
+const VM_STACK: usize = 16 << 20;
+const EXEC_TRANSFER: u32 = policy::EXEC_TRANSFER_CALL | policy::EXEC_TRANSFER_RETURN;
 
 /// Guest registers copied into QBDI before `qbdi_run` and back afterwards.
 pub struct GuestRegs {
@@ -96,11 +89,20 @@ struct Vm(*mut c_void);
 
 unsafe impl Send for Vm {}
 
+struct HostStack {
+    base: *mut u8,
+    size: usize,
+}
+
+unsafe impl Send for HostStack {}
+
 struct Door {
     vm: Vm,
+    stack: HostStack,
     events: Vec<TraceEvent>,
     escapes: Vec<(u64, u64)>,
     until: u64,
+    transfer_sp: u64,
     inst: bool,
     mem: bool,
     call: bool,
@@ -134,10 +136,27 @@ extern "C" {
     fn qbdi_recordMemoryAccess(instance: *mut c_void, kind: u32) -> bool;
     fn qbdi_getInstMemoryAccess(instance: *mut c_void, size: *mut usize) -> *mut MemoryAccess;
     fn qbdi_run(instance: *mut c_void, start: u64, stop: u64) -> bool;
+    fn qbdi_addVMEventCB(
+        instance: *mut c_void,
+        mask: u32,
+        cbk: unsafe extern "C" fn(
+            *mut c_void,
+            *const VmEventState,
+            *mut GprState,
+            *mut FprState,
+            *mut c_void,
+        ) -> u32,
+        data: *mut c_void,
+    ) -> u32;
+}
+
+#[repr(C)]
+struct VmEventState {
+    event: u32,
 }
 
 /// Create a VM for `target`, instrument its module, and drop conflict ranges.
-pub fn prepare(target: u64, until: u64, events: &EventMask) -> Result<()> {
+pub fn prepare(target: u64, until: u64, events: &EventMask, extra: &[String]) -> Result<()> {
     let mut vm = ptr::null_mut();
     unsafe { qbdi_initVM(&mut vm, ptr::null(), ptr::null()) };
     if vm.is_null() {
@@ -151,23 +170,34 @@ pub fn prepare(target: u64, until: u64, events: &EventMask) -> Result<()> {
             qbdi_recordMemoryAccess(vm, MEMORY_READ_WRITE);
             qbdi_addCodeCB(vm, POSTINST, post_inst, ptr::null_mut(), 0);
         }
+        qbdi_addVMEventCB(vm, EXEC_TRANSFER, on_transfer, ptr::null_mut());
         if !qbdi_addInstrumentedModuleFromAddr(vm, target) {
             qbdi_terminateVM(vm);
             return Err(Error::Parse(
                 "qbdi_addInstrumentedModuleFromAddr failed".into(),
             ));
         }
-        drop_conflict_ranges(vm);
+        drop_conflict_ranges(vm, extra);
     }
+    let stack = match map_stack() {
+        Ok(stack) => stack,
+        Err(err) => {
+            unsafe { qbdi_terminateVM(vm) };
+            return Err(err);
+        }
+    };
     let mut slot = door();
     if let Some(previous) = slot.take() {
         unsafe { qbdi_terminateVM(previous.vm.0) };
+        unmap_stack(&previous.stack);
     }
     *slot = Some(Door {
         vm: Vm(vm),
+        stack,
         events: Vec::new(),
         escapes: Vec::new(),
         until,
+        transfer_sp: 0,
         inst: events.inst,
         mem: events.mem,
         call: events.call,
@@ -199,11 +229,75 @@ pub fn run(regs: &mut GuestRegs, start: u64, stop: u64) -> Result<()> {
         }
         copy_gpr_in(gpr, regs);
         (*fpr).v = regs.q;
-        qbdi_run(vm, start, stop);
+        let top = {
+            let slot = door();
+            let door = slot.as_ref().expect("VM prepared");
+            policy::aligned_stack_top(door.stack.base as usize, door.stack.size)
+        };
+        qbdi_run_on_stack(top as *mut u8, vm, start, stop);
         copy_gpr_out(regs, gpr);
         regs.q = (*fpr).v;
     }
     Ok(())
+}
+
+fn map_stack() -> Result<HostStack> {
+    let base = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            VM_STACK,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return Err(Error::Parse("VM stack mmap failed".into()));
+    }
+    Ok(HostStack {
+        base: base.cast(),
+        size: VM_STACK,
+    })
+}
+
+fn unmap_stack(stack: &HostStack) {
+    if !stack.base.is_null() {
+        unsafe { libc::munmap(stack.base.cast(), stack.size) };
+    }
+}
+
+/// Run `qbdi_run` on `stack_top` so QBDI's frames are not the hook frame.
+unsafe fn qbdi_run_on_stack(stack_top: *mut u8, vm: *mut c_void, start: u64, stop: u64) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        core::arch::asm!(
+            "mov x9, sp",
+            "mov sp, x10",
+            "stp x29, x30, [sp, #-32]!",
+            "str x9, [sp, #16]",
+            "mov x29, sp",
+            "mov x0, x11",
+            "mov x1, x12",
+            "mov x2, x13",
+            "blr x14",
+            "ldr x9, [sp, #16]",
+            "ldp x29, x30, [sp], #32",
+            "mov sp, x9",
+            in("x10") stack_top,
+            in("x11") vm,
+            in("x12") start,
+            in("x13") stop,
+            in("x14") qbdi_run as *const (),
+            out("x9") _,
+            out("x0") _,
+            clobber_abi("C"),
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (stack_top, vm, start, stop);
+    }
 }
 
 pub fn take_events() -> Vec<TraceEvent> {
@@ -235,7 +329,7 @@ fn copy_gpr_out(dst: &mut GuestRegs, src: *const GprState) {
     }
 }
 
-fn drop_conflict_ranges(vm: *mut c_void) {
+fn drop_conflict_ranges(vm: *mut c_void, extra: &[String]) {
     let mut size = 0usize;
     let maps = unsafe { qbdi_getCurrentProcessMaps(true, &mut size) };
     if maps.is_null() {
@@ -247,7 +341,7 @@ fn drop_conflict_ranges(vm: *mut c_void) {
             continue;
         }
         let name = unsafe { std::ffi::CStr::from_ptr(map.name.cast()) }.to_string_lossy();
-        if blacklist::is_conflict(&name) {
+        if blacklist::is_excluded(&name, extra) {
             unsafe { qbdi_removeInstrumentedRange(vm, map.start, map.end) };
         }
     }
@@ -269,7 +363,7 @@ unsafe extern "C" fn pre_inst(
     let is_call = unsafe { (*analysis).is_call };
     if address != 0 {
         let word = unsafe { ptr::read_unaligned(address as *const u32) };
-        if PAC_HINTS.contains(&word) {
+        if policy::is_pac_hint(word) {
             return SKIP_PATCH;
         }
     }
@@ -277,8 +371,8 @@ unsafe extern "C" fn pre_inst(
     let Some(door) = slot.as_mut() else {
         return CONTINUE;
     };
-    if let Some((_, resume)) = door.escapes.iter().find(|(at, _)| *at == address) {
-        unsafe { (*gpr).pc = *resume };
+    if let Some(resume) = policy::escape_resume(&door.escapes, address) {
+        unsafe { (*gpr).pc = resume };
         return BREAK_TO_VM;
     }
     if door.inst {
@@ -333,5 +427,26 @@ unsafe extern "C" fn post_inst(
             is_write: access.kind & MEMORY_WRITE != 0,
         });
     }
+    CONTINUE
+}
+
+unsafe extern "C" fn on_transfer(
+    _vm: *mut c_void,
+    state: *const VmEventState,
+    gpr: *mut GprState,
+    _fpr: *mut FprState,
+    _data: *mut c_void,
+) -> u32 {
+    if state.is_null() || gpr.is_null() {
+        return CONTINUE;
+    }
+    let event = unsafe { (*state).event };
+    let mut slot = door();
+    let Some(door) = slot.as_mut() else {
+        return CONTINUE;
+    };
+    let (sp, saved) = policy::apply_transfer(event, unsafe { (*gpr).sp }, door.transfer_sp);
+    unsafe { (*gpr).sp = sp };
+    door.transfer_sp = saved;
     CONTINUE
 }

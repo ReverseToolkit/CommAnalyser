@@ -2,6 +2,7 @@
 //! Host tests compile without that payload.
 
 mod blacklist;
+mod policy;
 mod probe;
 mod ring;
 mod session;

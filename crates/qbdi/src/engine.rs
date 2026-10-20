@@ -30,7 +30,12 @@ pub fn install(config: TraceConfig) -> Result<u32> {
     if target == 0 {
         return Err(Error::Parse("Trace.function: null target".into()));
     }
-    load::prepare(config.target, config.until.unwrap_or(0), &config.events)?;
+    load::prepare(
+        config.target,
+        config.until.unwrap_or(0),
+        &config.events,
+        &config.extra_exclude,
+    )?;
     for escape in &config.escapes {
         load::add_escape(escape.break_at, escape.resume);
     }
