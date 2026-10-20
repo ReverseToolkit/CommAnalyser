@@ -1,6 +1,6 @@
 //! Minimal AArch64 inline hook.
 //!
-//! The trampoline saves GPRs plus Q0–Q7 (AAPCS64 argument/return NEON),
+//! The trampoline saves GPRs plus Q0–Q31,
 //! calls a Rust `onEnter` callback, then either executes the relocated
 //! prologue or jumps to the saved LR.  Mid-function resume uses `RET Xn`,
 //! matching Frida `put_jmp_reg` when pointer authentication is not the way
@@ -19,8 +19,8 @@ use crate::memory::{flush_icache, protect};
 
 const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
 const PAGE: usize = 0x1000;
-/// GPR frame (272) plus Q0–Q7 (128). AAPCS64 float args/returns live in V0–V7.
-const SAVE_SIZE: u32 = 400;
+/// GPR frame (272) plus Q0–Q31 (512).
+const SAVE_SIZE: u32 = 784;
 const NEAR_RADIUS: usize = 0x700_0000;
 const OFF_LR: u32 = 240;
 const OFF_SP: u32 = 248;
@@ -28,7 +28,7 @@ const OFF_NZCV: u32 = 256;
 const OFF_PC: u32 = 264;
 const OFF_Q: u32 = 272;
 
-/// AArch64 GPRs plus the eight argument/return NEON registers (Q0–Q7).
+/// AArch64 GPRs plus all 32 NEON registers (Q0–Q31).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SavedRegs {
@@ -38,7 +38,7 @@ pub struct SavedRegs {
     pub sp: u64,
     pub nzcv: u64,
     pub pc: u64,
-    pub q: [u128; 8],
+    pub q: [u128; 32],
 }
 
 impl SavedRegs {
@@ -141,7 +141,7 @@ pub struct InlineHook {
 
 impl InlineHook {
     /// Install a hook at `target`.  `callback` runs with the saved registers
-    /// and may modify GPRs/Q0–Q7 before the relocated prologue executes.
+    /// and may modify GPRs and Q0–Q31 before the relocated prologue executes.
     ///
     /// # Safety
     /// `user_data` must remain valid for as long as the hook is active.
@@ -456,13 +456,13 @@ fn emit_save_regs(w: &mut CodeWriter) {
     w.str_imm(16, 31, OFF_SP);
     w.put(0xD53B_4210); // mrs x16, nzcv
     w.str_imm(16, 31, OFF_NZCV);
-    for i in 0..4u8 {
+    for i in 0..16u8 {
         w.stp_q(i * 2, i * 2 + 1, 31, i64::from(OFF_Q + u32::from(i) * 32));
     }
 }
 
 fn emit_restore_regs(w: &mut CodeWriter) {
-    for i in 0..4u8 {
+    for i in 0..16u8 {
         w.ldp_q(i * 2, i * 2 + 1, 31, i64::from(OFF_Q + u32::from(i) * 32));
     }
     w.ldr_imm(16, 31, OFF_NZCV);
@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn saved_regs_layout() {
-        assert_eq!(std::mem::size_of::<SavedRegs>(), 400);
+        assert_eq!(std::mem::size_of::<SavedRegs>(), 784);
         assert_eq!(std::mem::size_of::<SavedRegs>(), SAVE_SIZE as usize);
         assert_eq!(core::mem::offset_of!(SavedRegs, lr), OFF_LR as usize);
         assert_eq!(core::mem::offset_of!(SavedRegs, sp), OFF_SP as usize);
@@ -707,7 +707,7 @@ mod tests {
         unsafe { ptr::write_unaligned(target as *mut u32, 0xD503_201F) };
         let hook =
             unsafe { InlineHook::attach(target, empty_enter, ptr::null_mut()) }.expect("attach");
-        let bytes = unsafe { std::slice::from_raw_parts(hook.trampoline() as *const u8, 0x400) };
+        let bytes = unsafe { std::slice::from_raw_parts(hook.trampoline() as *const u8, 0x800) };
         let words: Vec<u32> = bytes
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))

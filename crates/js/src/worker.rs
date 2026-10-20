@@ -970,10 +970,14 @@ mod tests {
                             if (this.context.s1 !== 2) {
                                 throw new Error('s1=' + this.context.s1);
                             }
+                            if (this.context.q31.byteLength !== 16) {
+                                throw new Error('q31');
+                            }
                             this.context.d0 = 4;
                             this.context.s1 = 0.25;
                             const bytes = new Uint8Array(this.context.q2);
                             bytes[0] = 0x11;
+                            this.context.d31 = 7;
                         }
                     });
                     return page.toString();
@@ -985,10 +989,12 @@ mod tests {
         let mut regs = SavedRegs::default();
         regs.q[0] = 1.5f64.to_bits() as u128;
         regs.q[1] = 2.0f32.to_bits() as u128;
+        regs.q[31] = 1;
         let after = worker.fire_enter(0, target, regs).unwrap();
         assert_eq!(after.q[0] as u64, 4.0f64.to_bits(), "d0");
         assert_eq!(after.q[1] as u32, 0.25f32.to_bits(), "s1");
         assert_eq!(after.q[2] as u8, 0x11, "q2 byte 0");
+        assert_eq!(after.q[31] as u64, 7.0f64.to_bits(), "d31");
     }
 
     #[test]

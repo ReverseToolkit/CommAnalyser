@@ -95,7 +95,11 @@ unsafe extern "C" fn on_enter(regs: *mut SavedRegs, _data: *mut std::ffi::c_void
         sp: unsafe { (*regs).sp },
         nzcv: unsafe { (*regs).nzcv },
         pc: unsafe { (*regs).pc },
-        q: unsafe { (*regs).q },
+        q: {
+            let mut q = [0u128; 8];
+            q.copy_from_slice(&unsafe { (*regs).q }[..8]);
+            q
+        },
     };
     let _ = unsafe { (api.enter)(&mut cpu) };
     unsafe {
@@ -107,7 +111,7 @@ unsafe extern "C" fn on_enter(regs: *mut SavedRegs, _data: *mut std::ffi::c_void
         (*regs).sp = cpu.sp;
         (*regs).nzcv = cpu.nzcv;
         (*regs).pc = cpu.pc;
-        (*regs).q = cpu.q;
+        (*regs).q[..8].copy_from_slice(&cpu.q);
     }
 }
 

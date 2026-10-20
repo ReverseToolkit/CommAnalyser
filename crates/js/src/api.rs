@@ -1268,8 +1268,7 @@ fn apply_context(this: Object<'_>, regs: &mut SavedRegs) -> JsResult<()> {
     Ok(())
 }
 
-/// Q0–Q7 are the AAPCS64 float/vector argument and return registers.
-/// `qN` is the full 16 bytes. `dN` is the low f64 and `sN` the low f32.
+/// Q0–Q31. `qN` is the full 16 bytes. `dN` is the low f64 and `sN` the low f32.
 fn apply_vector(context: &Object<'_>, regs: &mut SavedRegs) -> JsResult<()> {
     for index in 0..regs.q.len() {
         let original = regs.q[index].to_le_bytes();
