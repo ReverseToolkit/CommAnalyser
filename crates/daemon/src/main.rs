@@ -61,9 +61,7 @@ fn main() -> ExitCode {
             "--token" => token = args.next(),
             "-h" | "--help" => {
                 println!("usage: daemon [--addr 127.0.0.1:17321] [--token TOKEN]");
-                println!(
-                    "  CA_AGENT_PATH=<file> maps the agent from disk and loads its companions"
-                );
+                println!("  the agent is the gzip blob embedded in this binary");
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -288,14 +286,10 @@ fn inject(pid: u32) -> Result<String, String> {
     let listener = control_server::Listener::bind(&socket_name)
         .map_err(|err| format!("bind {socket_name}: {err}"))?;
 
-    // The embedded agent requires every DT_NEEDED to be loaded in the target.
-    // A file path lets the custom linker map companions (libc++_shared.so)
-    // from the agent's directory instead.
-    let options = match std::env::var("CA_AGENT_PATH") {
-        Ok(path) if !path.is_empty() => AttachOptions::new(pid, path),
-        _ => AttachOptions::from_bytes(pid, embedded_agent()?),
-    }
-    .with_config(socket_name.clone());
+    // The agent is the gzip blob linked into this binary. Byte injection
+    // requires every DT_NEEDED soname to already be mapped in the target.
+    let options = AttachOptions::from_bytes(pid, embedded_agent()?)
+        .with_config(socket_name.clone());
     let mut session = inject::attach(&options).map_err(|err| format!("{err}"))?;
 
     let stream = listener

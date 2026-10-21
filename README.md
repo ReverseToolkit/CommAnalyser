@@ -47,12 +47,11 @@ to `agent_main`. The agent connects back with `hello`. The daemon stores the
 channel and resumes the threads. `Session` drop resumes threads and leaves
 the mapped image in the target.
 
-The agent image comes from `CA_AGENT_PATH` when that variable is set. The
-file path lets the loader map `DT_NEEDED` companions from the same directory.
-Otherwise the Android daemon inflates the gzip blob that `crates/daemon/build.rs`
-embedded from `libagent.so`. A byte image requires every `DT_NEEDED` soname
-to already be mapped in the target. A host build of the daemon embeds an
-empty gzip.
+The agent is not a file on the device. `crates/daemon/build.rs` gzip-embeds
+`libagent.so` into the Android daemon, and `inject` inflates that blob.
+`libc++` is archived into the agent. The remaining `DT_NEEDED` entries
+(`libc.so`, `libm.so`, `libdl.so`, `liblog.so`) are already in the target.
+A host build of the daemon embeds an empty gzip.
 
 `spawn` starts a package (`am`) or an executable, then runs the same inject.
 There is no zygote gate.
@@ -147,9 +146,6 @@ adb forward tcp:17321 tcp:17321
 ./target/debug/comm-analyser --addr 127.0.0.1:17321 selftest <pid> js
 ```
 
-To load companions from disk, push `libagent.so` and start the daemon with
-`CA_AGENT_PATH=/data/local/tmp/libagent.so`.
-
 `selftest` suites are `runtime`, `gum`, `js`, `trace`, and `java`. A suite
 argument is a layer or a `layer.case` prefix. Failed cases exit 1.
 
@@ -172,7 +168,7 @@ When the daemon is started with `--token`, every request must carry the same
 {"op":"selftest","pid":1234,"suite":"js"}
 ```
 
-`inject` takes a pid. The agent path is `CA_AGENT_PATH` or the embedded blob.
+`inject` takes a pid. The agent bytes come from the daemon.
 `attach` answers `attach: use inject`. `detach` answers `detach: M2`.
 
 CLI commands: `ping`, `version`, `ps`, `attach`, `inject`, `spawn`, `agent`,
@@ -197,7 +193,7 @@ Installed on the worker when the agent is built with `gum-static`:
 ## Limits
 
 - No unload. `detach` is the M2 error, and a failed inject still leaves the mapped agent after threads resume.
-- The host daemon has an empty embedded agent. Android `inject` without `CA_AGENT_PATH` needs a daemon built by `./build.sh` after the agent.
+- The host daemon has an empty embedded agent. Android `inject` needs a daemon built by `./build.sh` after the agent.
 - `CModule` and `Script.bindWeak` are stubs.
 - `NativeCallback` stubs are not freed.
 - Spawn does not stop the new process before `Application.onCreate`.

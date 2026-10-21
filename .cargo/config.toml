@@ -12,6 +12,10 @@ rustflags = [
     # links with -nodefaultlibs, so point it at the NDK's clang runtime.
     "-L", "native=/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/lib/linux/aarch64",
     "-L", "native=/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/lib/linux",
+    # QBDI's libc++ is archived into the agent. Keep those symbols local so
+    # they do not interpose on the target's own libc++.so.
+    "-C", "link-arg=-Wl,--exclude-libs,libc++_static.a",
+    "-C", "link-arg=-Wl,--exclude-libs,libc++abi.a",
 ]
 
 [env]
