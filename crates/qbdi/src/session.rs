@@ -1,7 +1,7 @@
 //! Function-trace session policy (TAL door), independent of the QBDI FFI.
 
-use crate::blacklist;
-use crate::ring::{EventKind, EventRing, TraceEvent};
+use crate::policy;
+use crate::ring::EventKind;
 
 /// Which DBI callbacks fill the ring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,33 @@ impl EventMask {
     }
 }
 
+/// TAL `PrintMode` values that are not taint or Triton.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrintMode {
+    Bin = 1,
+    Debug = 2,
+    Trace = 3,
+    TraceArgs = 5,
+}
+
+impl PrintMode {
+    pub fn from_name(name: &str) -> runtime::Result<Self> {
+        match name {
+            "bin" => Ok(Self::Bin),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
+            "trace_args" => Ok(Self::TraceArgs),
+            "addr" | "triton" => Err(runtime::Error::Unsupported(
+                "taint and triton are not linked",
+            )),
+            other => Err(runtime::Error::Parse(format!("unknown trace mode {other}"))),
+        }
+    }
+}
+
+/// Default event budget for one trace (each event owns a String).
+pub const DEFAULT_MAX_EVENTS: usize = 100_000;
+
 /// Break out of the VM at `break_at` and re-enter at `resume`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Escape {
@@ -67,9 +94,18 @@ pub struct TraceConfig {
     pub target: u64,
     pub module: Option<String>,
     pub extra_exclude: Vec<String>,
+    /// TAL trace_end: stop QBDI before this address and resume native execution.
     pub until: Option<u64>,
     pub escapes: Vec<Escape>,
     pub events: EventMask,
+    pub mode: PrintMode,
+    /// TAL `trace_all`: instrument every executable map, then `avoid`.
+    pub trace_all: bool,
+    /// TAL `avoid_range` / `remove_range` pairs `(start, end)`.
+    pub avoid: Vec<(u64, u64)>,
+    /// Hard cap on buffered events. A trace that overruns it drops the newest
+    /// events and reports the count instead of growing until the process OOMs.
+    pub max_events: usize,
 }
 
 impl TraceConfig {
@@ -81,44 +117,24 @@ impl TraceConfig {
             until: None,
             escapes: Vec::new(),
             events: EventMask::default(),
+            mode: PrintMode::Trace,
+            trace_all: false,
+            avoid: Vec::new(),
+            max_events: DEFAULT_MAX_EVENTS,
         }
     }
 
-    /// Ranges to strip after instrumenting the target module.
-    pub fn blacklist_ranges(&self) -> runtime::Result<Vec<(u64, u64)>> {
-        blacklist::excluded_executable_ranges(&self.extra_exclude)
+    pub fn trace_end(&self) -> u64 {
+        self.until.unwrap_or(0)
     }
 
-    pub fn should_stop(&self, pc: u64) -> bool {
-        let pc = pc & 0x0000_FFFF_FFFF_FFFF;
-        self.until
-            .map(|until| until & 0x0000_FFFF_FFFF_FFFF)
-            .is_some_and(|until| until == pc)
-            || self
-                .escapes
-                .iter()
-                .any(|escape| (escape.break_at & 0x0000_FFFF_FFFF_FFFF) == pc)
-    }
-}
-
-/// Host-side session: ring + config. The QBDI VM is created only when linked.
-pub struct TraceSession {
-    pub config: TraceConfig,
-    pub ring: EventRing,
-}
-
-impl TraceSession {
-    pub fn new(config: TraceConfig) -> Self {
-        Self {
-            config,
-            ring: EventRing::new(4096),
-        }
-    }
-
-    pub fn record(&mut self, event: TraceEvent) {
-        if self.config.events.accepts(event.kind) {
-            self.ring.push(event);
-        }
+    pub fn hits_break(&self, pc: u64) -> bool {
+        let escapes: Vec<(u64, u64)> = self
+            .escapes
+            .iter()
+            .map(|escape| (escape.break_at, escape.resume))
+            .collect();
+        policy::hits_break(pc, self.trace_end(), &escapes)
     }
 }
 
@@ -176,14 +192,19 @@ mod tests {
         assert!(mask.accepts(EventKind::Inst));
         assert!(!mask.accepts(EventKind::Mem));
         let mut config = TraceConfig::new(0x10);
+        assert_eq!(config.mode, PrintMode::Trace);
+        assert!(PrintMode::from_name("bin").is_ok());
+        assert!(PrintMode::from_name("addr").is_err());
+        assert!(!config.trace_all);
+        assert!(config.avoid.is_empty());
         config.until = Some(0x20);
         config.escapes.push(Escape {
             break_at: 0x30,
             resume: 0x40,
         });
-        assert!(config.should_stop(0x20));
-        assert!(config.should_stop(0x30));
-        assert!(!config.should_stop(0x10));
+        assert!(config.hits_break(0x20));
+        assert!(config.hits_break(0x30));
+        assert!(!config.hits_break(0x10));
         exclude_module("libhost-test-exclude.so");
         assert!(extra_excludes()
             .iter()

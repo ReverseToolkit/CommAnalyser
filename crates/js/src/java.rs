@@ -14,17 +14,20 @@ use rquickjs::prelude::Func;
 use rquickjs::{Array, Ctx, Function, IntoJs, Object, Persistent, Result as JsResult, Value};
 
 use crate::worker::{java_dispatch, JavaHookEntry, JavaHookTable};
+use runtime::handles::HandleTable;
+
 use art::java::{
     ClassInfo, CtorInfo, FieldInfo, JavaArg, JavaClass, JavaObject, JavaValue, Kind, MethodId,
     MethodInfo,
 };
 
 thread_local! {
-    static OBJECTS: RefCell<Vec<Rc<JavaObject>>> = const { RefCell::new(Vec::new()) };
+    static OBJECTS: RefCell<HandleTable<Rc<JavaObject>>> = const { RefCell::new(HandleTable::new()) };
     static THROWABLE_CLASS: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 const HANDLE: &str = "__analyserJavaId";
+const GENERATION: &str = "__analyserJavaGen";
 
 struct HookMeta {
     is_static: bool,
@@ -181,8 +184,35 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
             },
         ),
     )?;
+    ctx.globals().set(
+        "__analyser_java_handle_stats",
+        Func::from(handle_stats),
+    )?;
+    ctx.globals().set(
+        "__analyser_java_release",
+        Func::from(|id: u32, generation: u32| {
+            release_object(id, generation);
+        }),
+    )?;
     ctx.eval::<(), _>(
         r#"
+        // Java handles are released when the wrapper becomes unreachable, so a
+        // script that never calls $dispose() does not accumulate JNI global
+        // references for every argument and return value it touches.
+        if (typeof FinalizationRegistry === 'function') {
+            globalThis.__analyser_java_finalizer = new FinalizationRegistry(held => {
+                __analyser_java_release(held[0], held[1]);
+            });
+            // No unregister token: QuickJS keeps the token strongly, which
+            // would make the wrapper immortal and the finalizer unreachable.
+            // Generation checks make explicit unregistering unnecessary.
+            globalThis.__analyser_java_track = function (obj, id, generation) {
+                globalThis.__analyser_java_finalizer.register(obj, [id, generation]);
+            };
+        } else {
+            // Without a finalizer, handles are only freed by $dispose().
+            globalThis.__analyser_java_track = function () {};
+        }
         globalThis.__analyser_call_impl = function (fn, thisObj, args) {
             return fn.apply(thisObj, args);
         };
@@ -373,7 +403,9 @@ fn ctor_method(ctor: &CtorInfo) -> MethodInfo {
 
 fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResult<Object<'js>> {
     let wrapper = Object::new(ctx.clone())?;
+    let generation = generation_of(id);
     wrapper.set(HANDLE, id)?;
+    wrapper.set(GENERATION, generation)?;
     wrapper.set("$className", class.info.name.clone())?;
     wrapper.set("$n", class.info.name.clone())?;
     let object = get_object(id).ok_or_else(|| js_error("invalid Java object handle"))?;
@@ -381,20 +413,37 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
         "$h",
         crate::api::NativePointer::instance(ctx.clone(), object.as_obj().as_raw() as usize as u64)?,
     )?;
-    let same_object = object.clone();
+    let this_id = id;
     wrapper.set(
         "$isSameObject",
         Function::new(ctx.clone(), move |other: Value<'_>| -> bool {
-            let Some(other_id) = java_id(&other) else {
+            let Some((other_id, other_generation)) = java_handle(&other) else {
                 return false;
             };
-            let Some(other) = get_object(other_id) else {
-                return false;
-            };
-            same_object.is_same_object(&other).unwrap_or(false)
+            match (
+                resolve(this_id, generation).ok(),
+                resolve(other_id, other_generation).ok(),
+            ) {
+                (Some(this), Some(other)) => this.is_same_object(&other).unwrap_or(false),
+                _ => false,
+            }
         })?,
     )?;
-    wrapper.set("$dispose", Function::new(ctx.clone(), || {}))?;
+    wrapper.set(
+        "$dispose",
+        Function::new(ctx.clone(), move || {
+            release_object(id, generation);
+        }),
+    )?;
+    // Bind the Java reference to the JS wrapper's lifetime.  The held value is
+    // the plain (slot, generation) pair, so the registry does not keep the
+    // wrapper alive; when QuickJS collects it, the handle is released even if
+    // the script never called $dispose().
+    // Tracking is best effort: if the registry is unavailable or throws, the
+    // wrapper still works and the handle is only freed by $dispose().
+    if let Ok(track) = ctx.globals().get::<_, Function<'js>>("__analyser_java_track") {
+        let _ = track.call::<_, ()>((wrapper.clone(), id, generation));
+    }
     for (name, methods) in method_groups(&class.info) {
         if methods[0].is_static {
             continue;
@@ -402,7 +451,7 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
         let function = method_function(
             ctx.clone(),
             class.clone(),
-            Target::Instance(object.clone()),
+            Target::Instance { id, generation },
             methods,
         )?;
         wrapper.set(name, function)?;
@@ -411,6 +460,7 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
         if let Ok(super_class) = JavaClass::find(&super_name) {
             let super_wrapper = Object::new(ctx.clone())?;
             super_wrapper.set(HANDLE, id)?;
+            super_wrapper.set(GENERATION, generation)?;
             super_wrapper.set("$className", super_class.info.name.clone())?;
             for (name, methods) in method_groups(&super_class.info) {
                 if methods[0].is_static {
@@ -420,7 +470,8 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
                     ctx.clone(),
                     super_class.clone(),
                     Target::Super {
-                        object: object.clone(),
+                        id,
+                        generation,
                         class: super_class.clone(),
                     },
                     methods,
@@ -441,7 +492,7 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
             field_object(
                 ctx.clone(),
                 class.clone(),
-                FieldTarget::Instance(object.clone()),
+                FieldTarget::Instance { id, generation },
                 field.clone(),
             )?,
         )?;
@@ -451,23 +502,29 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
 
 enum FieldTarget {
     Static,
-    Instance(Rc<JavaObject>),
+    Instance { id: u32, generation: u32 },
 }
 
 impl FieldTarget {
     fn get(&self, class: &JavaClass, field: &FieldInfo) -> runtime::Result<JavaValue> {
         match self {
             Self::Static => class.get_static_field(field),
-            Self::Instance(object) => object.get_field(field),
+            Self::Instance { id, generation } => resolve(*id, *generation)?.get_field(field),
         }
     }
 
     fn set(&self, class: &JavaClass, field: &FieldInfo, arg: &JavaArg) -> runtime::Result<()> {
         match self {
             Self::Static => class.set_static_field(field, arg),
-            Self::Instance(object) => object.set_field(field, arg),
+            Self::Instance { id, generation } => resolve(*id, *generation)?.set_field(field, arg),
         }
     }
+}
+
+fn resolve(id: u32, generation: u32) -> runtime::Result<Rc<JavaObject>> {
+    OBJECTS
+        .with(|table| table.borrow().get_live(id, generation).cloned())
+        .ok_or_else(|| runtime::Error::NotFound("Java object has been disposed".into()))
 }
 
 fn field_object<'js>(
@@ -480,7 +537,10 @@ fn field_object<'js>(
     let get_class = class.clone();
     let get_target = match &target {
         FieldTarget::Static => FieldTarget::Static,
-        FieldTarget::Instance(object) => FieldTarget::Instance(object.clone()),
+        FieldTarget::Instance { id, generation } => FieldTarget::Instance {
+            id: *id,
+            generation: *generation,
+        },
     };
     let get_field = field.clone();
     let getter = Function::new(ctx.clone(), move || -> JsResult<Value<'js>> {
@@ -519,9 +579,17 @@ fn method_groups(info: &ClassInfo) -> BTreeMap<String, Vec<MethodInfo>> {
 
 enum Target {
     Static,
-    Instance(Rc<JavaObject>),
+    /// Handle of the receiver; resolved on every call so a disposed object
+    /// fails loudly instead of keeping the Java reference alive.  The
+    /// generation is part of the handle: a reused slot must not be addressed
+    /// through a wrapper that was issued for the previous object.
+    Instance {
+        id: u32,
+        generation: u32,
+    },
     Super {
-        object: Rc<JavaObject>,
+        id: u32,
+        generation: u32,
         class: Rc<JavaClass>,
     },
     Prototype,
@@ -537,18 +605,25 @@ fn hook_for_original(
     crate::worker::find_java_hook(class_name, method)
 }
 
+/// Call a method with its hook temporarily bypassed.
+///
+/// Resuming is unconditional: a failure between suspend() and resume() would
+/// otherwise leave the entrypoint on the original method, silently disabling
+/// the hook for the rest of the process.
 fn call_with_hook<R>(
     hook: Option<Rc<RefCell<art::hook::JavaHook>>>,
-    call: impl FnOnce() -> R,
-) -> R {
+    call: impl FnOnce() -> runtime::Result<R>,
+) -> runtime::Result<R> {
     let Some(hook) = hook else {
         return call();
     };
     let hook = hook.borrow();
-    hook.suspend();
+    hook.suspend()?;
     let result = call();
-    hook.resume();
-    result
+    let resumed = hook.resume();
+    let value = result?;
+    resumed?;
+    Ok(value)
 }
 
 fn method_function<'js>(
@@ -573,10 +648,18 @@ fn method_function<'js>(
                 Target::Static => {
                     call_with_hook(hook, || call_class.call_static(method, &java_args))
                 }
-                Target::Instance(object) => {
+                Target::Instance { id, generation } => {
+                    let object = resolve(*id, *generation).map_err(to_js_error)?;
                     call_with_hook(hook, || object.call(method, &java_args))
                 }
-                Target::Super { object, class } => class.call_super(object, method, &java_args),
+                Target::Super {
+                    id,
+                    generation,
+                    class,
+                } => {
+                    let object = resolve(*id, *generation).map_err(to_js_error)?;
+                    class.call_super(&object, method, &java_args)
+                }
                 Target::Prototype => {
                     return Err(js_error(
                         "instance method called on the class object; call it on an instance",
@@ -767,8 +850,12 @@ pub(crate) struct HookCall {
 
 struct OriginalCall {
     this_id: u32,
+    /// x0..x7 as the trampoline saw them (quick ABI: x1 = this, x2.. = args).
     raw: [u64; 8],
+    /// d0..d7.
     fargs: [u64; 8],
+    /// The caller's stack window, for arguments past the register file.
+    stack: [u64; 8],
     globals: u32,
 }
 
@@ -783,7 +870,7 @@ pub(crate) fn invoke_impl<'js>(
         args,
         fargs,
         params,
-        stack: _stack,
+        stack,
         globals,
         hook,
         jni_mode,
@@ -803,6 +890,7 @@ pub(crate) fn invoke_impl<'js>(
                         this_id: 0,
                         raw: args,
                         fargs,
+                        stack,
                         globals,
                     },
                 )?,
@@ -835,6 +923,7 @@ pub(crate) fn invoke_impl<'js>(
                             this_id: id,
                             raw: args,
                             fargs,
+                            stack,
                             globals,
                         },
                     )?,
@@ -853,6 +942,7 @@ pub(crate) fn invoke_impl<'js>(
                         this_id: id,
                         raw: args,
                         fargs,
+                        stack,
                         globals,
                     },
                 )?,
@@ -965,12 +1055,14 @@ fn original_function<'js>(
         this_id,
         raw,
         fargs,
+        stack,
         globals,
     } = call;
     let call_ctx = ctx.clone();
     Function::new(ctx, move || -> JsResult<Value<'js>> {
-        let args = original_args(&method, &raw, &fargs, globals)?;
-        hook.borrow().suspend();
+        let args = original_args(&method, &raw, &fargs, &stack, globals)?;
+        let hook = hook.borrow();
+        hook.suspend().map_err(to_js_error)?;
         let result = if method.is_static {
             class.call_static(&method, &args)
         } else {
@@ -978,67 +1070,90 @@ fn original_function<'js>(
                 get_object(this_id).ok_or_else(|| js_error("invalid Java object handle"))?;
             object.call(&method, &args)
         };
-        hook.borrow().resume();
-        value_to_js(
-            call_ctx.clone(),
-            class.clone(),
-            result.map_err(to_js_error)?,
-        )
+        let resumed = hook.resume().map_err(to_js_error);
+        let value = result.map_err(to_js_error)?;
+        resumed?;
+        value_to_js(call_ctx.clone(), class.clone(), value)
     })
 }
 
+/// Rebuild the JS-visible arguments for `original()`.
+///
+/// The quick ABI consumes x0/x1 before the parameters (x0 = ArtMethod*, x1 =
+/// this), floats travel in d0..d7, and everything past those registers arrives
+/// on the caller's stack.  This walks the same order as `java_dispatch` so
+/// `original(...)` sees exactly what the hook body saw -- including the
+/// overflow slots that a register-only reading used to drop.
 fn original_args(
     method: &MethodInfo,
     raw: &[u64; 8],
     fargs: &[u64; 8],
+    stack: &[u64; 8],
     globals: u32,
 ) -> JsResult<Vec<JavaArg>> {
-    let start = if method.is_static { 1 } else { 2 };
-    let mut fp_index = 0;
-    method
-        .params
-        .iter()
-        .enumerate()
-        .map(|(slot, kind)| {
-            let register = start + slot;
-            let is_global = globals & (1 << register) != 0;
-            Ok(match kind {
-                Kind::Boolean => JavaArg::Boolean(raw[register] != 0),
-                Kind::Byte | Kind::Char | Kind::Short | Kind::Int => {
-                    JavaArg::Int(raw[register] as i32)
-                }
-                Kind::Long => JavaArg::Long(raw[register] as i64),
-                Kind::Float => {
-                    let value = f32::from_bits(fargs[fp_index] as u32);
+    let mut int_index = if method.is_static { 1 } else { 2 };
+    let mut fp_index = 0usize;
+    let mut stack_index = 0usize;
+    let mut args = Vec::with_capacity(method.params.len());
+
+    for (slot, kind) in method.params.iter().enumerate() {
+        let float = matches!(kind, Kind::Float | Kind::Double);
+        let word = if float {
+            match fargs.get(fp_index) {
+                Some(word) => {
                     fp_index += 1;
-                    JavaArg::Float(value)
+                    *word
                 }
-                Kind::Double => {
-                    let value = f64::from_bits(fargs[fp_index]);
-                    fp_index += 1;
-                    JavaArg::Double(value)
+                None => next_stack_word(stack, &mut stack_index, slot)?,
+            }
+        } else {
+            match raw.get(int_index) {
+                Some(word) => {
+                    int_index += 1;
+                    *word
                 }
-                Kind::Object(name) if name == "java.lang.String" && is_global => {
-                    match art::java::string_from_global_handle(raw[register] as usize)
-                        .map_err(to_js_error)?
-                    {
-                        Some(value) => JavaArg::String(value),
-                        None => JavaArg::Null,
-                    }
+                None => next_stack_word(stack, &mut stack_index, slot)?,
+            }
+        };
+        let is_global = globals & (1 << (slot + 1)) != 0;
+        args.push(match kind {
+            Kind::Boolean => JavaArg::Boolean(word != 0),
+            Kind::Byte | Kind::Char | Kind::Short | Kind::Int => JavaArg::Int(word as i32),
+            Kind::Long => JavaArg::Long(word as i64),
+            Kind::Float => JavaArg::Float(f32::from_bits(word as u32)),
+            Kind::Double => JavaArg::Double(f64::from_bits(word)),
+            Kind::Object(name) if name == "java.lang.String" && is_global => {
+                match art::java::string_from_global_handle(word as usize).map_err(to_js_error)? {
+                    Some(value) => JavaArg::String(value),
+                    None => JavaArg::Null,
                 }
-                Kind::Object(name) if is_global => {
-                    let param_class = JavaClass::find(name).map_err(to_js_error)?;
-                    let object = art::java::object_from_global_handle(
-                        param_class.info.clone(),
-                        raw[register] as usize,
-                    )
-                    .map_err(to_js_error)?;
-                    JavaArg::Object(Rc::new(object))
-                }
-                Kind::Object(_) | Kind::Array(_) | Kind::Void => JavaArg::Null,
-            })
-        })
-        .collect()
+            }
+            Kind::Object(name) if is_global => {
+                let param_class = JavaClass::find(name).map_err(to_js_error)?;
+                let object = art::java::object_from_global_handle(
+                    param_class.info.clone(),
+                    word as usize,
+                )
+                .map_err(to_js_error)?;
+                JavaArg::Object(Rc::new(object))
+            }
+            Kind::Object(_) | Kind::Array(_) | Kind::Void => JavaArg::Null,
+        });
+    }
+    Ok(args)
+}
+
+/// The caller's stack window is captured by the trampoline; running past it
+/// means the method has more arguments than the capture window, which is a
+/// hook bug, not something to paper over with a zero.
+fn next_stack_word(stack: &[u64; 8], index: &mut usize, slot: usize) -> JsResult<u64> {
+    let word = stack.get(*index).copied().ok_or_else(|| {
+        js_error(&format!(
+            "original(): argument {slot} is past the captured stack window"
+        ))
+    })?;
+    *index += 1;
+    Ok(word)
 }
 
 fn enumerate_loaded_classes_sync<'js>(ctx: Ctx<'js>) -> JsResult<Array<'js>> {
@@ -1108,7 +1223,7 @@ fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsRe
         }
         (
             art::java::new_string_array(&strings).map_err(to_js_error)?,
-            "[Ljava/lang/String;",
+            "[Ljava/lang/String;".to_owned(),
         )
     } else if !matches!(
         type_name.as_str(),
@@ -1123,8 +1238,7 @@ fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsRe
         let descriptor = format!("[L{};", type_name.replace('.', "/"));
         (
             art::java::new_object_array_from_objects(&type_name, &objects).map_err(to_js_error)?,
-            // Keep descriptor owned until after wrapping.
-            Box::leak(descriptor.into_boxed_str()) as &'static str,
+            descriptor,
         )
     } else {
         let mut numbers = Vec::with_capacity(values.len());
@@ -1152,9 +1266,9 @@ fn make_array<'js>(ctx: Ctx<'js>, type_name: String, values: Array<'js>) -> JsRe
             "boolean" => "[Z",
             _ => return Err(js_error("unsupported Java.array type")),
         };
-        (object, descriptor)
+        (object, descriptor.to_owned())
     };
-    let class = JavaClass::find(descriptor).map_err(to_js_error)?;
+    let class = JavaClass::find(&descriptor).map_err(to_js_error)?;
     let id = register(object);
     Ok(instance_object(ctx, class, id)?.into_value())
 }
@@ -1206,24 +1320,61 @@ fn value_to_js<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, value: JavaValue) -> Js
     }
 }
 
-fn java_id(value: &Value<'_>) -> Option<u32> {
+/// The (slot, generation) pair a wrapper was issued with.
+fn java_handle(value: &Value<'_>) -> Option<(u32, u32)> {
     if !value.is_object() {
         return None;
     }
     let object = value.as_object()?;
-    object.get::<&str, u32>(HANDLE).ok()
+    let id = object.get::<&str, u32>(HANDLE).ok()?;
+    let generation = object.get::<&str, u32>(GENERATION).ok()?;
+    Some((id, generation))
+}
+
+/// A wrapper is only usable while its generation still matches the slot.
+/// Without this check a wrapper kept after `$dispose()` would address
+/// whatever object reused the slot.
+fn java_id(value: &Value<'_>) -> Option<u32> {
+    let (id, generation) = java_handle(value)?;
+    OBJECTS
+        .with(|table| table.borrow().get_live(id, generation).is_some())
+        .then_some(id)
 }
 
 fn register(object: JavaObject) -> u32 {
-    OBJECTS.with(|objects| {
-        let mut objects = objects.borrow_mut();
-        objects.push(Rc::new(object));
-        (objects.len() - 1) as u32
-    })
+    OBJECTS.with(|table| table.borrow_mut().insert(Rc::new(object)))
+}
+
+fn generation_of(id: u32) -> u32 {
+    OBJECTS.with(|table| table.borrow().generation(id)).unwrap_or(0)
 }
 
 fn get_object(id: u32) -> Option<Rc<JavaObject>> {
-    OBJECTS.with(|objects| objects.borrow().get(id as usize).cloned())
+    OBJECTS.with(|table| table.borrow().get(id).cloned())
+}
+
+/// Release a handle.  Called by `$dispose()` and by the JS finalizer; both
+/// may run for the same handle, so the second call is a no-op.
+/// Live/slot/free counts for the Java handle table.
+///
+/// Called from the JS thread (via `__analyser_java_handle_stats`), where the
+/// table lives; this is the observable used to tune the GC cadence on a device.
+pub fn handle_stats() -> String {
+    OBJECTS.with(|table| {
+        let table = table.borrow();
+        format!(
+            "{{\"live\":{},\"slots\":{},\"free\":{}}}",
+            table.live(),
+            table.capacity(),
+            table.free_slots()
+        )
+    })
+}
+
+fn release_object(id: u32, generation: u32) {
+    OBJECTS.with(|table| {
+        table.borrow_mut().release(id, generation);
+    });
 }
 
 fn to_js_error(error: runtime::Error) -> rquickjs::Error {

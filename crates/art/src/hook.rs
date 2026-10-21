@@ -6,6 +6,7 @@
 
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Mutex;
 
 use arch_arm64::writer::CodeWriter;
 use runtime::{Error, Result};
@@ -25,6 +26,7 @@ const ACC_COMPILE_DONT_BOTHER: u32 = 0x0200_0000;
 pub struct JavaHook {
     art_method: usize,
     original: usize,
+    installed_entrypoint: usize,
     stub: usize,
     original_flags: u32,
     original_data: usize,
@@ -38,21 +40,28 @@ impl JavaHook {
     }
 
     /// Temporarily route calls back to the original method.
-    pub fn suspend(&self) {
+    ///
+    /// The ArtMethod fields live in ART's data pages; the writer restores the
+    /// page protection it found, so a suspend/resume cycle never leaves the
+    /// method metadata writable.
+    pub fn suspend(&self) -> Result<()> {
         if self.native_mode {
-            write_pointer(self.art_method + DATA_OFFSET, self.original_data);
-            write_u32(self.art_method + ACCESS_FLAGS_OFFSET, self.original_flags);
+            write_pointer(self.art_method + DATA_OFFSET, self.original_data)?;
+            write_u32(self.art_method + ACCESS_FLAGS_OFFSET, self.original_flags)?;
         }
-        write_pointer(self.art_method + ENTRYPOINT_OFFSET, self.original);
+        write_pointer(self.art_method + ENTRYPOINT_OFFSET, self.original)
     }
 
     /// Reinstall the hook after an original() call.
-    pub fn resume(&self) {
-        write_pointer(self.art_method + ENTRYPOINT_OFFSET, self.stub);
+    pub fn resume(&self) -> Result<()> {
         if self.native_mode {
-            write_pointer(self.art_method + DATA_OFFSET, self.stub);
-            write_u32(self.art_method + ACCESS_FLAGS_OFFSET, self.patched_flags());
+            write_pointer(self.art_method + DATA_OFFSET, self.stub)?;
+            write_u32(self.art_method + ACCESS_FLAGS_OFFSET, self.patched_flags())?;
         }
+        write_pointer(
+            self.art_method + ENTRYPOINT_OFFSET,
+            self.installed_entrypoint,
+        )
     }
 
     fn patched_flags(&self) -> u32 {
@@ -65,7 +74,7 @@ impl JavaHook {
         if !self.active {
             return Ok(());
         }
-        self.suspend();
+        self.suspend()?;
         self.active = false;
         Ok(())
     }
@@ -82,8 +91,13 @@ pub fn install(method: MethodId, dispatcher: usize, id: usize) -> Result<JavaHoo
     if art_method == 0 {
         return Err(Error::Parse("Java hook: null ArtMethod".into()));
     }
-    let stub = make_stub(dispatcher, id)?;
+    // The layout offsets above are model-specific. Refuse to patch anything
+    // that does not look like an ArtMethod in a mapped page rather than
+    // scribbling over an unrelated field on a different ART version.
     let entry = art_method + ENTRYPOINT_OFFSET;
+    runtime::patch::ensure_mapped(art_method, std::mem::size_of::<usize>() * 4)?;
+    runtime::patch::ensure_mapped(entry, std::mem::size_of::<usize>())?;
+    let stub = stub_for(dispatcher, id)?;
     let original = read_pointer(entry);
     if original == 0 {
         return Err(Error::Parse("Java hook: null entrypoint".into()));
@@ -98,19 +112,14 @@ pub fn install(method: MethodId, dispatcher: usize, id: usize) -> Result<JavaHoo
     let hook = JavaHook {
         art_method,
         original,
+        installed_entrypoint: if native_mode { native_trampoline } else { stub },
         stub,
         original_flags,
         original_data,
         native_mode,
         active: true,
     };
-    if native_mode {
-        write_pointer(art_method + DATA_OFFSET, stub);
-        write_pointer(entry, native_trampoline);
-        write_u32(art_method + ACCESS_FLAGS_OFFSET, hook.patched_flags());
-    } else {
-        write_pointer(entry, stub);
-    }
+    hook.resume()?;
     Ok(hook)
 }
 
@@ -154,26 +163,21 @@ fn read_u32(address: usize) -> u32 {
     unsafe { ptr::read_unaligned(address as *const u32) }
 }
 
-fn write_u32(address: usize, value: u32) {
-    let page_size = runtime::process::page_size();
-    let page = address & !(page_size - 1);
-    // SAFETY: ArtMethod fields live in writable ART memory.
-    unsafe {
-        libc::mprotect(
-            page as *mut c_void,
-            page_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-        );
-        ptr::write_unaligned(address as *mut u32, value);
-    }
+fn write_u32(address: usize, value: u32) -> Result<()> {
+    runtime::patch::with_writable(address, std::mem::size_of::<u32>(), || {
+        // SAFETY: with_writable verified the range and made it writable.
+        unsafe { ptr::write_unaligned(address as *mut u32, value) };
+    })
 }
 
 fn make_stub(dispatcher: usize, id: usize) -> Result<usize> {
+    // W^X: map writable, emit the stub, then flip to read+execute.  Asking for
+    // RWX up front is refused by hardened Android builds.
     let page = unsafe {
         libc::mmap(
             ptr::null_mut(),
             PAGE,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
             0,
@@ -209,61 +213,109 @@ fn make_stub(dispatcher: usize, id: usize) -> Result<usize> {
     unsafe {
         ptr::copy_nonoverlapping(w.bytes().as_ptr(), page as *mut u8, w.len());
     }
-    flush_icache(page as usize, w.len());
+    runtime::patch::flush_icache(page as usize, w.len());
+    if unsafe { libc::mprotect(page, PAGE, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: page is the mapping created above.
+        unsafe { libc::munmap(page, PAGE) };
+        return Err(Error::Io(error));
+    }
     Ok(page as usize)
 }
+
+/// Stub pages are cached per hook id.
+///
+/// A stub is reachable from the ArtMethod entrypoint, so freeing it as soon as
+/// a hook is detached races with threads already inside the trampoline.  The
+/// id is stable for a given hooked method (the JS hook table never reuses a
+/// slot with different metadata), so keeping one page per id bounds the cost
+/// by the number of hooked methods instead of by the number of
+/// `implementation = ...` assignments.
+fn stub_for(dispatcher: usize, id: usize) -> Result<usize> {
+    let mut pages = STUB_PAGES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(entry) = pages
+        .iter()
+        .find(|entry| entry.id == id && entry.dispatcher == dispatcher)
+    {
+        return Ok(entry.page);
+    }
+    let page = make_stub(dispatcher, id)?;
+    pages.push(StubPage {
+        id,
+        dispatcher,
+        page,
+    });
+    Ok(page)
+}
+
+struct StubPage {
+    id: usize,
+    dispatcher: usize,
+    page: usize,
+}
+
+static STUB_PAGES: Mutex<Vec<StubPage>> = Mutex::new(Vec::new());
 
 fn read_pointer(address: usize) -> usize {
     unsafe { ptr::read_unaligned(address as *const usize) }
 }
 
-fn write_pointer(address: usize, value: usize) {
-    let page_size = runtime::process::page_size();
-    let page = address & !(page_size - 1);
-    unsafe {
-        libc::mprotect(
-            page as *mut c_void,
-            page_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-        );
-        ptr::write_unaligned(address as *mut usize, value);
-        libc::mprotect(
-            page as *mut c_void,
-            page_size,
-            libc::PROT_READ | libc::PROT_EXEC,
-        );
-    }
-    flush_icache(address, std::mem::size_of::<usize>());
+fn write_pointer(address: usize, value: usize) -> Result<()> {
+    runtime::patch::with_writable(address, std::mem::size_of::<usize>(), || {
+        // SAFETY: with_writable verified the range and made it writable.
+        unsafe { ptr::write_unaligned(address as *mut usize, value) };
+    })
 }
 
-fn flush_icache(address: usize, len: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let start = address & !63;
-        let end = (address + len + 63) & !63;
-        let mut line = start;
-        while line < end {
-            unsafe {
-                core::arch::asm!("dc cvau, {}", in(reg) line, options(nostack, preserves_flags));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suspend_resume_preserves_native_and_managed_entrypoints() {
+        for native_mode in [false, true] {
+            // A mapped, writable ArtMethod-sized fixture; its addresses are
+            // compared as metadata and never executed on the host.
+            let mut method = [0usize; 4];
+            let address = method.as_mut_ptr() as usize;
+            let mut hook = JavaHook {
+                art_method: address,
+                original: 0x1000,
+                installed_entrypoint: if native_mode { 0x2000 } else { 0x3000 },
+                stub: 0x3000,
+                original_flags: if native_mode {
+                    ACC_NATIVE | ACC_FAST_NATIVE
+                } else {
+                    0
+                },
+                original_data: 0x4000,
+                native_mode,
+                active: true,
+            };
+            for _ in 0..3 {
+                hook.suspend().unwrap();
+                assert_eq!(read_pointer(address + ENTRYPOINT_OFFSET), hook.original);
+                hook.resume().unwrap();
+                assert_eq!(
+                    read_pointer(address + ENTRYPOINT_OFFSET),
+                    hook.installed_entrypoint
+                );
+                if native_mode {
+                    assert_eq!(read_pointer(address + DATA_OFFSET), hook.stub);
+                    assert_eq!(
+                        read_u32(address + ACCESS_FLAGS_OFFSET),
+                        hook.patched_flags()
+                    );
+                }
             }
-            line += 64;
-        }
-        unsafe {
-            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
-        }
-        let mut line = start;
-        while line < end {
-            unsafe {
-                core::arch::asm!("ic ivau, {}", in(reg) line, options(nostack, preserves_flags));
+            hook.detach().unwrap();
+            assert_eq!(read_pointer(address + ENTRYPOINT_OFFSET), hook.original);
+            if native_mode {
+                assert_eq!(read_pointer(address + DATA_OFFSET), hook.original_data);
+                assert_eq!(read_u32(address + ACCESS_FLAGS_OFFSET), hook.original_flags);
             }
-            line += 64;
         }
-        unsafe {
-            core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = (address, len);
     }
 }

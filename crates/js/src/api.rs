@@ -16,8 +16,10 @@ use rquickjs::{
     Result as JsResult, Value,
 };
 
-use gum::{memory, native, process, thread, InlineHook, Interceptor, SavedRegs};
-use runtime::module;
+use gum::{memory, replace, InlineHook, SavedRegs};
+use runtime::{module, process, thread};
+
+use crate::native;
 
 use crate::worker::{
     callback_dispatch, hook_enter, hook_leave, make_bridge, CallbackEntry, CallbackTable,
@@ -347,6 +349,10 @@ impl NativePointer {
 #[rquickjs::class(rename_all = "camelCase")]
 pub struct Retval {
     value: u64,
+    /// Set by `retval.replace(...)`.  onLeave only writes x0 when the script
+    /// asked for it, so a casual `this.context.x0 = ...` is no longer
+    /// overwritten by an untouched retval.
+    replaced: bool,
 }
 
 #[rquickjs::methods(rename_all = "camelCase")]
@@ -355,6 +361,7 @@ impl Retval {
     pub fn new(value: Value<'_>) -> JsResult<Self> {
         Ok(Self {
             value: parse_pointer(&value)?,
+            replaced: false,
         })
     }
 
@@ -370,6 +377,7 @@ impl Retval {
 
     pub fn replace(&mut self, value: Value<'_>) -> JsResult<()> {
         self.value = parse_pointer(&value)?;
+        self.replaced = true;
         Ok(())
     }
 }
@@ -722,7 +730,7 @@ pub(crate) fn install_with_hooks<'js>(
         "replace",
         Func::from(
             |target: Value<'js>, replacement: Value<'js>| -> JsResult<()> {
-                Interceptor::replace(
+                replace::replace(
                     parse_pointer(&target)? as usize,
                     parse_pointer(&replacement)? as usize,
                 )
@@ -733,20 +741,15 @@ pub(crate) fn install_with_hooks<'js>(
     interceptor.set(
         "revert",
         Func::from(|target: Value<'js>| -> JsResult<()> {
-            Interceptor::revert(parse_pointer(&target)? as usize).map_err(to_js_error)
+            replace::revert(parse_pointer(&target)? as usize).map_err(to_js_error)
         }),
     )?;
     interceptor.set(
         "flush",
         Func::from({
-            let hooks = hooks.clone();
+            let _hooks = hooks.clone();
             move || {
-                for group in hooks.borrow().groups.iter() {
-                    if let Some(hook) = group.hook.as_ref() {
-                        memory::flush_icache(hook.trampoline(), 0x1000);
-                    }
-                }
-                Interceptor::flush();
+                replace::flush();
             }
         }),
     )?;
@@ -786,7 +789,7 @@ pub(crate) fn install_with_hooks<'js>(
                     table.entries.len() - 1
                 };
                 let stub =
-                    gum::native::make_callback_stub(callback_dispatch as *const () as usize, id)
+                    native::make_callback_stub(callback_dispatch as *const () as usize, id)
                         .map_err(to_js_error)?;
                 NativePointer::instance(ctx, stub as u64)
             },
@@ -978,10 +981,27 @@ fn attach_listener<'js>(
     let address = usize::try_from(parse_pointer(&target)?)
         .map_err(|_| js_error("target address does not fit in usize"))?;
     if let Ok(pointer) = Class::<NativePointer>::from_value(&callbacks) {
-        let native = pointer.borrow().value as usize;
-        let hook = unsafe {
-            InlineHook::attach(address, std::mem::transmute(native), std::ptr::null_mut())
-        };
+        // A native handler is called as `extern "C" fn(*mut SavedRegs, *mut
+        // c_void)`. Only an executable, non-null address can possibly be one;
+        // anything else is a script bug that would otherwise jump into data.
+        let native = usize::try_from(pointer.borrow().value)
+            .map_err(|_| js_error("native handler address does not fit in usize"))?;
+        if native == 0 {
+            return Err(js_error("native handler is null"));
+        }
+        let executable = runtime::maps::self_mapping_containing(native)
+            .map_err(to_js_error)?
+            .is_some_and(|mapping| mapping.perms.exec);
+        if !executable {
+            return Err(js_error(&format!(
+                "native handler {native:#x} is not in an executable mapping"
+            )));
+        }
+        // SAFETY: the caller supplied an executable address; the handler
+        // contract is the same one CModule callbacks use in Frida.
+        let handler: unsafe extern "C" fn(*mut gum::SavedRegs, *mut std::ffi::c_void) =
+            unsafe { std::mem::transmute(native) };
+        let hook = unsafe { InlineHook::attach(address, handler, std::ptr::null_mut()) };
         return match hook {
             Ok(hook) => {
                 let mut table = hooks.borrow_mut();
@@ -1221,7 +1241,13 @@ pub(crate) fn invoke_leave<'js>(
     regs: &mut SavedRegs,
 ) -> JsResult<()> {
     let on_leave = on_leave.restore(ctx)?;
-    let retval = Class::instance(ctx.clone(), Retval { value: regs.x[0] })?;
+    let retval = Class::instance(
+        ctx.clone(),
+        Retval {
+            value: regs.x[0],
+            replaced: false,
+        },
+    )?;
 
     let this = make_this(ctx, target, regs, None)?;
     let mut call_args = Args::new(ctx.clone(), 1);
@@ -1229,8 +1255,14 @@ pub(crate) fn invoke_leave<'js>(
     call_args.push_arg(retval.clone())?;
     on_leave.call_arg::<()>(call_args)?;
 
+    // Context edits are the script's explicit intent; only overwrite x0 when
+    // retval.replace() was called, otherwise the retval object we captured on
+    // entry would clobber `this.context.x0`.
     apply_context(this, regs)?;
-    regs.x[0] = retval.borrow().value;
+    let retval = retval.borrow();
+    if retval.replaced {
+        regs.x[0] = retval.value;
+    }
     Ok(())
 }
 
@@ -2181,7 +2213,8 @@ fn write_bytes(addr: u64, data: &[u8]) -> JsResult<()> {
 fn read_cstring(addr: u64) -> runtime::Result<String> {
     let mut out = Vec::new();
     for offset in 0..4096 {
-        let byte = memory::read(addr as usize + offset, 1)?;
+        let byte = memory::read(addr as usize + offset, 1)
+            .map_err(|err| runtime::Error::Parse(err.to_string()))?;
         if byte[0] == 0 {
             return Ok(String::from_utf8_lossy(&out).into_owned());
         }
@@ -2192,7 +2225,7 @@ fn read_cstring(addr: u64) -> runtime::Result<String> {
     ))
 }
 
-pub(crate) fn to_js_error(error: runtime::Error) -> rquickjs::Error {
+pub(crate) fn to_js_error(error: impl std::fmt::Display) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("comm-analyser", "memory", error.to_string())
 }
 

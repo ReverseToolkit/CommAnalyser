@@ -12,7 +12,7 @@ use std::ptr;
 use arch_arm64::writer::CodeWriter;
 
 #[cfg(target_arch = "aarch64")]
-use crate::memory::{flush_icache, protect};
+use gum::memory::{flush_icache, protect};
 
 #[cfg(target_arch = "aarch64")]
 const PAGE: usize = 0x1000;

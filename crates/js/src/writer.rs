@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use rquickjs::class::{Trace, Tracer};
 use rquickjs::{ArrayBuffer, Class, Ctx, JsLifetime, Object, Result as JsResult, Value};
 
-use gum::arch::relocator::relocate_one;
-use gum::arch::writer::CodeWriter;
+use arch_arm64::relocator::relocate_one;
+use arch_arm64::writer::CodeWriter;
 use gum::memory;
 
 use crate::api::parse_pointer;
@@ -255,10 +255,40 @@ impl Arm64Writer {
         }
     }
 
+    /// str rt, [rn + offset].
+    ///
+    /// Chooses the cheapest encoding: scaled STR, then unscaled STUR
+    /// (-256..=255, any alignment), then a scratch-register fallback.
+    ///
+    /// # Side effect
+    ///
+    /// For offsets that neither STR nor STUR can encode (for example 257,
+    /// -1000, or a 32-bit offset of 16384 and above) the writer computes the
+    /// address in **x16** and stores at offset 0. If either operand is x16 it
+    /// uses **x17** instead. Aligned/small offsets never touch another
+    /// register. When both x16 and x17 are operands the call throws rather
+    /// than clobbering one of them.
+    ///
+    /// ```js
+    /// const w = new Arm64Writer(code);
+    /// w.putStrRegRegOffset("x0", "x1", 8);      // str x0, [x1, #8]  no scratch
+    /// w.putStrRegRegOffset("x0", "x1", -1000);  // x16 = x1 - 1000; str x0, [x16]
+    /// ```
+    ///
+    /// Both calls are executed on a device by
+    /// `writer::tests::js_layer_falls_back_for_large_store_offsets` (run with
+    /// `--target aarch64-linux-android --features gum/link`, see
+    /// docs/21-hardening.md).
     pub fn put_str_reg_reg_offset(&mut self, rt: String, rn: String, offset: i64) -> JsResult<()> {
         let is_32 = rt.starts_with('w');
-        self.code
-            .str_reg_offset(parse_x(&rt)?, parse_x(&rn)?, offset, is_32);
+        if !self
+            .code
+            .str_reg_offset(parse_x(&rt)?, parse_x(&rn)?, offset, is_32)
+        {
+            return Err(js_err(
+                "strRegOffset: offset does not fit STR/STUR immediate encoding",
+            ));
+        }
         Ok(())
     }
 
@@ -361,39 +391,40 @@ impl Arm64Writer {
         args: Value<'_>,
     ) -> JsResult<()> {
         let target = parse_pointer(&address)?;
-        let mut values = Vec::new();
         let list: rquickjs::Array<'_> = args.get()?;
+        if list.len() > 8 {
+            return Err(js_err(
+                "putCallAddressWithArguments: at most 8 arguments (stack arguments are not supported)",
+            ));
+        }
+        // Registers are moved in parallel before immediates: an immediate
+        // writes its destination directly, so emitting it in argument order
+        // could clobber a source that a later move still needs.
+        let mut sources: Vec<Option<u8>> = vec![None; list.len()];
+        let mut immediates: Vec<(u8, u64)> = Vec::new();
         for index in 0..list.len() {
             let arg: Value<'_> = list.get(index)?;
             if arg.is_string() {
-                values.push(RegOrImm::Reg(arg.get::<String>()?));
+                sources[index] = Some(parse_x(&arg.get::<String>()?)?);
             } else {
-                values.push(RegOrImm::Imm(parse_pointer(&arg)?));
+                immediates.push((index as u8, parse_pointer(&arg)?));
             }
         }
-        for (index, value) in values.iter().enumerate() {
-            let rd = index as u8;
-            match value {
-                RegOrImm::Reg(name) => {
-                    let rs = parse_x(name)?;
-                    if rs != rd {
-                        self.code.put(0xAA00_03E0 | ((rs as u32) << 16) | rd as u32);
-                    }
-                }
-                RegOrImm::Imm(imm) => self.code.abs_addr(rd, *imm),
-            }
+        if !self.code.move_arg_registers(&sources) {
+            return Err(js_err(
+                "putCallAddressWithArguments: argument moves cannot be scheduled",
+            ));
         }
-        let scratch = values.len() as u8;
+        for (destination, value) in immediates {
+            self.code.abs_addr(destination, value);
+        }
+        let scratch = list.len() as u8;
         self.code.abs_addr(scratch, target);
         self.code.blr(scratch);
         Ok(())
     }
 }
 
-enum RegOrImm {
-    Reg(String),
-    Imm(u64),
-}
 
 fn encode_label(kind: LabelKind, delta: i64) -> u32 {
     match kind {
@@ -447,10 +478,19 @@ fn parse_xw(name: &str) -> JsResult<(bool, u8)> {
     }
     if let Some(rest) = name.strip_prefix('x') {
         let n: u8 = rest.parse().map_err(|_| js_err("bad register"))?;
+        // x31 is only reachable through the sp/xzr aliases; anything above it
+        // would shift into the neighbouring encoding fields and corrupt the
+        // instruction instead of failing.
+        if n > 30 {
+            return Err(js_err("register out of range"));
+        }
         return Ok((true, n));
     }
     if let Some(rest) = name.strip_prefix('w') {
         let n: u8 = rest.parse().map_err(|_| js_err("bad register"))?;
+        if n > 30 {
+            return Err(js_err("register out of range"));
+        }
         return Ok((false, n));
     }
     Err(js_err("bad register"))
@@ -477,7 +517,7 @@ fn js_err(message: &str) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("comm-analyser", "writer", message.to_owned())
 }
 
-fn map_err(error: runtime::Error) -> rquickjs::Error {
+fn map_err(error: impl std::fmt::Display) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("comm-analyser", "writer", error.to_string())
 }
 
@@ -519,15 +559,19 @@ pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                         }
                         let pc = cursor_r.get();
                         let bytes = memory::read(pc, 4).map_err(map_err)?;
-                        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+                        let word = u32::from_le_bytes(
+                            bytes.as_slice().try_into().map_err(|_| {
+                                js_err("readOne: instruction crosses a mapping boundary")
+                            })?,
+                        );
                         last_r.set((word, pc));
                         cursor_r.set(pc + 4);
-                        let insn = gum::arch::classify(word);
-                        if insn.is_branch() && !matches!(insn, gum::arch::Insn::Bl { .. }) {
+                        let insn = arch_arm64::classify(word);
+                        if insn.is_branch() && !matches!(insn, arch_arm64::Insn::Bl { .. }) {
                             eoi_r.set(true);
                             reloc_r.set("eoi", true)?;
                         }
-                        let decoded = gum::arch::decode(word, pc as u64);
+                        let decoded = arch_arm64::decode(word, pc as u64);
                         reloc_r.set(
                             "input",
                             crate::instruction::from_decoded(ctx, pc as u64, &decoded)?,
@@ -572,3 +616,230 @@ pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     )?;
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rquickjs::{Context, Runtime};
+
+    /// Emit code through the JS API and return the writer bytes.
+    fn emit(script: &str) -> rquickjs::Result<Vec<u8>> {
+        let runtime = Runtime::new()?;
+        let ctx = Context::full(&runtime)?;
+        let mut sink = vec![0u8; 256];
+        let base = sink.as_mut_ptr() as u64;
+        ctx.with(|ctx| {
+            install(&ctx)?;
+            ctx.globals().set("base", base)?;
+            ctx.eval::<(), _>(script)?;
+            let writer: Class<Arm64Writer> = ctx.eval("w")?;
+            let bytes = {
+                let borrow = writer.borrow();
+                borrow.code.bytes().to_vec()
+            };
+            Ok(bytes)
+        })
+    }
+
+    /// Apply the emitted moves to a register file, stopping at the call.
+    fn simulate(bytes: &[u8]) -> [u64; 32] {
+        let mut regs: [u64; 32] = core::array::from_fn(|index| 0x1000 + index as u64);
+        let sp = 0x7000u64;
+        for word in bytes.chunks_exact(4).map(|chunk| {
+            u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"))
+        }) {
+            let rd = (word & 0x1F) as usize;
+            let rn = ((word >> 5) & 0x1F) as usize;
+            let rm = ((word >> 16) & 0x1F) as usize;
+            if word & 0xFFE0_FFE0 == 0xAA00_03E0 {
+                // mov xd, xm
+                regs[rd] = if rm == 31 { 0 } else { regs[rm] };
+            } else if word & 0xFF80_0000 == 0xD280_0000 {
+                // movz xd, #imm16, lsl #(hw * 16)
+                let imm = ((word >> 5) & 0xFFFF) as u64;
+                let shift = ((word >> 21) & 0x3) * 16;
+                regs[rd] = imm << shift;
+            } else if word & 0xFF80_0000 == 0xF280_0000 {
+                // movk
+                let imm = ((word >> 5) & 0xFFFF) as u64;
+                let shift = ((word >> 21) & 0x3) * 16;
+                let mask = !(0xFFFFu64 << shift);
+                regs[rd] = (regs[rd] & mask) | (imm << shift);
+            } else if word & 0xFFC0_0000 == 0x9100_0000 {
+                // add xd, xn|sp, #imm
+                let imm = ((word >> 10) & 0xFFF) as u64;
+                let base = if rn == 31 { sp } else { regs[rn] };
+                regs[rd] = base + imm;
+            } else if word & 0xFFFF_FC1F == 0xD63F_0000 {
+                // blr xn: arguments are in place, stop before the call.
+                break;
+            } else {
+                panic!("unexpected instruction {word:#010x}");
+            }
+        }
+        regs
+    }
+
+    #[test]
+    fn js_layer_moves_arguments_in_parallel() {
+        // Naive ordering would leave x1 == old x1 instead of old x0.
+        let bytes = emit(r#"
+            globalThis.w = new Arm64Writer(base);
+            w.putCallAddressWithArguments(0x1000, ["x1", "x0"]);
+        "#)
+        .expect("emit");
+        let regs = simulate(&bytes);
+        assert_eq!(regs[0], 0x1001, "x0 must receive the old x1");
+        assert_eq!(regs[1], 0x1000, "x1 must receive the old x0");
+    }
+
+    #[test]
+    fn js_layer_breaks_a_three_way_cycle() {
+        let bytes = emit(r#"
+            globalThis.w = new Arm64Writer(base);
+            w.putCallAddressWithArguments(0x2000, ["x2", "x0", "x1"]);
+        "#)
+        .expect("emit");
+        let regs = simulate(&bytes);
+        assert_eq!(regs[0], 0x1002);
+        assert_eq!(regs[1], 0x1000);
+        assert_eq!(regs[2], 0x1001);
+    }
+
+    #[test]
+    fn js_layer_writes_immediates_after_register_moves() {
+        // Immediate first would destroy x0 before the move reads it.
+        let bytes = emit(r#"
+            globalThis.w = new Arm64Writer(base);
+            w.putCallAddressWithArguments(0x3000, [0x1234, "x0"]);
+        "#)
+        .expect("emit");
+        let regs = simulate(&bytes);
+        assert_eq!(regs[0], 0x1234);
+        assert_eq!(regs[1], 0x1000, "x1 must keep the old x0");
+    }
+
+    #[test]
+    fn js_layer_rejects_unsupported_argument_shapes() {
+        let too_many = emit(r#"
+            globalThis.w = new Arm64Writer(base);
+            w.putCallAddressWithArguments(0x1000, ["x0","x1","x2","x3","x4","x5","x6","x7","x0"]);
+        "#);
+        assert!(too_many.is_err(), "9 arguments must be rejected");
+
+        let bad_register = emit(r#"
+            globalThis.w = new Arm64Writer(base);
+            w.putCallAddressWithArguments(0x1000, ["x99"]);
+        "#);
+        assert!(bad_register.is_err(), "x99 must be rejected");
+    }
+
+    /// Decode a single emitted store into (effective offset, is_32).
+    fn decode_store(bytes: &[u8]) -> (i64, bool) {
+        assert_eq!(bytes.len(), 4, "expected exactly one instruction");
+        let word = u32::from_le_bytes(bytes.try_into().expect("4 bytes"));
+        if word & 0xFFC0_0000 == 0xF900_0000 {
+            ((((word >> 10) & 0xFFF) * 8) as i64, false)
+        } else if word & 0xFFC0_0000 == 0xB900_0000 {
+            ((((word >> 10) & 0xFFF) * 4) as i64, true)
+        } else if word & 0xFFE0_0C00 == 0xF800_0000 {
+            let imm9 = ((word >> 12) & 0x1FF) as i64;
+            ((imm9 << 55) >> 55, false)
+        } else if word & 0xFFE0_0C00 == 0xB800_0000 {
+            let imm9 = ((word >> 12) & 0x1FF) as i64;
+            ((imm9 << 55) >> 55, true)
+        } else {
+            panic!("unexpected store encoding {word:#010x}");
+        }
+    }
+
+    #[test]
+    fn js_layer_preserves_unaligned_store_offsets() {
+        // 5 is not a multiple of 8 and must go through STUR unchanged.
+        let bytes = emit(r#"
+            globalThis.w = new Arm64Writer(base);
+            w.putStrRegRegOffset("x0", "x1", 5);
+        "#)
+        .expect("emit");
+        assert_eq!(decode_store(&bytes), (5, false));
+
+        // A 32-bit store gets its own scaled form (scale 4), not a rejection.
+        let bytes = emit(r#"
+            globalThis.w = new Arm64Writer(base);
+            w.putStrRegRegOffset("w0", "x1", 256);
+        "#)
+        .expect("emit");
+        assert_eq!(decode_store(&bytes), (256, true));
+    }
+
+    /// Replay a store sequence and return the effective address.
+    fn simulate_store(bytes: &[u8]) -> i64 {
+        let mut regs: [u64; 32] = core::array::from_fn(|index| 0x1000 + index as u64);
+        let mut address = None;
+        for word in bytes.chunks_exact(4).map(|chunk| {
+            u32::from_le_bytes(chunk.try_into().expect("4 bytes"))
+        }) {
+            let rd = (word & 0x1F) as usize;
+            let base = ((word >> 5) & 0x1F) as usize;
+            let rm = ((word >> 16) & 0x1F) as usize;
+            if word & 0xFFE0_FFE0 == 0xAA00_03E0 {
+                // mov xd, xm
+                regs[rd] = regs[rm];
+            } else if word & 0xFF80_0000 == 0xD280_0000 {
+                let immediate = ((word >> 5) & 0xFFFF) as u64;
+                regs[rd] = immediate << (((word >> 21) & 0x3) * 16);
+            } else if word & 0xFF80_0000 == 0xF280_0000 {
+                let immediate = ((word >> 5) & 0xFFFF) as u64;
+                let shift = ((word >> 21) & 0x3) * 16;
+                regs[rd] = (regs[rd] & !(0xFFFFu64 << shift)) | (immediate << shift);
+            } else if word & 0xFFC0_0000 == 0x9100_0000
+                || word & 0xFFC0_0000 == 0x9140_0000
+            {
+                let immediate = ((word >> 10) & 0xFFF) as u64;
+                let shift = if word & 0x0040_0000 != 0 { 12 } else { 0 };
+                regs[rd] = regs[base].wrapping_add(immediate << shift);
+            } else if word & 0xFFC0_0000 == 0xD100_0000
+                || word & 0xFFC0_0000 == 0xD140_0000
+            {
+                let immediate = ((word >> 10) & 0xFFF) as u64;
+                let shift = if word & 0x0040_0000 != 0 { 12 } else { 0 };
+                regs[rd] = regs[base].wrapping_sub(immediate << shift);
+            } else if word & 0xFFE0_FC00 == 0x8B00_0000 {
+                regs[rd] = regs[base].wrapping_add(regs[rm]);
+            } else if word & 0xFFC0_0000 == 0xF900_0000 {
+                address = Some(regs[base] as i64 + (((word >> 10) & 0xFFF) as i64 * 8));
+                break;
+            } else if word & 0xFFE0_0C00 == 0xF800_0000 {
+                let imm9 = (((word >> 12) & 0x1FF) as i64) << 55 >> 55;
+                address = Some(regs[base] as i64 + imm9);
+                break;
+            } else {
+                panic!("unexpected instruction {word:#010x}");
+            }
+        }
+        address.expect("sequence must store once")
+    }
+
+    #[test]
+    fn js_layer_falls_back_for_large_store_offsets() {
+        // -1000 fits neither STR nor STUR; the writer materializes the address
+        // in x16 and stores at offset 0.
+        let bytes = emit(r#"
+            globalThis.w = new Arm64Writer(base);
+            w.putStrRegRegOffset("x0", "x1", -1000);
+        "#)
+        .expect("emit");
+        assert!(bytes.len() > 4, "fallback must emit more than one instruction");
+        assert_eq!(simulate_store(&bytes), 0x1001 - 1000);
+    }
+
+    #[test]
+    fn js_layer_rejects_large_offset_without_a_scratch_register() {
+        // x16/x17 are the scratch candidates; using both leaves none.
+        let result = emit(r#"
+            globalThis.w = new Arm64Writer(base);
+            w.putStrRegRegOffset("x16", "x17", 5001);
+        "#);
+        assert!(result.is_err(), "no scratch register available");
+    }
+}
+

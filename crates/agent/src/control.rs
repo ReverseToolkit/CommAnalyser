@@ -96,7 +96,7 @@ fn run(name: &str) -> std::io::Result<()> {
         "quickjs": worker.is_some(),
     });
     {
-        let mut output = writer.lock().expect("agent writer poisoned");
+        let mut output = writer.lock().unwrap_or_else(|error| error.into_inner());
         writeln!(output, "{hello}")?;
         output.flush()?;
     }
@@ -111,7 +111,7 @@ fn run(name: &str) -> std::io::Result<()> {
             Ok(value) => value,
             Err(err) => {
                 let response = json!({"ok": false, "error": format!("bad json: {err}")});
-                let mut output = writer.lock().expect("agent writer poisoned");
+                let mut output = writer.lock().unwrap_or_else(|error| error.into_inner());
                 writeln!(output, "{response}")?;
                 output.flush()?;
                 continue;
@@ -123,7 +123,7 @@ fn run(name: &str) -> std::io::Result<()> {
             break;
         };
 
-        let mut output = writer.lock().expect("agent writer poisoned");
+        let mut output = writer.lock().unwrap_or_else(|error| error.into_inner());
         writeln!(output, "{response}")?;
         output.flush()?;
     }
@@ -338,11 +338,17 @@ pub fn spawn(name: String) {
     std::thread::spawn(move || {
         let mut last = None;
         for _ in 0..50 {
-            match run(&name) {
-                Ok(()) => return,
-                Err(err) => {
+            // Contain a panic so the control thread survives a bad script or
+            // a torn-down runtime instead of going silent.
+            match runtime::ffi::guard("agent control channel", || run(&name)) {
+                Some(Ok(())) => return,
+                Some(Err(err)) => {
                     last = Some(err);
                     std::thread::sleep(Duration::from_millis(20));
+                }
+                None => {
+                    eprintln!("[agent] control channel panicked; giving up");
+                    return;
                 }
             }
         }
@@ -355,7 +361,9 @@ pub fn spawn(name: String) {
 static HOOK_HITS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn on_getpid(_regs: *mut gum::SavedRegs, _data: *mut c_void) {
-    HOOK_HITS.fetch_add(1, Ordering::SeqCst);
+    runtime::ffi::guard("hook_getpid", || {
+        HOOK_HITS.fetch_add(1, Ordering::SeqCst);
+    });
 }
 
 fn hook_getpid() -> Value {

@@ -1,454 +1,580 @@
-//! QBDI VM for `Trace.function`. The hook is ours; this module prepares the
-//! VM, skips PAC hints, and collects events. No TAL.
+//! The QBDI trace session: one VM, one host stack, one event sink.
+//!
+//! The VM and its callbacks come from `qbdi-rs`; this module owns the
+//! CommAnalyser policy: what to instrument, when to break out of the VM, and
+//! what to record while the guest runs.
+//!
+//! Two rules keep the callbacks usable:
+//!
+//! - no module enumeration per instruction. Module names come from a snapshot
+//!   taken when the session is prepared. Event text is formatted on demand;
+//!   symbols are resolved lazily per module.
+//! - no locking per callback.  A trace is exclusive (see [Busy]), so the
+//!   callbacks reach the session through a thread-local pointer owned by
+//!   [run].
 
-use std::ffi::c_void;
-use std::ptr;
-use std::sync::Mutex;
+// The trace door is what calls into this module; without it the session is
+// unreachable and the compiler cannot see the use.
+#![cfg_attr(not(feature = "vm"), allow(dead_code))]
 
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use qbdi_rs::{
+    Action, AnalysisType, FloatRegisters, HostStack, InstAnalysis, InstContext, InstPosition,
+    MemoryAccessType, Reg, RegisterAccess, Registers, Vm, VmContext, VmEvent,
+};
 use runtime::{Error, Result};
 
 use crate::blacklist;
-use crate::policy;
-use crate::session::EventMask;
-use crate::TraceEvent;
-use crate::EventKind;
+use crate::policy::{self, InstKind};
+use crate::ring::{EventRing, TraceEvent};
+use crate::session::{PrintMode, TraceConfig};
+use crate::symbols::Symbols;
 
-const OPT_BYPASS_PAUTH: u32 = 1 << 25;
-const PREINST: u32 = 0;
-const POSTINST: u32 = 1;
-const CONTINUE: u32 = 0;
-const SKIP_PATCH: u32 = 2;
-const BREAK_TO_VM: u32 = 3;
-const ANALYSIS_INSTRUCTION: u32 = 1;
-const MEMORY_READ_WRITE: u32 = 3;
-const MEMORY_WRITE: u32 = 2;
-
-const EXEC_TRANSFER: u32 = policy::EXEC_TRANSFER_CALL | policy::EXEC_TRANSFER_RETURN;
+const PRIORITY_POST: i32 = 10;
+const PRIORITY_MEM: i32 = -10;
 const VM_STACK: usize = 16 << 20;
+const PRINTABLE_SIZE: i32 = 4;
 
-/// Guest registers copied into QBDI before `qbdi_run` and back afterwards.
+/// Guest registers copied into QBDI before the run and back afterwards.
 pub struct GuestRegs {
     pub x: [u64; 29],
+    pub q: [u128; 32],
     pub fp: u64,
     pub lr: u64,
     pub sp: u64,
     pub nzcv: u64,
     pub pc: u64,
-    pub q: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
-#[repr(C)]
-struct GprState {
-    x: [u64; 29],
-    fp: u64,
-    lr: u64,
-    sp: u64,
-    nzcv: u64,
-    pc: u64,
-    local_monitor_addr: u64,
-    local_monitor_enable: u64,
+/// Where an address lives, captured when the session is prepared.
+#[derive(Clone)]
+struct Place {
+    name: Arc<str>,
+    path: Arc<str>,
+    base: u64,
 }
 
-#[repr(C)]
-struct FprState {
-    v: [u128; 32],
-    fpcr: u64,
-    fpsr: u64,
-}
-
-#[repr(C)]
-struct InstAnalysis {
-    _mnemonic: *const i8,
-    address: u64,
-    inst_size: u32,
-    _cpu_mode: u32,
-    _affect_control_flow: bool,
-    _is_branch: bool,
-    is_call: bool,
-}
-
-#[repr(C)]
-struct MemoryAccess {
-    inst_address: u64,
-    access_address: u64,
-    value: u64,
-    size: u16,
-    kind: u32,
-    _flags: u32,
-}
-
-#[repr(C)]
-struct MemoryMap {
+struct Segment {
     start: u64,
     end: u64,
-    _permission: u32,
-    name: *mut i8,
+    place: Place,
 }
 
-struct Vm(*mut c_void);
-
-unsafe impl Send for Vm {}
-
-struct HostStack {
-    base: *mut u8,
-    size: usize,
+/// Immutable snapshot of the process module layout.
+///
+/// Modules can load and unload while a trace runs.  A snapshot makes the
+/// callback path allocation-free and syscall-free; events are labelled with
+/// the layout that was current when the trace started, which is what a trace
+/// describes anyway.
+struct ModuleIndex {
+    segments: Vec<Segment>,
 }
 
-unsafe impl Send for HostStack {}
+impl ModuleIndex {
+    fn snapshot() -> Result<Self> {
+        // Without the module layout, call events lose their module names and
+        // the lookup silently labels everything with a raw address.  A trace
+        // is not worth starting in that state.
+        let modules = runtime::module::enumerate()?;
+        let mut segments = Vec::new();
+        for module in modules {
+            let place = Place {
+                name: Arc::from(module.name.as_str()),
+                path: Arc::from(module.path.as_str()),
+                base: module.base as u64,
+            };
+            for range in &module.ranges {
+                segments.push(Segment {
+                    start: range.start as u64,
+                    end: range.end as u64,
+                    place: place.clone(),
+                });
+            }
+        }
+        segments.sort_unstable_by_key(|segment| segment.start);
+        Ok(Self { segments })
+    }
 
+    fn lookup(&self, address: u64) -> Option<&Place> {
+        let after = self.segments.partition_point(|segment| segment.start <= address);
+        let segment = self.segments.get(after.checked_sub(1)?)?;
+        (address < segment.end).then_some(&segment.place)
+    }
+}
+
+/// The live trace session.
 struct Door {
-    vm: Vm,
-    stack: HostStack,
-    events: Vec<TraceEvent>,
-    escapes: Vec<(u64, u64)>,
-    until: u64,
-    transfer_sp: u64,
+    /// Boxed so the address survives a move of the session.
+    vm: Box<Vm>,
+    /// Boxed for the same reason.
+    stack: Box<HostStack>,
+    index: ModuleIndex,
+    ring: EventRing,
+    trace_end: u64,
     inst: bool,
     mem: bool,
     call: bool,
+    kind: InstKind,
+    mode: PrintMode,
+    printable: i32,
+    inst_path: Arc<str>,
+    reads: Vec<i16>,
+    writes: Vec<i16>,
+    last_inst: bool,
+    symbols: Symbols,
 }
 
 static DOOR: Mutex<Option<Door>> = Mutex::new(None);
 
 fn door() -> std::sync::MutexGuard<'static, Option<Door>> {
-    DOOR.lock().unwrap_or_else(|err| err.into_inner())
+    DOOR.lock().unwrap_or_else(|error| error.into_inner())
 }
 
-extern "C" {
-    fn qbdi_initVM(instance: *mut *mut c_void, cpu: *const i8, mattrs: *const i8);
-    fn qbdi_terminateVM(instance: *mut c_void);
-    fn qbdi_getOptions(instance: *mut c_void) -> u32;
-    fn qbdi_setOptions(instance: *mut c_void, options: u32);
-    fn qbdi_addInstrumentedModuleFromAddr(instance: *mut c_void, addr: u64) -> bool;
-    fn qbdi_removeInstrumentedRange(instance: *mut c_void, start: u64, end: u64);
-    fn qbdi_getCurrentProcessMaps(full_path: bool, size: *mut usize) -> *mut MemoryMap;
-    fn qbdi_freeMemoryMapArray(arr: *mut MemoryMap, size: usize);
-    fn qbdi_getGPRState(instance: *mut c_void) -> *mut GprState;
-    fn qbdi_getFPRState(instance: *mut c_void) -> *mut FprState;
-    fn qbdi_addCodeCB(
-        instance: *mut c_void,
-        pos: u32,
-        cbk: unsafe extern "C" fn(*mut c_void, *mut GprState, *mut FprState, *mut c_void) -> u32,
-        data: *mut c_void,
-        priority: i32,
-    ) -> u32;
-    fn qbdi_getInstAnalysis(instance: *mut c_void, kind: u32) -> *const InstAnalysis;
-    fn qbdi_recordMemoryAccess(instance: *mut c_void, kind: u32) -> bool;
-    fn qbdi_getInstMemoryAccess(instance: *mut c_void, size: *mut usize) -> *mut MemoryAccess;
-    fn qbdi_run(instance: *mut c_void, start: u64, stop: u64) -> bool;
-    fn qbdi_addVMEventCB(
-        instance: *mut c_void,
-        mask: u32,
-        cbk: unsafe extern "C" fn(
-            *mut c_void,
-            *const VmEventState,
-            *mut GprState,
-            *mut FprState,
-            *mut c_void,
-        ) -> u32,
-        data: *mut c_void,
-    ) -> u32;
+thread_local! {
+    /// The session [run] is currently executing on this thread.
+    static CURRENT: Cell<*mut Door> = const { Cell::new(std::ptr::null_mut()) };
 }
 
-#[repr(C)]
-struct VmEventState {
-    event: u32,
+fn current() -> Option<*mut Door> {
+    CURRENT.with(|slot| {
+        let pointer = slot.get();
+        (!pointer.is_null()).then_some(pointer)
+    })
 }
 
-/// Create a VM for `target`, instrument its module, and drop conflict ranges.
-pub fn prepare(target: u64, until: u64, events: &EventMask, extra: &[String]) -> Result<()> {
-    let mut vm = ptr::null_mut();
-    unsafe { qbdi_initVM(&mut vm, ptr::null(), ptr::null()) };
-    if vm.is_null() {
-        return Err(Error::Parse("qbdi_initVM failed".into()));
-    }
-    unsafe {
-        let options = qbdi_getOptions(vm) | OPT_BYPASS_PAUTH;
-        qbdi_setOptions(vm, options);
-        qbdi_addCodeCB(vm, PREINST, pre_inst, ptr::null_mut(), 0);
-        if events.mem {
-            qbdi_recordMemoryAccess(vm, MEMORY_READ_WRITE);
-            qbdi_addCodeCB(vm, POSTINST, post_inst, ptr::null_mut(), 0);
-        }
-        qbdi_addVMEventCB(vm, EXEC_TRANSFER, on_transfer, ptr::null_mut());
-        if !qbdi_addInstrumentedModuleFromAddr(vm, target) {
-            qbdi_terminateVM(vm);
+/// One trace at a time: the VM, the host stack and the event ring are single
+/// instances, and QBDI callbacks run on the guest thread.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+struct Busy;
+
+impl Busy {
+    fn acquire() -> Result<Self> {
+        if BUSY.swap(true, Ordering::AcqRel) {
             return Err(Error::Parse(
-                "qbdi_addInstrumentedModuleFromAddr failed".into(),
+                "Trace.function: a trace is already running".into(),
             ));
         }
-        drop_conflict_ranges(vm, extra);
+        Ok(Self)
     }
-    let stack = match map_stack() {
-        Ok(stack) => stack,
-        Err(err) => {
-            unsafe { qbdi_terminateVM(vm) };
-            return Err(err);
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.store(false, Ordering::Release);
+    }
+}
+
+fn map_error(error: qbdi_rs::Error) -> Error {
+    Error::Parse(error.to_string())
+}
+
+/// Create the VM, instrument it, and register the trace callbacks.
+pub fn prepare(config: &TraceConfig) -> Result<()> {
+    if !config.escapes.is_empty() {
+        // `CheckAndBreak` needs the private ExecBlock shim and a register
+        // write-back design that is not validated yet.
+        return Err(Error::Unsupported(
+            "Trace.function: escape breakpoints are not enabled",
+        ));
+    }
+    if BUSY.load(Ordering::Acquire) {
+        return Err(Error::Parse(
+            "Trace.function: cannot replace a session while it is running".into(),
+        ));
+    }
+    // Snapshot before touching the live session so a failure leaves it intact.
+    let index = ModuleIndex::snapshot()?;
+    let mut vm = Vm::new().map_err(map_error)?;
+    vm.add_code_callback(InstPosition::Pre, 0, on_pre_inst)
+        .map_err(map_error)?;
+    vm.add_code_callback(InstPosition::Post, PRIORITY_POST, on_post_inst)
+        .map_err(map_error)?;
+    vm.add_vm_event_callback(VmEvent::EXEC_TRANSFER_CALL, on_transfer_call)
+        .map_err(map_error)?;
+    vm.add_vm_event_callback(VmEvent::EXEC_TRANSFER_RETURN, |_| Action::Continue)
+        .map_err(map_error)?;
+    vm.add_vm_event_callback(VmEvent::BASIC_BLOCK_NEW, |_| Action::Continue)
+        .map_err(map_error)?;
+    if config.events.mem {
+        vm.add_mem_access_callback(MemoryAccessType::READ_WRITE, PRIORITY_MEM, on_memory_access)
+            .map_err(map_error)?;
+    }
+    // The pinned QBDI has no blacklist mode: choose the instrumented set
+    // explicitly. `trace_all` covers every executable map, then subtracts the
+    // avoid ranges; the per-function mode instruments the target's module.
+    if config.trace_all {
+        if !vm.instrument_all_executable_maps() {
+            return Err(Error::Parse(
+                "Trace.function: instrumenting every executable map failed".into(),
+            ));
         }
-    };
+        for &(start, end) in &config.avoid {
+            vm.remove_instrumented_range(start, end);
+        }
+    } else if !vm.add_instrumented_module_from_addr(config.target) {
+        return Err(Error::Parse(
+            "Trace.function: target is not in an executable module".into(),
+        ));
+    }
+    remove_conflict_module(&vm, &config.extra_exclude);
+    let stack = HostStack::new(VM_STACK).map_err(map_error)?;
     let mut slot = door();
     if let Some(previous) = slot.take() {
-        unsafe { qbdi_terminateVM(previous.vm.0) };
-        unmap_stack(&previous.stack);
+        // Terminates the old VM and frees its stack.
+        drop(previous);
     }
     *slot = Some(Door {
-        vm: Vm(vm),
-        stack,
-        events: Vec::new(),
-        escapes: Vec::new(),
-        until,
-        transfer_sp: 0,
-        inst: events.inst,
-        mem: events.mem,
-        call: events.call,
+        vm: Box::new(vm),
+        stack: Box::new(stack),
+        index,
+        ring: EventRing::new(config.max_events.max(1)),
+        trace_end: config.trace_end(),
+        inst: config.events.inst,
+        mem: config.events.mem,
+        call: config.events.call,
+        kind: InstKind::None,
+        mode: config.mode,
+        printable: if config.mode == PrintMode::Bin {
+            0
+        } else {
+            PRINTABLE_SIZE
+        },
+        inst_path: Arc::from(""),
+        reads: Vec::new(),
+        writes: Vec::new(),
+        last_inst: false,
+        symbols: Symbols::default(),
     });
     Ok(())
 }
 
-pub fn add_escape(break_at: u64, resume: u64) {
-    if let Some(door) = door().as_mut() {
-        door.escapes.push((break_at, resume));
+/// Copy the guest registers into the VM, run from `start` until `stop`, then
+/// copy the resulting registers and floating point state back into `regs`.
+pub fn run(regs: &mut GuestRegs, start: u64, fallback_stop: u64) -> Result<()> {
+    let _busy = Busy::acquire()?;
+    let mut slot = door();
+    let door = slot
+        .as_mut()
+        .ok_or_else(|| Error::Parse("QBDI VM is not prepared".into()))?;
+    // TAL's trace_end transfers back to native execution at that address.
+    // Returning STOP through QBDI first lets Rust release its session guards
+    // before the door restores the guest registers and resumes there.
+    // The pre-instruction callback stops at trace_end. Always retain the
+    // caller's return address as a stop too, in case trace_end is not reached.
+    let stop = fallback_stop;
+    let door: *mut Door = door;
+    // SAFETY: both boxes are owned by the session, which cannot be replaced
+    // while `_busy` is held; the borrows end before the callbacks run.
+    let (vm, stack) = unsafe { (&*(*door).vm as *const Vm, &*(*door).stack as *const HostStack) };
+    let (vm, stack) = unsafe { (&*vm, &*stack) };
+    // Gum's relocated prologue lives outside the original module. Starting
+    // there bypasses the replacement and executes each original instruction
+    // once before entering the instrumented module body.
+    let page = runtime::process::page_size() as u64;
+    let trampoline_page = start & !(page - 1);
+    vm.add_instrumented_range(trampoline_page.into(), (trampoline_page + page).into())
+        .map_err(map_error)?;
+    set_registers(vm, regs);
+    CURRENT.with(|cell| cell.set(door));
+    let result = runtime::ffi::guard("Trace.run", || run_on_stack(vm, stack, start, stop))
+        .unwrap_or_else(|| Err(Error::Parse("QBDI trace panicked".into())));
+    CURRENT.with(|cell| cell.set(std::ptr::null_mut()));
+    copy_back(vm, regs);
+    // Do not touch `door` here: the callbacks created references from it.
+    result
+}
+
+fn set_registers(vm: &Vm, regs: &GuestRegs) {
+    let mut state = Registers::default();
+    state.set_x(&regs.x);
+    state.set(Reg::Fp, regs.fp);
+    state.set(Reg::Lr, regs.lr);
+    state.set(Reg::Sp, regs.sp);
+    state.set(Reg::Nzcv, regs.nzcv);
+    state.set(Reg::Pc, regs.pc);
+    vm.set_registers(&state);
+    let mut floats = FloatRegisters::default();
+    for (index, value) in regs.q.iter().enumerate() {
+        floats.set(index, *value);
+    }
+    floats.set_fpcr(regs.fpcr);
+    floats.set_fpsr(regs.fpsr);
+    vm.set_floats(&floats);
+}
+
+fn copy_back(vm: &Vm, regs: &mut GuestRegs) {
+    if let Some(state) = vm.registers() {
+        regs.x = state.x();
+        regs.fp = state.get(Reg::Fp);
+        regs.lr = state.get(Reg::Lr);
+        regs.sp = state.get(Reg::Sp);
+        regs.nzcv = state.get(Reg::Nzcv);
+        regs.pc = state.get(Reg::Pc);
+    }
+    if let Some(after) = vm.floats() {
+        regs.fpcr = after.fpcr();
+        regs.fpsr = after.fpsr();
+        for (index, value) in regs.q.iter_mut().enumerate() {
+            *value = after.get(index);
+        }
     }
 }
 
-/// Copy `regs` into the VM, run from `start` until `stop`, then copy them back.
-pub fn run(regs: &mut GuestRegs, start: u64, stop: u64) -> Result<()> {
-    let (vm, stop) = {
-        let slot = door();
-        let door = slot
-            .as_ref()
-            .ok_or_else(|| Error::Parse("QBDI VM is not prepared".into()))?;
-        let stop = if door.until != 0 { door.until } else { stop };
-        (door.vm.0, stop)
-    };
-    unsafe {
-        let gpr = qbdi_getGPRState(vm);
-        let fpr = qbdi_getFPRState(vm);
-        if gpr.is_null() || fpr.is_null() {
-            return Err(Error::Parse("QBDI register state is null".into()));
-        }
-        copy_gpr_in(gpr, regs);
-        (*fpr).v = regs.q;
-        // `copy_gpr_in` keeps the hooked thread's SP in the guest GPR.
-        // Only the CPU SP moves onto the mapped host stack for `qbdi_run`.
-        let top = {
-            let slot = door();
-            let door = slot.as_ref().expect("VM prepared");
-            policy::aligned_stack_top(door.stack.base as usize, door.stack.size)
-        };
-        qbdi_run_on_stack(top as *mut u8, vm, start, stop);
-        copy_gpr_out(regs, gpr);
-        regs.q = (*fpr).v;
+/// The events the last traced call produced.
+pub fn take_events() -> Vec<TraceEvent> {
+    take_batch().0
+}
+
+/// The batch and how many events the ring dropped, read atomically so a
+/// script cannot pair one trace's events with another trace's drop count.
+pub fn take_batch() -> (Vec<TraceEvent>, u64) {
+    door()
+        .as_mut()
+        .map(|door| {
+            // The post-instruction pass refers to the last event; dropping the
+            // batch must not leave that flag behind.
+            door.last_inst = false;
+            (door.ring.drain(), door.ring.dropped())
+        })
+        .unwrap_or_default()
+}
+
+/// How many events the ring discarded because it was full.
+pub fn dropped_events() -> u64 {
+    door().as_ref().map(|door| door.ring.dropped()).unwrap_or(0)
+}
+
+fn run_on_stack(vm: &Vm, stack: &HostStack, start: u64, stop: u64) -> Result<()> {
+    if !stack.run(vm, start, stop) {
+        return Err(Error::Parse("qbdi_run returned false".into()));
     }
     Ok(())
 }
 
-fn map_stack() -> Result<HostStack> {
-    let base = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            VM_STACK,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if base == libc::MAP_FAILED {
-        return Err(Error::Parse("VM stack mmap failed".into()));
-    }
-    Ok(HostStack {
-        base: base.cast(),
-        size: VM_STACK,
-    })
-}
-
-fn unmap_stack(stack: &HostStack) {
-    if !stack.base.is_null() {
-        unsafe { libc::munmap(stack.base.cast(), stack.size) };
-    }
-}
-
-/// Switch the CPU stack pointer, then call `qbdi_run`. Does not write GPR `SP`.
-unsafe fn qbdi_run_on_stack(stack_top: *mut u8, vm: *mut c_void, start: u64, stop: u64) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        core::arch::asm!(
-            "mov x9, sp",
-            "mov sp, x10",
-            "stp x29, x30, [sp, #-32]!",
-            "str x9, [sp, #16]",
-            "mov x29, sp",
-            "mov x0, x11",
-            "mov x1, x12",
-            "mov x2, x13",
-            "blr x14",
-            "ldr x9, [sp, #16]",
-            "ldp x29, x30, [sp], #32",
-            "mov sp, x9",
-            in("x10") stack_top,
-            in("x11") vm,
-            in("x12") start,
-            in("x13") stop,
-            in("x14") qbdi_run as *const (),
-            out("x9") _,
-            out("x0") _,
-            clobber_abi("C"),
-        );
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = (stack_top, vm, start, stop);
-    }
-}
-
-pub fn take_events() -> Vec<TraceEvent> {
-    door()
-        .as_mut()
-        .map(|door| std::mem::take(&mut door.events))
-        .unwrap_or_default()
-}
-
-fn copy_gpr_in(dst: *mut GprState, src: &GuestRegs) {
-    unsafe {
-        (*dst).x = src.x;
-        (*dst).fp = src.fp;
-        (*dst).lr = src.lr;
-        (*dst).sp = src.sp;
-        (*dst).nzcv = src.nzcv;
-        (*dst).pc = src.pc;
-    }
-}
-
-fn copy_gpr_out(dst: &mut GuestRegs, src: *const GprState) {
-    unsafe {
-        dst.x = (*src).x;
-        dst.fp = (*src).fp;
-        dst.lr = (*src).lr;
-        dst.sp = (*src).sp;
-        dst.nzcv = (*src).nzcv;
-        dst.pc = (*src).pc;
-    }
-}
-
-fn drop_conflict_ranges(vm: *mut c_void, extra: &[String]) {
-    let mut size = 0usize;
-    let maps = unsafe { qbdi_getCurrentProcessMaps(true, &mut size) };
-    if maps.is_null() {
-        return;
-    }
-    for index in 0..size {
-        let map = unsafe { &*maps.add(index) };
-        if map.name.is_null() {
+/// Drop the executable maps that must not be instrumented.
+fn remove_conflict_module(vm: &Vm, extra: &[String]) {
+    for map in vm.process_maps(false) {
+        let Some(name) = map.name() else {
+            continue;
+        };
+        if !map.permission().is_exec() {
             continue;
         }
-        let name = unsafe { std::ffi::CStr::from_ptr(map.name.cast()) }.to_string_lossy();
-        if blacklist::is_excluded(&name, extra) {
-            unsafe { qbdi_removeInstrumentedRange(vm, map.start, map.end) };
+        if blacklist::is_excluded(name, extra) {
+            vm.remove_instrumented_range(map.start(), map.end());
         }
     }
-    unsafe { qbdi_freeMemoryMapArray(maps, size) };
 }
 
-unsafe extern "C" fn pre_inst(
-    vm: *mut c_void,
-    gpr: *mut GprState,
-    _fpr: *mut FprState,
-    _data: *mut c_void,
-) -> u32 {
-    let analysis = unsafe { qbdi_getInstAnalysis(vm, ANALYSIS_INSTRUCTION) };
-    if analysis.is_null() {
-        return CONTINUE;
+/// The session installed by [run] on this thread.
+fn session() -> Option<*mut Door> {
+    current()
+}
+
+fn on_pre_inst(context: &mut InstContext<'_>) -> Action {
+    // SAFETY: QBDI invokes callbacks on the thread that owns the session.
+    let Some(pointer) = session() else {
+        return Action::Continue;
+    };
+    // SAFETY: the pointer is installed by run() on this thread and outlives the callback.
+    let door = unsafe { &mut *pointer };
+    let Some(analysis) = context.vm().analysis(AnalysisType::TRACE) else {
+        return Action::Continue;
+    };
+    let address = analysis.address();
+    if door.trace_end != 0 && address == door.trace_end {
+        door.last_inst = false;
+        context.registers.set(Reg::Pc, address);
+        return Action::Stop;
     }
-    let address = unsafe { (*analysis).address };
-    let inst_size = unsafe { (*analysis).inst_size };
-    let is_call = unsafe { (*analysis).is_call };
-    if address != 0 {
-        let word = unsafe { ptr::read_unaligned(address as *const u32) };
-        if policy::is_pac_hint(word) {
-            return SKIP_PATCH;
+    let kind = policy::classify(
+        analysis.is_call(),
+        analysis.is_return(),
+        analysis.is_branch(),
+        analysis.is_predicable(),
+    );
+    door.kind = kind;
+    if door.call {
+        door.inst_path = door
+            .index
+            .lookup(address)
+            .map(|place| place.path.clone())
+            .unwrap_or_else(|| Arc::from(""));
+    }
+    if !door.inst {
+        door.last_inst = false;
+        return Action::Continue;
+    }
+    let (reads, writes) = split_regs(&analysis);
+    let mut text = inst_text(&door.index, address, &analysis);
+    let read_text = fmt_regs(context.registers, &reads);
+    if !read_text.is_empty() {
+        text.push(' ');
+        text.push_str(&read_text);
+    }
+    if door.mode == PrintMode::Bin {
+        text.push_str(&inst_bytes(address, analysis.size()));
+    }
+    let size = u16::try_from(analysis.size()).unwrap_or(u16::MAX);
+    // Only a stored event can receive the post-instruction register suffix.
+    door.last_inst = door.ring.push(TraceEvent::inst(address, size, text));
+    door.reads = reads;
+    door.writes = writes;
+    Action::Continue
+}
+
+fn on_post_inst(context: &mut InstContext<'_>) -> Action {
+    let target = context.registers.get(Reg::Pc);
+    let sp = context.registers.get(Reg::Sp);
+    let args = context.registers.args();
+    // SAFETY: same thread and session as on_pre_inst.
+    let Some(pointer) = session() else {
+        return Action::Continue;
+    };
+    // SAFETY: installed by run() on this thread, valid for the callback.
+    let door = unsafe { &mut *pointer };
+    if door.last_inst {
+        let extra = fmt_regs(context.registers, &door.writes);
+        if !extra.is_empty() {
+            if let Some(last) = door.ring.last_mut() {
+                last.text.push(' ');
+                last.text.push_str(&extra);
+            }
         }
     }
-    let mut slot = door();
-    let Some(door) = slot.as_mut() else {
-        return CONTINUE;
+    if door.mode == PrintMode::Bin || !door.call || !matches!(door.kind, InstKind::Call | InstKind::Jmp) {
+        return Action::Continue;
+    }
+    let Some(place) = door.index.lookup(target).cloned() else {
+        return Action::Continue;
     };
-    if let Some(resume) = policy::escape_resume(&door.escapes, address) {
-        unsafe { (*gpr).pc = resume };
-        return BREAK_TO_VM;
+    if door.kind == InstKind::Jmp && place.path == door.inst_path {
+        return Action::Continue;
     }
-    if door.inst {
-        door.events.push(TraceEvent {
-            kind: EventKind::Inst,
-            pc: address,
-            size: inst_size as u16,
-            mem_addr: 0,
-            mem_value: 0,
-            is_write: false,
-        });
+    let offset = target.wrapping_sub(place.base);
+    let symbol = door
+        .symbols
+        .resolve(&place.path, place.base, target)
+        .unwrap_or_else(|| format!("{offset:#x}"));
+    let mut text = format!("call {}:{} base:{:#x}", place.name, symbol, place.base);
+    if door.mode == PrintMode::TraceArgs {
+        text.push('\n');
+        text.push_str(&crate::args::format_call(&symbol, &args, sp));
     }
-    if door.call && is_call {
-        door.events.push(TraceEvent {
-            kind: EventKind::Call,
-            pc: address,
-            size: inst_size as u16,
-            mem_addr: 0,
-            mem_value: 0,
-            is_write: false,
-        });
-    }
-    CONTINUE
+    let _ = door.ring.push(TraceEvent::call(target, text));
+    Action::Continue
 }
 
-unsafe extern "C" fn post_inst(
-    vm: *mut c_void,
-    _gpr: *mut GprState,
-    _fpr: *mut FprState,
-    _data: *mut c_void,
-) -> u32 {
-    let mut count = 0usize;
-    let accesses = unsafe { qbdi_getInstMemoryAccess(vm, &mut count) };
-    if accesses.is_null() || count == 0 {
-        return CONTINUE;
-    }
-    let mut slot = door();
-    let Some(door) = slot.as_mut() else {
-        return CONTINUE;
+fn on_memory_access(context: &mut InstContext<'_>) -> Action {
+    // SAFETY: same thread and session as on_pre_inst.
+    let Some(pointer) = session() else {
+        return Action::Continue;
     };
-    if !door.mem {
-        return CONTINUE;
+    // SAFETY: installed by run() on this thread, valid for the callback.
+    let door = unsafe { &mut *pointer };
+    if !door.mem || door.mode == PrintMode::Bin || door.kind == InstKind::Call {
+        return Action::Continue;
     }
-    for index in 0..count {
-        let access = unsafe { &*accesses.add(index) };
-        door.events.push(TraceEvent {
-            kind: EventKind::Mem,
-            pc: access.inst_address,
-            size: access.size,
-            mem_addr: access.access_address,
-            mem_value: access.value,
-            is_write: access.kind & MEMORY_WRITE != 0,
-        });
+    let printable = door.printable;
+    for access in context.vm().memory_accesses() {
+        let text = if printable == 0 {
+            String::new()
+        } else {
+            // SAFETY: the guest just accessed this address, so it is mapped.
+            unsafe { policy::printable_text(access.address(), printable) }.unwrap_or_default()
+        };
+        let _ = door.ring.push(TraceEvent::mem(
+            access.instruction_address(),
+            access.size(),
+            access.address(),
+            access.value(),
+            access.is_write(),
+            text,
+        ));
     }
-    CONTINUE
+    Action::Continue
 }
 
-unsafe extern "C" fn on_transfer(
-    _vm: *mut c_void,
-    state: *const VmEventState,
-    gpr: *mut GprState,
-    _fpr: *mut FprState,
-    _data: *mut c_void,
-) -> u32 {
-    if state.is_null() || gpr.is_null() {
-        return CONTINUE;
-    }
-    let event = unsafe { (*state).event };
-    let mut slot = door();
-    let Some(door) = slot.as_mut() else {
-        return CONTINUE;
+fn on_transfer_call(context: &mut VmContext<'_>) -> Action {
+    // SAFETY: same thread and session as on_pre_inst.
+    let Some(pointer) = session() else {
+        return Action::Continue;
     };
-    let (sp, saved) = policy::apply_transfer(event, unsafe { (*gpr).sp }, door.transfer_sp);
-    unsafe { (*gpr).sp = sp };
-    door.transfer_sp = saved;
-    CONTINUE
+    // SAFETY: installed by run() on this thread, valid for the callback.
+    let door = unsafe { &mut *pointer };
+    if !door.call || door.mode != PrintMode::Debug {
+        return Action::Continue;
+    }
+    let pc = context.registers.get(Reg::Pc);
+    let at = match door.index.lookup(pc) {
+        Some(place) => format!("{}:{:#x}", place.name, pc.wrapping_sub(place.base)),
+        None => format!("{pc:#x}"),
+    };
+    let disasm = crate::disasm::disassemble(pc).unwrap_or_default();
+    let _ = door.ring.push(TraceEvent::call(
+        pc,
+        format!("transfer call {pc:#x}:{disasm}\ncall {at}"),
+    ));
+    Action::Continue
+}
+
+fn inst_text(index: &ModuleIndex, address: u64, analysis: &InstAnalysis<'_>) -> String {
+    let at = match index.lookup(address) {
+        Some(place) => format!("{}:{:#x}", place.name, address.wrapping_sub(place.base)),
+        None => format!("{address:#x}"),
+    };
+    match analysis.disassembly() {
+        Some(disassembly) if !disassembly.is_empty() => format!("{at} {disassembly}"),
+        _ => at,
+    }
+}
+
+fn split_regs(analysis: &InstAnalysis<'_>) -> (Vec<i16>, Vec<i16>) {
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    for operand in analysis.operands() {
+        let Some(index) = operand.register_index() else {
+            continue;
+        };
+        match operand.access() {
+            RegisterAccess::Read => reads.push(index),
+            RegisterAccess::Write => writes.push(index),
+            RegisterAccess::ReadWrite => writes.push(index),
+            RegisterAccess::Unused => {}
+        }
+    }
+    (reads, writes)
+}
+
+fn fmt_regs(registers: &Registers, indexes: &[i16]) -> String {
+    indexes
+        .iter()
+        .rev()
+        .filter_map(|index| {
+            let reg = Reg::from_index(*index)?;
+            Some(format!("{}={:#x}", reg.name(), registers.get(reg)))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn inst_bytes(addr: u64, size: u32) -> String {
+    let size = size as usize;
+    if size == 0 || size > 16 {
+        return String::new();
+    }
+    let ptr = addr as *const u8;
+    let mut text = String::from("(");
+    for index in 0..size {
+        let byte = unsafe { ptr.add(index).read_unaligned() };
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text.push(')');
+    text
 }

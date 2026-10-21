@@ -1,11 +1,12 @@
 //! TAL-style default exclusions: do not instrument libc/ART/linker/agent.
 
 /// Substrings matched against `/proc/self/maps` path or basename.
+/// Android `removeConflictModule` names. Only executable maps are removed.
 pub const ANDROID_CONFLICT: &[&str] = &[
     "libart.so",
-    "libart-compiler.so",
     "libEGL.so",
     "linker",
+    "libart-compiler.so",
     "libnativehelper.so",
     "libandroid_runtime.so",
     "libandroidfw.so",
@@ -17,8 +18,6 @@ pub const ANDROID_CONFLICT: &[&str] = &[
     "liblog.so",
     "libGLESv1_CM.so",
     ".oat",
-    "libagent.so",
-    "libQBDI",
 ];
 
 /// Whether `name` (path or basename) is in the default conflict set.
@@ -58,13 +57,17 @@ mod tests {
         assert!(is_conflict("libart.so"));
         assert!(is_conflict("/system/bin/linker64"));
         assert!(is_conflict("boot.oat"));
-        assert!(is_conflict("/data/local/tmp/libagent.so"));
+        assert!(!is_conflict("/data/local/tmp/libagent.so"));
+        assert!(!is_conflict("libQBDI.so"));
         assert!(!is_conflict("libfoo.so"));
         assert!(!is_conflict("/system/lib64/libm.so"));
         assert!(is_excluded(
             "/data/app/libextra.so",
             &["libextra.so".into()]
         ));
-        assert!(!is_excluded("/system/lib64/libm.so", &["libextra.so".into()]));
+        assert!(!is_excluded(
+            "/system/lib64/libm.so",
+            &["libextra.so".into()]
+        ));
     }
 }

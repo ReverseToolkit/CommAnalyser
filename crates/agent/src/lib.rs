@@ -4,7 +4,9 @@
 //! validates the ABI and logs; the QuickJS runtime and control channel are
 //! wired in M1.
 
+#[cfg(feature = "gum-static")]
 mod control;
+#[cfg(feature = "gum-static")]
 mod selftest;
 
 use std::ffi::CStr;
@@ -19,6 +21,12 @@ use std::os::raw::{c_char, c_int};
 /// `config` must be null or point to a valid NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn agent_main(config: *const c_char) -> c_int {
+    // The injector calls this through a C ABI; a panic must not unwind into
+    // the loader stub or abort the freshly attached process.
+    runtime::ffi::guard("agent_main", || unsafe { agent_main_inner(config) }).unwrap_or(-1)
+}
+
+unsafe fn agent_main_inner(config: *const c_char) -> c_int {
     let text = if config.is_null() {
         String::new()
     } else {
@@ -29,7 +37,9 @@ pub unsafe extern "C" fn agent_main(config: *const c_char) -> c_int {
             .to_owned()
     };
     eprintln!("[agent] loaded (config={text:?})");
+    #[cfg(feature = "gum-static")]
     if !text.is_empty() {
+        let _ = gum::Gum::init();
         control::spawn(text);
     }
     0
@@ -52,16 +62,5 @@ mod tests {
     fn null_config_is_ok() {
         let rc = unsafe { super::agent_main(std::ptr::null()) };
         assert_eq!(rc, 0);
-    }
-
-    #[test]
-    fn clear_cache_emits_aarch64_ops_not_the_builtin() {
-        let src = include_str!("../clear_cache.c");
-        assert!(
-            !src.contains("__builtin___clear_cache"),
-            "the builtin calls this symbol and overflows the JS worker stack"
-        );
-        assert!(src.contains("dc cvau"), "D-cache clean to PoU");
-        assert!(src.contains("ic ivau"), "I-cache invalidate");
     }
 }

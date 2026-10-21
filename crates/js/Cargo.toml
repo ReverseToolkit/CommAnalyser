@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 runtime.workspace = true
+arch-arm64.workspace = true
 gum.workspace = true
 art.workspace = true
 qbdi.workspace = true

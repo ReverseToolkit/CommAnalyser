@@ -8,10 +8,17 @@ rust-version.workspace = true
 
 [features]
 default = []
-link = ["dep:gum"]
+# The QBDI VM: static link of libQBDI plus the safe wrapper.
+vm = ["qbdi-rs/link"]
+# The trace door: the VM plus our inline hook.
+link = ["vm", "dep:gum", "gum/link", "dep:gum-sys"]
 
 [dependencies]
 runtime.workspace = true
+arch-arm64.workspace = true
+qbdi-rs.workspace = true
 libc.workspace = true
 thiserror.workspace = true
+goblin = "0.10"
 gum = { workspace = true, optional = true }
+gum-sys = { workspace = true, optional = true }

@@ -4,8 +4,11 @@
 //! thread identity.  Android-specific probing lives in `art` / `inject`.
 
 pub mod error;
+pub mod ffi;
+pub mod handles;
 pub mod maps;
 pub mod module;
+pub mod patch;
 pub mod process;
 pub mod range;
 pub mod thread;

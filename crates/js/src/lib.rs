@@ -8,6 +8,7 @@ mod elf;
 mod extras;
 mod instruction;
 mod java;
+pub mod native;
 mod trace;
 mod worker;
 mod writer;
@@ -773,10 +774,12 @@ mod api_tests {
                 "#,
             )
             .unwrap();
-        assert!(
-            result.contains("after=58000050") && result.contains("restored=d503201f"),
-            "{result}"
-        );
+        // The redirect is a direct B when the trampoline page is in range and
+        // an ldr/ret literal jump otherwise; both are valid. What matters is
+        // that the prologue changed and revert restored it.
+        assert!(result.contains("restored=d503201f"), "{result}");
+        assert!(!result.contains("after=d503201f"), "{result}");
+        assert!(!result.contains("replace-error:"), "{result}");
         let _ = rt;
     }
 

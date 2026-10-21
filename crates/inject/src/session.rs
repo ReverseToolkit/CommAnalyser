@@ -15,9 +15,12 @@ use crate::ptrace::{self, UserPtRegs};
 use crate::remote::RemoteMemory;
 use crate::AttachOptions;
 
-const SCRATCH_SIZE: usize = 0x1_0000;
-const STACK_OFF: usize = 0x8000;
-const CONFIG_OFF: usize = 0x9000;
+/// Bootstrap region: sentinel at the base, a large stack above it, then the
+/// config string. Frida-gum/glib initialization uses more stack than the
+/// original QBDI-only agent, so keep a megabyte of headroom.
+const SCRATCH_SIZE: usize = 0x20_0000;
+const STACK_OFF: usize = 0x10_0000;
+const CONFIG_OFF: usize = 0x18_0000;
 const PAGE: usize = 0x1000;
 const PROT_RW: u64 = 3;
 const PROT_RWX: u64 = 7;

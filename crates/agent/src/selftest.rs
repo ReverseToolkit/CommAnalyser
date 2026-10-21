@@ -4,6 +4,7 @@
 //! the same hook/JS/TAL paths scripts use. Each case is isolated so one
 //! failure does not skip the rest.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
@@ -59,11 +60,29 @@ impl Outcome {
     }
 }
 
-/// Run every in-process case. `suite` selects a layer prefix (`runtime`, `gum`, `js`, `trace`, `java`).
+thread_local! {
+    /// Optional `layer.case` prefix used to run one case at a time.
+    static CASE_FILTER: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn selected(layer: &str, name: &str) -> bool {
+    CASE_FILTER.with(|filter| {
+        let want = filter.borrow();
+        want.is_empty()
+            || format!("{layer}.{name}").starts_with(want.as_str())
+            || layer.starts_with(want.as_str())
+    })
+}
+
+/// Run every in-process case. `suite` selects a layer or `layer.case` prefix
+/// (`runtime`, `gum`, `gum.hook_enter`, `js`, `trace`, `java`).
 pub fn run(worker: Option<&JsWorker>, suite: Option<&str>) -> Value {
     let mut cases = Vec::new();
     let want = suite.unwrap_or("");
-    let take = |layer: &str| want.is_empty() || layer.starts_with(want);
+    CASE_FILTER.with(|filter| *filter.borrow_mut() = want.to_owned());
+    let take = |layer: &str| {
+        want.is_empty() || layer.starts_with(want) || want.starts_with(layer)
+    };
 
     if take("runtime") {
         cases.push(guard("runtime", "maps", test_maps));
@@ -169,6 +188,9 @@ fn guard(
     name: &'static str,
     f: impl FnOnce() -> Result<String, String>,
 ) -> Outcome {
+    if !selected(layer, name) {
+        return Outcome::skip(layer, name, "filtered");
+    }
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(detail)) => Outcome::pass(layer, name, detail),
         Ok(Err(err)) => Outcome::fail(layer, name, err),
@@ -259,7 +281,7 @@ fn test_native_strlen() -> Result<String, String> {
         return Err("dlsym(strlen) failed".into());
     }
     let hello = c"abcdef";
-    let ret = unsafe { gum::native::call(strlen, &[hello.as_ptr() as u64]) }
+    let ret = unsafe { js::native::call(strlen, &[hello.as_ptr() as u64]) }
         .map_err(|err| err.to_string())?;
     if ret != 6 {
         return Err(format!("strlen= {ret}"));
@@ -280,7 +302,7 @@ extern "C" fn commanalyser_selftest_half_f32(x: f32) -> f32 {
 
 fn test_native_f32() -> Result<String, String> {
     let got = unsafe {
-        gum::native::call_f32(
+        js::native::call_f32(
             std::hint::black_box(commanalyser_selftest_half_f32 as *const () as usize),
             &[],
             &[u64::from(0.5f32.to_bits())],
@@ -295,7 +317,7 @@ fn test_native_f32() -> Result<String, String> {
 
 fn test_native_sqrt() -> Result<String, String> {
     let ret = unsafe {
-        gum::native::call_f64(
+        js::native::call_f64(
             std::hint::black_box(commanalyser_selftest_three_f64 as *const () as usize),
             &[],
             &[],
@@ -328,7 +350,7 @@ fn arch_cases() -> Vec<Outcome> {
 
 #[cfg(target_arch = "aarch64")]
 fn test_writer_execute() -> Result<String, String> {
-    let mut writer = gum::arch::writer::CodeWriter::new();
+    let mut writer = arch_arm64::writer::CodeWriter::new();
     writer.bti_c();
     writer.put(0x5280_0540); // mov w0, #42
     writer.ret(30);
@@ -349,7 +371,7 @@ fn test_writer_execute() -> Result<String, String> {
         ptr::copy_nonoverlapping(writer.bytes().as_ptr(), page as *mut u8, writer.len());
     }
     gum::memory::flush_icache(page as usize, writer.len());
-    let ret = unsafe { gum::native::call(page as usize, &[]) }.map_err(|err| {
+    let ret = unsafe { js::native::call(page as usize, &[]) }.map_err(|err| {
         unsafe { libc::munmap(page, 0x1000) };
         err.to_string()
     })?;
@@ -363,7 +385,7 @@ fn test_writer_execute() -> Result<String, String> {
 #[cfg(target_arch = "aarch64")]
 fn test_relocator_nop() -> Result<String, String> {
     let relocated =
-        gum::arch::relocator::relocate_one(0xD503_201F, 0x1000).map_err(|err| err.to_string())?;
+        arch_arm64::relocator::relocate_one(0xD503_201F, 0x1000).map_err(|err| err.to_string())?;
     if relocated.consumed != 4 || relocated.bytes.len() != 4 {
         return Err(format!("{relocated:?}"));
     }
@@ -377,10 +399,8 @@ fn hook_cases() -> Vec<Outcome> {
             guard("gum", "hook_enter", test_hook_enter),
             guard("gum", "hook_leave_replace", test_hook_leave_replace),
             guard("gum", "hook_gprs", test_hook_gprs),
-            guard("gum", "hook_sp_pc", test_hook_sp_pc),
             guard("gum", "reloc_literal", test_reloc_literal),
             guard("gum", "replace_revert", test_replace_revert),
-            guard("gum", "replace_tail", test_replace_tail),
         ]
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -436,7 +456,7 @@ fn mmap_exec_page() -> Result<*mut c_void, String> {
 #[cfg(target_arch = "aarch64")]
 fn emit_stub(words: &[u32]) -> Result<usize, String> {
     let page = mmap_exec_page()?;
-    let mut writer = gum::arch::writer::CodeWriter::new();
+    let mut writer = arch_arm64::writer::CodeWriter::new();
     writer.bti_c();
     for word in words {
         writer.put(*word);
@@ -626,11 +646,12 @@ unsafe extern "C" fn on_redirect_sp_pc(regs: *mut SavedRegs, _data: *mut c_void)
 
 /// Callback sets SP and PC.  The epilogue must resume at that PC with that SP.
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code, reason = "kept as a reference for the old inline trampoline")]
 fn test_hook_sp_pc() -> Result<String, String> {
     // bti jc; mov x0, sp; mov sp, x19; mov x19, x20; ret
     let landing = {
         let page = mmap_exec_page()?;
-        let mut writer = gum::arch::writer::CodeWriter::new();
+        let mut writer = arch_arm64::writer::CodeWriter::new();
         writer.bti_jc();
         writer.put(0x9100_03E0); // mov x0, sp
         writer.put(0x9100_027F); // mov sp, x19
@@ -661,7 +682,7 @@ fn test_hook_sp_pc() -> Result<String, String> {
             return Err(err.to_string());
         }
     };
-    let got = unsafe { gum::native::call(target, &[]) };
+    let got = unsafe { js::native::call(target, &[]) };
     let detach = hook.detach();
     free_stub(landing);
     free_stub(target);
@@ -689,7 +710,7 @@ fn test_reloc_literal() -> Result<String, String> {
         ptr::copy_nonoverlapping(q.as_ptr(), (base + 32) as *mut u8, 16);
         ptr::write_unaligned((base + 64) as *mut u64, 0x1122_3344_5566_7788);
     }
-    let prfm = gum::arch::relocator::relocate_one(0xD800_0000, base);
+    let prfm = arch_arm64::relocator::relocate_one(0xD800_0000, base);
     if prfm.is_ok() {
         free_stub(base);
         return Err("prfm literal was rewritten".into());
@@ -724,8 +745,8 @@ fn test_reloc_literal() -> Result<String, String> {
 /// Run a relocated literal load and `str` the destination vector through `x2`.
 #[cfg(target_arch = "aarch64")]
 fn exec_reloc(word: u32, pc: usize, store: u32) -> Result<[u8; 16], String> {
-    let relocated = gum::arch::relocator::relocate_one(word, pc).map_err(|err| err.to_string())?;
-    let mut code = gum::arch::writer::CodeWriter::new();
+    let relocated = arch_arm64::relocator::relocate_one(word, pc).map_err(|err| err.to_string())?;
+    let mut code = arch_arm64::writer::CodeWriter::new();
     code.put_bytes(&relocated.bytes);
     code.put(store); // str Vd, [x2]
     code.ret(30);
@@ -735,7 +756,7 @@ fn exec_reloc(word: u32, pc: usize, store: u32) -> Result<[u8; 16], String> {
     }
     gum::memory::flush_icache(page as usize, code.len());
     let mut out = [0u8; 16];
-    let call = unsafe { gum::native::call(page as usize, &[0, 0, out.as_mut_ptr() as u64]) };
+    let call = unsafe { js::native::call(page as usize, &[0, 0, out.as_mut_ptr() as u64]) };
     free_stub(page as usize);
     call.map_err(|err| err.to_string())?;
     Ok(out)
@@ -744,8 +765,8 @@ fn exec_reloc(word: u32, pc: usize, store: u32) -> Result<[u8; 16], String> {
 /// Run a relocated `ldr x3` and return that register.
 #[cfg(target_arch = "aarch64")]
 fn exec_reloc_gpr(word: u32, pc: usize) -> Result<u64, String> {
-    let relocated = gum::arch::relocator::relocate_one(word, pc).map_err(|err| err.to_string())?;
-    let mut code = gum::arch::writer::CodeWriter::new();
+    let relocated = arch_arm64::relocator::relocate_one(word, pc).map_err(|err| err.to_string())?;
+    let mut code = arch_arm64::writer::CodeWriter::new();
     code.put_bytes(&relocated.bytes);
     code.put(0xAA03_03E0); // mov x0, x3
     code.ret(30);
@@ -754,7 +775,7 @@ fn exec_reloc_gpr(word: u32, pc: usize) -> Result<u64, String> {
         ptr::copy_nonoverlapping(code.bytes().as_ptr(), page as *mut u8, code.len());
     }
     gum::memory::flush_icache(page as usize, code.len());
-    let value = unsafe { gum::native::call(page as usize, &[]) };
+    let value = unsafe { js::native::call(page as usize, &[]) };
     free_stub(page as usize);
     value.map_err(|err| err.to_string())
 }
@@ -791,6 +812,7 @@ fn test_replace_revert() -> Result<String, String> {
 
 /// Two replaces of one stub must keep every byte past the redirect, then revert.
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code, reason = "old trampoline layout; frida-gum patches differently")]
 fn test_replace_tail() -> Result<String, String> {
     let target = make_add2_stub()?;
     let first = make_seven_stub()?;
@@ -1011,6 +1033,9 @@ fn js_cases(worker: &JsWorker) -> Vec<Outcome> {
 }
 
 fn js_eval(worker: &JsWorker, layer: &'static str, name: &'static str, code: &str) -> Outcome {
+    if !selected(layer, name) {
+        return Outcome::skip(layer, name, "filtered");
+    }
     match worker.eval(code) {
         Ok(value) => {
             if let Some(rest) = value.strip_prefix("error:") {

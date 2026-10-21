@@ -7,9 +7,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use rquickjs::{Function, Persistent};
 
@@ -19,6 +20,29 @@ use gum::{InlineHook, SavedRegs};
 use runtime::{Error, Result};
 
 use crate::ScriptRuntime;
+
+/// Marks the current thread as already inside a hook callback.
+///
+/// RAII: a panic inside the callback is contained by `ffi::guard`, and the
+/// flag must still be cleared, otherwise every later hook on that thread would
+/// be silently skipped.
+struct HookActiveGuard;
+
+impl HookActiveGuard {
+    fn enter() -> Option<Self> {
+        if HOOK_ACTIVE.with(Cell::get) {
+            return None;
+        }
+        HOOK_ACTIVE.with(|flag| flag.set(true));
+        Some(Self)
+    }
+}
+
+impl Drop for HookActiveGuard {
+    fn drop(&mut self) {
+        HOOK_ACTIVE.with(|flag| flag.set(false));
+    }
+}
 
 thread_local! {
     static JS_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -184,7 +208,9 @@ pub(crate) fn find_java_hook(
 }
 
 /// Handle used by the agent control thread and by hook trampolines.
-#[derive(Clone)]
+///
+/// Deliberately not Clone: dropping any handle sends Shutdown, so a clone
+/// would let an unrelated scope terminate the JS thread.
 pub struct JsWorker {
     tx: Sender<Job>,
     recv: std::sync::Arc<crate::extras::RecvQueue>,
@@ -282,6 +308,49 @@ impl Drop for JsWorker {
     }
 }
 
+/// Wall-clock budget for one JS job, in milliseconds.
+const HOOK_BUDGET_MS: u64 = 4_000;
+const SCRIPT_BUDGET_MS: u64 = 8_000;
+// Background work must yield promptly to waiting hook callbacks.
+const BACKGROUND_BUDGET_MS: u64 = 100;
+
+/// How often the worker collects and drains finalizers.  Java handles are
+/// released from a FinalizationRegistry callback, which QuickJS queues as a
+/// job; without pumping jobs those references would never be freed.
+const GC_INTERVAL: u32 = 128;
+const MAX_FINALIZER_JOBS: usize = 64;
+
+struct Budget<'a>(&'a AtomicU64);
+
+impl<'a> Budget<'a> {
+    fn enter(deadline: &'a AtomicU64, epoch: Instant, budget_ms: u64) -> Self {
+        let now = epoch.elapsed().as_millis() as u64;
+        deadline.store(now + budget_ms, Ordering::Release);
+        Self(deadline)
+    }
+}
+
+impl Drop for Budget<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+
+fn pump_background(runtime: &ScriptRuntime, deadline: &AtomicU64, epoch: Instant, collect: bool) {
+    let _budget = Budget::enter(deadline, epoch, BACKGROUND_BUDGET_MS);
+    if collect {
+        runtime.runtime().run_gc();
+    }
+    runtime.with_js(|ctx| {
+        for _ in 0..MAX_FINALIZER_JOBS {
+            if !ctx.execute_pending_job() {
+                break;
+            }
+        }
+        crate::extras::fire_due_timers(&ctx);
+    });
+}
+
 fn worker_loop(
     rx: Receiver<Job>,
     tx: Sender<Job>,
@@ -290,7 +359,12 @@ fn worker_loop(
 ) {
     crate::extras::bind_recv_queue(recv);
     JS_THREAD.with(|flag| flag.set(true));
-    let _ = JS_TX.set(tx.clone());
+    if JS_TX.set(tx.clone()).is_err() {
+        // A second worker cannot receive cross-thread dispatch: the trampolines
+        // have no per-runtime context.  Say so instead of silently routing
+        // callbacks to the previous (possibly dead) worker.
+        eprintln!("[js] a worker is already registered for cross-thread dispatch");
+    }
     let hooks = Rc::new(RefCell::new(HookTable::default()));
     let callbacks = Rc::new(RefCell::new(CallbackTable::default()));
     let java_hooks = Rc::new(RefCell::new(JavaHookTable::default()));
@@ -309,17 +383,45 @@ fn worker_loop(
         }
     };
     RUNTIME.with(|slot| slot.set(&runtime as *const ScriptRuntime));
+    let mut jobs_since_gc: u32 = 0;
+
+    // A runaway script must not wedge the worker: every hooked thread waits on
+    // it, so an unterminated loop becomes an ANR in the guest. QuickJS calls
+    // this between bytecode instructions; returning true aborts the script.
+    let epoch = Instant::now();
+    let deadline = Arc::new(AtomicU64::new(0));
+    {
+        let deadline = deadline.clone();
+        runtime.runtime().set_interrupt_handler(Some(Box::new(move || {
+            let armed = deadline.load(Ordering::Relaxed);
+            armed != 0 && epoch.elapsed().as_millis() as u64 > armed
+        })));
+    }
 
     loop {
-        let wait = crate::extras::next_timer_wait();
+        let wait = if runtime.runtime().is_job_pending() {
+            Duration::ZERO
+        } else {
+            crate::extras::next_timer_wait()
+        };
         let job = match rx.recv_timeout(wait) {
             Ok(job) => job,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                runtime.with_js(|ctx| crate::extras::fire_due_timers(&ctx));
+                pump_background(&runtime, &deadline, epoch, false);
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        // Hook callbacks have a 5 s waiter on the other side; evals have the
+        // control channel's 10 s. Interrupt slightly earlier so the caller
+        // sees a script error instead of a silent timeout.
+        let interactive = matches!(&job, Job::Eval { .. } | Job::Rpc { .. });
+        let budget = if interactive {
+            SCRIPT_BUDGET_MS
+        } else {
+            HOOK_BUDGET_MS
+        };
+        let budget = Budget::enter(&deadline, epoch, budget);
         match job {
             Job::Eval { code, reply } => {
                 let _ = reply.send(runtime.eval(&code));
@@ -374,7 +476,16 @@ fn worker_loop(
             }
             Job::Shutdown => break,
         }
-        runtime.with_js(|ctx| crate::extras::fire_due_timers(&ctx));
+        drop(budget);
+        jobs_since_gc = jobs_since_gc.wrapping_add(1);
+        // Interactive jobs collect every time: a script that allocates and
+        // reads handle stats in two eval()s sees the state after collection.
+        // Hook traffic amortizes instead, because it is hot.
+        let collect = interactive || jobs_since_gc >= GC_INTERVAL;
+        if collect {
+            jobs_since_gc = 0;
+        }
+        pump_background(&runtime, &deadline, epoch, collect);
     }
     // QuickJS can assert in JS_FreeRuntime when the host closes the control
     // channel while any JS closure is still reachable.  Hooks are detached
@@ -385,13 +496,19 @@ fn worker_loop(
 
 /// Trampoline for `Interceptor.attach` onEnter.
 pub(crate) unsafe extern "C" fn hook_enter(regs: *mut SavedRegs, data: *mut std::ffi::c_void) {
+    // A panic here would unwind into Gum's C frame and abort the guest.
+    runtime::ffi::guard("Interceptor.onEnter", || unsafe {
+        hook_enter_inner(regs, data);
+    });
+}
+
+unsafe fn hook_enter_inner(regs: *mut SavedRegs, data: *mut std::ffi::c_void) {
     if regs.is_null() || data.is_null() {
         return;
     }
-    if HOOK_ACTIVE.with(Cell::get) {
+    let Some(_active) = HookActiveGuard::enter() else {
         return;
-    }
-    HOOK_ACTIVE.with(|flag| flag.set(true));
+    };
 
     // SAFETY: `data` points to a HookBridge kept alive by HookGroup.
     let bridge = unsafe { &*(data as *const HookBridge) };
@@ -401,7 +518,6 @@ pub(crate) unsafe extern "C" fn hook_enter(regs: *mut SavedRegs, data: *mut std:
             let updated = unsafe { (*runtime).run_enter(bridge.group, bridge.target, *regs) };
             unsafe { *regs = updated };
         }
-        HOOK_ACTIVE.with(|flag| flag.set(false));
         return;
     }
     let (reply, response) = mpsc::channel();
@@ -420,19 +536,22 @@ pub(crate) unsafe extern "C" fn hook_enter(regs: *mut SavedRegs, data: *mut std:
             unsafe { *regs = updated };
         }
     }
-
-    HOOK_ACTIVE.with(|flag| flag.set(false));
 }
 
 /// Trampoline for `Interceptor.attach` onLeave.
 pub(crate) unsafe extern "C" fn hook_leave(regs: *mut SavedRegs, data: *mut std::ffi::c_void) {
+    runtime::ffi::guard("Interceptor.onLeave", || unsafe {
+        hook_leave_inner(regs, data);
+    });
+}
+
+unsafe fn hook_leave_inner(regs: *mut SavedRegs, data: *mut std::ffi::c_void) {
     if regs.is_null() || data.is_null() {
         return;
     }
-    if HOOK_ACTIVE.with(Cell::get) {
+    let Some(_active) = HookActiveGuard::enter() else {
         return;
-    }
-    HOOK_ACTIVE.with(|flag| flag.set(true));
+    };
 
     // SAFETY: `data` points to a HookBridge kept alive by HookGroup.
     let bridge = unsafe { &*(data as *const HookBridge) };
@@ -442,7 +561,6 @@ pub(crate) unsafe extern "C" fn hook_leave(regs: *mut SavedRegs, data: *mut std:
             let updated = unsafe { (*runtime).run_leave(bridge.group, bridge.target, *regs) };
             unsafe { *regs = updated };
         }
-        HOOK_ACTIVE.with(|flag| flag.set(false));
         return;
     }
     let (reply, response) = mpsc::channel();
@@ -461,12 +579,17 @@ pub(crate) unsafe extern "C" fn hook_leave(regs: *mut SavedRegs, data: *mut std:
             unsafe { *regs = updated };
         }
     }
-
-    HOOK_ACTIVE.with(|flag| flag.set(false));
 }
 
 /// Dispatcher embedded in every NativeCallback stub.
 pub(crate) extern "C" fn callback_dispatch(id: usize, args: *const u64) -> u64 {
+    runtime::ffi::guard("NativeCallback", || unsafe {
+        callback_dispatch_inner(id, args)
+    })
+    .unwrap_or(0)
+}
+
+unsafe fn callback_dispatch_inner(id: usize, args: *const u64) -> u64 {
     if args.is_null() {
         return 0;
     }
@@ -503,6 +626,18 @@ pub(crate) extern "C" fn callback_dispatch(id: usize, args: *const u64) -> u64 {
 
 /// Dispatcher embedded in every Java method trampoline.
 pub(crate) extern "C" fn java_dispatch(
+    id: usize,
+    args: *const u64,
+    fargs: *const u64,
+    stack: *const u64,
+) -> DispatchResult {
+    runtime::ffi::guard("Java.implementation", || unsafe {
+        java_dispatch_inner(id, args, fargs, stack)
+    })
+    .unwrap_or_default()
+}
+
+unsafe fn java_dispatch_inner(
     id: usize,
     args: *const u64,
     fargs: *const u64,
@@ -750,6 +885,28 @@ mod tests {
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(80));
         assert_eq!(worker.eval("String(__delayed)").unwrap(), "1");
+    }
+
+    #[test]
+    fn runaway_background_callbacks_do_not_wedge_worker() {
+        let _js = crate::js_test_guard();
+        let (events, received) = std::sync::mpsc::channel();
+        let worker = JsWorker::spawn(events).unwrap();
+        // The event synchronizes with the idle timer path, outside eval's budget.
+        worker
+            .eval("setTimeout(() => { send('timer'); while (true) {} }, 25); 'queued'")
+            .unwrap();
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(worker.eval("6 * 7").unwrap(), "42");
+        worker
+            .eval("Promise.resolve().then(() => { send('job'); while (true) {} }); 'queued'")
+            .unwrap();
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(worker.eval("40 + 2").unwrap(), "42");
     }
 
     #[test]

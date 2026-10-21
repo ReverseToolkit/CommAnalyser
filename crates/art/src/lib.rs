@@ -8,7 +8,6 @@ pub mod hook;
 pub mod java;
 pub mod soa;
 
-use std::ffi::c_void;
 use std::ptr;
 
 use jni::objects::{JObject, JValue};
@@ -172,13 +171,20 @@ pub fn probe_hook() -> Result<String> {
             };
             let address = art_method as usize + offset;
             let original = read_pointer(address);
-            write_pointer(address, stub);
+            if write_pointer(address, stub).is_err() {
+                // Not every candidate is in a page we may patch.
+                continue;
+            }
             let value = env
                 .call_method(&object, &*length_name, length_sig.method_signature(), &[])
                 .and_then(|value| value.i())
                 .map(|value| value as u64)
                 .unwrap_or(u64::MAX);
-            write_pointer(address, original);
+            if let Err(error) = write_pointer(address, original) {
+                // Restoring is best effort: report it, but keep the result of
+                // the probe that already ran.
+                eprintln!("[comm-analyser] failed to restore ArtMethod word: {error}");
+            }
             attempts.push(serde_json::json!({
                 "offset": offset,
                 "original": format!("{original:#x}"),
@@ -199,11 +205,16 @@ pub fn probe_hook() -> Result<String> {
 }
 
 fn hook_stub() -> Result<usize> {
-    static STUB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let address = *STUB.get_or_init(|| make_hook_stub().unwrap_or(0));
-    if address == 0 {
-        return Err(Error::Unsupported("ART hook stub allocation failed"));
+    // Cache success only: a transient mmap failure must not disable the probe
+    // path for the rest of the process.
+    static STUB: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+    let mut slot = STUB.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(address) = *slot {
+        return Ok(address);
     }
+    let address = make_hook_stub()
+        .ok_or_else(|| Error::Unsupported("ART hook stub allocation failed"))?;
+    *slot = Some(address);
     Ok(address)
 }
 
@@ -212,7 +223,7 @@ fn make_hook_stub() -> Option<usize> {
         libc::mmap(
             ptr::null_mut(),
             0x1000,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
             0,
@@ -225,8 +236,12 @@ fn make_hook_stub() -> Option<usize> {
     let code: [u32; 3] = [0xD503_24DF, 0x5282_4680, 0xD65F_03C0];
     unsafe {
         ptr::copy_nonoverlapping(code.as_ptr() as *const u8, page as *mut u8, 12);
-        // Leave the page RWX: Android's execmem policy can reject a later
-        // mprotect(RX) even though the anonymous mmap succeeded.
+    }
+    runtime::patch::flush_icache(page as usize, 12);
+    // W^X: never leave a page both writable and executable.
+    if unsafe { libc::mprotect(page, 0x1000, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
+        unsafe { libc::munmap(page, 0x1000) };
+        return None;
     }
     Some(page as usize)
 }
@@ -235,57 +250,11 @@ fn read_pointer(address: usize) -> usize {
     unsafe { ptr::read_unaligned(address as *const usize) }
 }
 
-fn write_pointer(address: usize, value: usize) {
-    let page_size = runtime::process::page_size();
-    let page = address & !(page_size - 1);
-    unsafe {
-        libc::mprotect(
-            page as *mut c_void,
-            page_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-        );
-        ptr::write_unaligned(address as *mut usize, value);
-        libc::mprotect(
-            page as *mut c_void,
-            page_size,
-            libc::PROT_READ | libc::PROT_EXEC,
-        );
-    }
-    gum_flush(address, std::mem::size_of::<usize>());
-}
-
-fn gum_flush(address: usize, len: usize) {
-    // Keep art independent of gum: use the same cache-maintenance
-    // sequence locally.
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = (address, len);
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        let start = address & !63;
-        let end = (address + len + 63) & !63;
-        let mut line = start;
-        while line < end {
-            unsafe {
-                core::arch::asm!("dc cvau, {}", in(reg) line, options(nostack, preserves_flags));
-            }
-            line += 64;
-        }
-        unsafe {
-            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
-        }
-        let mut line = start;
-        while line < end {
-            unsafe {
-                core::arch::asm!("ic ivau, {}", in(reg) line, options(nostack, preserves_flags));
-            }
-            line += 64;
-        }
-        unsafe {
-            core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
-        }
-    }
+fn write_pointer(address: usize, value: usize) -> Result<()> {
+    runtime::patch::with_writable(address, std::mem::size_of::<usize>(), || {
+        // SAFETY: the range is mapped and temporarily writable.
+        unsafe { ptr::write_unaligned(address as *mut usize, value) };
+    })
 }
 
 /// Diagnostic: allocate the ART hook stub and report its mapping permissions.

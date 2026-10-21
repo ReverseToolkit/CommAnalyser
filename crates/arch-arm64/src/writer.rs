@@ -46,8 +46,17 @@ impl CodeWriter {
     }
 
     /// Overwrite one instruction that was already emitted at byte `at`.
-    pub fn set_word(&mut self, at: usize, word: u32) {
-        self.bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+    ///
+    /// Returns `false` when `at` does not address a whole instruction; the
+    /// caller decides whether that is a label bug or an expected gap.  This is
+    /// a public encoder entry point, so it must not panic on a bad offset.
+    #[must_use]
+    pub fn set_word(&mut self, at: usize, word: u32) -> bool {
+        let Some(slot) = self.bytes.get_mut(at..at + 4) else {
+            return false;
+        };
+        slot.copy_from_slice(&word.to_le_bytes());
+        true
     }
 
     #[inline]
@@ -342,15 +351,220 @@ impl CodeWriter {
     }
 
     /// `STR Xt, [Xn, #imm]` signed offset (unscaled) when imm is not a multiple of 8.
-    pub fn str_reg_offset(&mut self, rt: u8, rn: u8, offset: i64, is_32: bool) {
-        if offset >= 0 && offset % 8 == 0 && offset < 32768 && !is_32 {
-            self.str_imm(rt, rn, offset as u32);
-            return;
+    /// Move `sources[i]` into `x{i}`, in parallel.
+    ///
+    /// Argument setup cannot be emitted in source order: with `[x1, x0]` a
+    /// naive `mov x0, x1; mov x1, x0` copies the new x0 into x1.  This
+    /// schedules the moves like a parallel assignment: a move is emitted only
+    /// once its destination is no longer a source for any pending move, and a
+    /// cycle is broken by saving one destination in x16.
+    ///
+    /// `None` leaves that destination untouched.  Returns `false` when the
+    /// set cannot be scheduled (more than 8 arguments, an invalid register, or
+    /// a cycle that would need a second scratch register).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use arch_arm64::CodeWriter;
+    ///
+    /// // x0 and x1 swap in parallel: one save through x16 plus two moves,
+    /// // never an overwrite of a value that is still needed.
+    /// let mut writer = CodeWriter::new();
+    /// assert!(writer.move_arg_registers(&[Some(1), Some(0)]));
+    /// assert_eq!(writer.bytes().len(), 12);
+    ///
+    /// // A destination that is already correct needs no instruction.
+    /// let mut writer = CodeWriter::new();
+    /// assert!(writer.move_arg_registers(&[Some(0), None]));
+    /// assert!(writer.bytes().is_empty());
+    /// ```
+    pub fn move_arg_registers(&mut self, sources: &[Option<u8>]) -> bool {
+        if sources.len() > 8 {
+            return false;
         }
-        let size = if is_32 { 0xB8u32 } else { 0xF8 };
-        // STUR signed 9-bit
-        let imm9 = (offset as u32) & 0x1FF;
-        self.put((size << 24) | (imm9 << 12) | ((rn as u32) << 5) | rt as u32);
+        if sources.iter().flatten().any(|&source| source > 31) {
+            return false;
+        }
+        let mut pending: Vec<Option<u8>> = sources.to_vec();
+        for (index, source) in pending.iter_mut().enumerate() {
+            // x31 in a source means SP; anything else is a plain register.
+            if *source == Some(index as u8) {
+                *source = None;
+            }
+        }
+        loop {
+            if pending.iter().all(Option::is_none) {
+                return true;
+            }
+            // A move whose destination is not read by any pending move.
+            let free = (0..pending.len()).find(|&index| {
+                pending[index].is_some()
+                    && !pending
+                        .iter()
+                        .any(|source| *source == Some(index as u8))
+            });
+            if let Some(index) = free {
+                let source = pending[index].take().expect("checked above");
+                self.mov_register(index as u8, source);
+                continue;
+            }
+            // Every remaining move is part of a cycle.  x16 is free because
+            // destinations are x0..x7, but only one save may be outstanding.
+            if pending.iter().any(|source| *source == Some(16)) {
+                return false;
+            }
+            let Some(pivot) = pending.iter().position(Option::is_some) else {
+                return true;
+            };
+            self.mov_register(16, pivot as u8);
+            for source in pending.iter_mut() {
+                if *source == Some(pivot as u8) {
+                    *source = Some(16);
+                }
+            }
+        }
+    }
+
+    /// `mov xd, xm` (or `add xd, sp, #0` when the source is x31/SP).
+    fn mov_register(&mut self, destination: u8, source: u8) {
+        if source == 31 {
+            // ORR with Rm = 31 reads XZR, not SP; ADD encodes SP as Rn = 31.
+            self.put(0x9100_03E0 | destination as u32);
+        } else {
+            self.put(0xAA00_03E0 | ((source as u32) << 16) | destination as u32);
+        }
+    }
+
+    /// Store at a signed byte offset, choosing STR (scaled) or STUR.
+    ///
+    /// Unaligned offsets are legal up to the STUR range and are encoded
+    /// unscaled, so they are never rounded. Offsets outside both encodings
+    /// use a scratch register: add/sub with an immediate when possible,
+    /// otherwise the offset is materialized with movz/movk and added.
+    ///
+    /// # Side effect
+    ///
+    /// The scratch fallback clobbers **x16**, or **x17** when rt or rn is
+    /// x16. It is only taken for offsets that neither STR nor STUR can
+    /// express; small and aligned offsets emit a single instruction and leave
+    /// every other register alone. When both x16 and x17 are operands there
+    /// is no scratch available and the call returns false without emitting
+    /// anything.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use arch_arm64::CodeWriter;
+    ///
+    /// // Aligned and small: one instruction, no scratch register.
+    /// let mut writer = CodeWriter::new();
+    /// assert!(writer.str_reg_offset(0, 1, 8, false));
+    /// assert_eq!(writer.bytes().len(), 4);
+    ///
+    /// // Unaligned but inside the STUR window: still one instruction.
+    /// let mut writer = CodeWriter::new();
+    /// assert!(writer.str_reg_offset(0, 1, 5, false));
+    /// assert_eq!(writer.bytes().len(), 4);
+    ///
+    /// // Large: materialized through x16.
+    /// let mut writer = CodeWriter::new();
+    /// assert!(writer.str_reg_offset(0, 1, -1000, false));
+    /// assert!(writer.bytes().len() > 4);
+    ///
+    /// // Both scratch candidates are operands: refused, nothing emitted.
+    /// let mut writer = CodeWriter::new();
+    /// assert!(!writer.str_reg_offset(16, 17, 5001, false));
+    /// assert!(writer.bytes().is_empty());
+    /// ```
+    #[must_use]
+    pub fn str_reg_offset(&mut self, rt: u8, rn: u8, offset: i64, is_32: bool) -> bool {
+        if rt > 31 || rn > 31 {
+            return false;
+        }
+        // Scaled form: the scale is the access size (8 or 4 bytes).
+        let (scale, limit) = if is_32 { (4, 16384) } else { (8, 32768) };
+        if offset >= 0 && offset % scale == 0 && offset < limit {
+            if is_32 {
+                self.str_imm_32(rt, rn, offset as u32);
+            } else {
+                self.str_imm(rt, rn, offset as u32);
+            }
+            return true;
+        }
+        // Unscaled form covers the signed 9-bit window at any alignment.
+        if (-256..=255).contains(&offset) {
+            let size = if is_32 { 0xB8u32 } else { 0xF8 };
+            let imm9 = (offset as u32) & 0x1FF;
+            self.put((size << 24) | (imm9 << 12) | ((rn as u32) << 5) | rt as u32);
+            return true;
+        }
+        // Large offset: compute the address in a scratch register, then store
+        // at offset 0.  x16/x17 are the only registers this may clobber; if
+        // both are in use by the operands the request is refused.
+        let scratch = if rt != 16 && rn != 16 {
+            16
+        } else if rt != 17 && rn != 17 {
+            17
+        } else {
+            return false;
+        };
+        if !self.add_immediate(scratch, rn, offset) {
+            // Offset does not fit ADD's 12-bit immediate: materialize it.
+            self.abs_addr(scratch, offset as u64);
+            // add scratch, rn, scratch
+            self.put(
+                0x8B00_0000 | ((scratch as u32) << 16) | ((rn as u32) << 5) | scratch as u32,
+            );
+        }
+        self.str_zero(rt, scratch, is_32);
+        true
+    }
+
+    /// `add dst, base, #offset` (or `sub` for negatives), including the
+    /// LSL #12 form.  Returns false when the value needs materialization.
+    fn add_immediate(&mut self, dst: u8, base: u8, offset: i64) -> bool {
+        let encode = |imm: u32, shift: bool, subtract: bool| -> u32 {
+            let base_op = match (subtract, shift) {
+                (false, false) => 0x9100_0000,
+                (false, true) => 0x9140_0000,
+                (true, false) => 0xD100_0000,
+                (true, true) => 0xD140_0000,
+            };
+            base_op
+                | (imm << 10)
+                | ((base as u32) << 5)
+                | dst as u32
+        };
+        if (0..=4095).contains(&offset) {
+            self.put(encode(offset as u32, false, false));
+            return true;
+        }
+        if offset > 0 && offset % 4096 == 0 && offset / 4096 <= 4095 {
+            self.put(encode((offset / 4096) as u32, true, false));
+            return true;
+        }
+        if (-4095..=0).contains(&offset) {
+            self.put(encode((-offset) as u32, false, true));
+            return true;
+        }
+        if offset < 0 && offset % 4096 == 0 && -offset / 4096 <= 4095 {
+            self.put(encode((-offset / 4096) as u32, true, true));
+            return true;
+        }
+        false
+    }
+
+    /// `str rt, [base, #0]` in the requested width.
+    fn str_zero(&mut self, rt: u8, base: u8, is_32: bool) {
+        let opcode = if is_32 { 0xB900_0000 } else { 0xF900_0000 };
+        self.put(opcode | ((base as u32) << 5) | rt as u32);
+    }
+
+    /// `STR Wt, [Xn, #imm]` (unsigned offset, imm multiple of 4).
+    pub fn str_imm_32(&mut self, rt: u8, rn: u8, offset: u32) {
+        debug_assert!(offset % 4 == 0 && offset < 16384);
+        self.put(0xB900_0000 | ((offset / 4) << 10) | ((rn as u32) << 5) | rt as u32);
     }
 
     /// Absolute unconditional branch: `ldr x16, #8; br x16; .quad target`.
@@ -474,6 +688,242 @@ mod tests {
         );
     }
 
+    /// Apply emitted moves to a register file and return the low destinations.
+    fn simulate_moves(sources: &[Option<u8>]) -> Vec<u64> {
+        let mut writer = CodeWriter::new();
+        assert!(
+            writer.move_arg_registers(sources),
+            "scheduler rejected {sources:?}"
+        );
+        let mut registers: [u64; 32] = core::array::from_fn(|index| 0x1000 + index as u64);
+        let stack_pointer = 0x5000u64;
+        for word in words(writer.bytes()) {
+            if word & 0xFFE0_FFE0 == 0xAA00_03E0 {
+                // ORR Xd, XZR, Xm  ==  mov xd, xm
+                let source = ((word >> 16) & 0x1F) as usize;
+                let destination = (word & 0x1F) as usize;
+                registers[destination] = registers[source];
+            } else if word & 0xFFC0_0000 == 0x9100_0000 {
+                // ADD Xd, Xn|SP, #imm
+                let destination = (word & 0x1F) as usize;
+                let base = ((word >> 5) & 0x1F) as usize;
+                let immediate = ((word >> 10) & 0xFFF) as u64;
+                registers[destination] =
+                    if base == 31 { stack_pointer } else { registers[base] } + immediate;
+            } else {
+                panic!("unexpected move encoding {word:#08x}");
+            }
+        }
+        registers[..sources.len()].to_vec()
+    }
+
+    fn permutations(values: &mut [u8], length: usize, visit: &mut impl FnMut(&[u8])) {
+        if length <= 1 {
+            visit(values);
+            return;
+        }
+        for index in 0..length {
+            permutations(values, length - 1, visit);
+            if length % 2 == 0 {
+                values.swap(index, length - 1);
+            } else {
+                values.swap(0, length - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn argument_moves_are_parallel_for_every_permutation() {
+        let mut order: Vec<u8> = (0..8).collect();
+        let original: [u64; 32] = core::array::from_fn(|index| 0x1000 + index as u64);
+        let mut seen = 0u32;
+        permutations(&mut order, 8, &mut |permutation| {
+            let sources: Vec<Option<u8>> = permutation.iter().copied().map(Some).collect();
+            let moved = simulate_moves(&sources);
+            for (destination, &source) in permutation.iter().enumerate() {
+                assert_eq!(
+                    moved[destination], original[source as usize],
+                    "permutation {permutation:?}: x{destination} should hold x{source}"
+                );
+            }
+            seen += 1;
+        });
+        assert_eq!(seen, 40_320);
+    }
+
+    #[test]
+    fn argument_moves_skip_none_and_reject_too_many() {
+        let moved = simulate_moves(&[Some(3), None, Some(0)]);
+        assert_eq!(moved, vec![0x1003, 0x1001, 0x1000]);
+
+        let mut writer = CodeWriter::new();
+        assert!(!writer.move_arg_registers(&[None; 9]), "8 arguments is the ABI limit");
+        assert!(!writer.move_arg_registers(&[Some(32)]), "invalid register");
+        assert!(writer.bytes().is_empty(), "a rejected plan emits nothing");
+    }
+
+    #[test]
+    fn argument_moves_support_sp_as_a_source() {
+        let moved = simulate_moves(&[Some(31)]);
+        assert_eq!(moved, vec![0x5000]);
+    }
+
+    /// Decode a single store instruction into (effective offset, is_32).
+    fn decode_store(bytes: &[u8]) -> (i64, bool) {
+        assert_eq!(bytes.len(), 4, "expected exactly one instruction");
+        let word = words(bytes)[0];
+        if word & 0xFFC0_0000 == 0xF900_0000 {
+            // STR Xt, [Xn, #imm12 * 8]
+            ((((word >> 10) & 0xFFF) * 8) as i64, false)
+        } else if word & 0xFFC0_0000 == 0xB900_0000 {
+            // STR Wt, [Xn, #imm12 * 4]
+            ((((word >> 10) & 0xFFF) * 4) as i64, true)
+        } else if word & 0xFFE0_0C00 == 0xF800_0000 {
+            // STUR Xt, [Xn, #imm9]
+            let imm9 = ((word >> 12) & 0x1FF) as i64;
+            ((imm9 << 55) >> 55, false)
+        } else if word & 0xFFE0_0C00 == 0xB800_0000 {
+            // STUR Wt, [Xn, #imm9]
+            let imm9 = ((word >> 12) & 0x1FF) as i64;
+            ((imm9 << 55) >> 55, true)
+        } else {
+            panic!("unexpected store encoding {word:#010x}");
+        }
+    }
+
+    /// Replay a store sequence and return (effective address, registers).
+    fn simulate_store(bytes: &[u8], rt: u8, rn: u8, is_32: bool) -> (i64, [u64; 32]) {
+        let _ = (rt, rn, is_32);
+        let mut regs: [u64; 32] = core::array::from_fn(|index| 0x1000 + index as u64);
+        let mut address = None;
+        for word in words(bytes) {
+            let rd = (word & 0x1F) as usize;
+            let base = ((word >> 5) & 0x1F) as usize;
+            let rm = ((word >> 16) & 0x1F) as usize;
+            if word & 0xFFE0_FFE0 == 0xAA00_03E0 {
+                regs[rd] = if rm == 31 { 0 } else { regs[rm] };
+            } else if word & 0xFF80_0000 == 0xD280_0000 {
+                let immediate = ((word >> 5) & 0xFFFF) as u64;
+                let shift = ((word >> 21) & 0x3) * 16;
+                regs[rd] = immediate << shift;
+            } else if word & 0xFF80_0000 == 0xF280_0000 {
+                let immediate = ((word >> 5) & 0xFFFF) as u64;
+                let shift = ((word >> 21) & 0x3) * 16;
+                let mask = !(0xFFFFu64 << shift);
+                regs[rd] = (regs[rd] & mask) | (immediate << shift);
+            } else if word & 0xFFC0_0000 == 0x9100_0000
+                || word & 0xFFC0_0000 == 0x9140_0000
+            {
+                let immediate = ((word >> 10) & 0xFFF) as u64;
+                let shift = if word & 0x0040_0000 != 0 { 12 } else { 0 };
+                regs[rd] = (if base == 31 { 0x7000 } else { regs[base] })
+                    .wrapping_add(immediate << shift);
+            } else if word & 0xFFC0_0000 == 0xD100_0000
+                || word & 0xFFC0_0000 == 0xD140_0000
+            {
+                let immediate = ((word >> 10) & 0xFFF) as u64;
+                let shift = if word & 0x0040_0000 != 0 { 12 } else { 0 };
+                regs[rd] = (if base == 31 { 0x7000 } else { regs[base] })
+                    .wrapping_sub(immediate << shift);
+            } else if word & 0xFFE0_FC00 == 0x8B00_0000 {
+                regs[rd] = regs[base].wrapping_add(regs[rm]);
+            } else if word & 0xFFC0_0000 == 0xF900_0000 {
+                address = Some((regs[base] as i64).wrapping_add(((word >> 10) & 0xFFF) as i64 * 8));
+                break;
+            } else if word & 0xFFC0_0000 == 0xB900_0000 {
+                address = Some((regs[base] as i64).wrapping_add(((word >> 10) & 0xFFF) as i64 * 4));
+                break;
+            } else if word & 0xFFE0_0C00 == 0xF800_0000 {
+                let imm9 = (((word >> 12) & 0x1FF) as i64) << 55 >> 55;
+                address = Some(regs[base] as i64 + imm9);
+                break;
+            } else if word & 0xFFE0_0C00 == 0xB800_0000 {
+                let imm9 = (((word >> 12) & 0x1FF) as i64) << 55 >> 55;
+                address = Some(regs[base] as i64 + imm9);
+                break;
+            } else {
+                panic!("unexpected instruction {word:#010x}");
+            }
+        }
+        (address.expect("sequence must store once"), regs)
+    }
+
+    /// Base register of the final store, which reveals the scratch choice.
+    fn store_base_register(bytes: &[u8]) -> u8 {
+        for word in words(bytes) {
+            let is_store = word & 0xFFC0_0000 == 0xF900_0000
+                || word & 0xFFC0_0000 == 0xB900_0000
+                || word & 0xFFE0_0C00 == 0xF800_0000
+                || word & 0xFFE0_0C00 == 0xB800_0000;
+            if is_store {
+                return ((word >> 5) & 0x1F) as u8;
+            }
+        }
+        panic!("no store in sequence");
+    }
+
+    #[test]
+    fn scratch_fallback_uses_x16_then_x17() {
+        // Documented side effect: the fallback clobbers x16...
+        let mut writer = CodeWriter::new();
+        assert!(writer.str_reg_offset(0, 1, -1000, false));
+        assert_eq!(store_base_register(writer.bytes()), 16);
+
+        // ...or x17 when an operand already owns x16.
+        let mut writer = CodeWriter::new();
+        assert!(writer.str_reg_offset(16, 1, 5001, false));
+        assert_eq!(store_base_register(writer.bytes()), 17);
+
+        // Direct encodings never touch a scratch register.
+        let mut writer = CodeWriter::new();
+        assert!(writer.str_reg_offset(0, 1, 8, false));
+        assert_eq!(store_base_register(writer.bytes()), 1);
+    }
+
+    #[test]
+    fn store_offsets_are_encoded_exactly_or_refused() {
+        // Every one of these must reach the requested address, whether it
+        // uses a scaled STR, an unscaled STUR, or the scratch fallback.
+        let offsets: &[i64] = &[
+            0, 8, 255, 256, 5, -3, -8, -256, // direct encodings
+            257, 32761, -257, -1000,         // fallback
+            4096, -4096, 5000, -5000, 32768, // ADD/SUB with LSL #12 or materialized
+            1 << 20, -(1 << 20), 12345678,   // materialized
+        ];
+        for &offset in offsets {
+            for is_32 in [false, true] {
+                let mut writer = CodeWriter::new();
+                assert!(
+                    writer.str_reg_offset(0, 1, offset, is_32),
+                    "offset {offset} (32-bit: {is_32}) should be encodable"
+                );
+                let (address, registers) = simulate_store(writer.bytes(), 0, 1, is_32);
+                assert_eq!(
+                    address,
+                    0x1001 + offset,
+                    "offset {offset} (32-bit: {is_32}) landed at the wrong address"
+                );
+                assert_eq!(registers[0], 0x1000, "rt must not be clobbered");
+                assert_eq!(registers[1], 0x1001, "rn must not be clobbered");
+            }
+        }
+
+        // Shortest possible sequences are still chosen.
+        let mut writer = CodeWriter::new();
+        assert!(writer.str_reg_offset(0, 1, 8, false));
+        assert_eq!(writer.bytes().len(), 4, "aligned offset needs one instruction");
+        let mut writer = CodeWriter::new();
+        assert!(writer.str_reg_offset(0, 1, 32768, false));
+        assert_eq!(writer.bytes().len(), 8, "ADD lsl #12 plus store");
+
+        // With x16 and x17 both occupied there is no scratch register.
+        let mut writer = CodeWriter::new();
+        assert!(!writer.str_reg_offset(16, 17, 5001, false));
+        assert!(writer.bytes().is_empty(), "a refused store emits nothing");
+        // The same operands still work when the offset needs no scratch.
+        let mut writer = CodeWriter::new();
+        assert!(writer.str_reg_offset(16, 17, 8, false));
+    }
     #[test]
     fn abs_call_layout() {
         let mut w = CodeWriter::new();

@@ -1746,6 +1746,11 @@ pub fn enumerate_loaded_classes() -> Result<Vec<String>> {
             // SAFETY: Class.getName returns java.lang.String.
             let string = unsafe { JString::from_raw(env, object.as_raw()) };
             names.push(jstring_to_string(env, &string)?);
+            // Both references were created locally for this class.  Without
+            // these deletes a large app exhausts the 512-entry local ref table
+            // during the walk and aborts.
+            env.delete_local_ref(object);
+            env.delete_local_ref(class);
         }
         Ok(names)
     })

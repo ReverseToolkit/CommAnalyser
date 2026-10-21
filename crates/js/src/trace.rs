@@ -4,7 +4,10 @@ use rquickjs::function::Opt;
 use rquickjs::prelude::Func;
 use rquickjs::{Array, Ctx, Function, Object, Result as JsResult, Value};
 
-use qbdi::{begin, exclude_module, take_events, Escape, EventKind, EventMask, TraceConfig};
+use qbdi::{
+    begin, exclude_module, take_batch, Escape, EventKind, EventMask, PrintMode, TraceConfig,
+    DEFAULT_MAX_EVENTS,
+};
 
 use crate::api::{parse_pointer, to_js_error, NativePointer};
 
@@ -49,6 +52,14 @@ fn trace_function<'js>(
                 config.extra_exclude.push(exclude.get::<String>(index)?);
             }
         }
+        if let Ok(mode) = options.get::<_, String>("mode") {
+            config.mode = PrintMode::from_name(&mode).map_err(to_js_error)?;
+        }
+        if let Ok(max_events) = options.get::<_, f64>("maxEvents") {
+            if max_events >= 1.0 {
+                config.max_events = max_events as usize;
+            }
+        }
         if let Ok(escape) = options.get::<_, Array<'js>>("escape") {
             for index in 0..escape.len() {
                 let item: Object<'js> = escape.get(index)?;
@@ -59,14 +70,17 @@ fn trace_function<'js>(
         }
         let _ = options.get::<_, Function<'js>>("onEvent");
     }
+    let _ = DEFAULT_MAX_EVENTS;
     begin(config).map_err(to_js_error)?;
     let _ = ctx;
     Ok(())
 }
 
 fn take_events_js<'js>(ctx: Ctx<'js>) -> JsResult<Array<'js>> {
-    let events = take_events();
+    let (events, dropped) = take_batch();
     let array = Array::new(ctx.clone())?;
+    // A script must be able to tell a complete trace from a truncated one.
+    array.as_object().set("dropped", dropped)?;
     for (index, event) in events.into_iter().enumerate() {
         let item = Object::new(ctx.clone())?;
         let kind = match event.kind {
@@ -77,6 +91,9 @@ fn take_events_js<'js>(ctx: Ctx<'js>) -> JsResult<Array<'js>> {
         item.set("type", kind)?;
         item.set("pc", NativePointer::instance(ctx.clone(), event.pc)?)?;
         item.set("size", event.size)?;
+        if !event.text.is_empty() {
+            item.set("text", event.text)?;
+        }
         if event.kind == EventKind::Mem {
             item.set(
                 "address",

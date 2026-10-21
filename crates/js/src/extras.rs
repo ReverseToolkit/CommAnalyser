@@ -105,8 +105,14 @@ pub fn fire_due_timers(ctx: &Ctx<'_>) {
         due
     });
     for (_, _, function) in due {
-        if let Ok(function) = function.restore(ctx) {
-            let _ = function.call::<(), ()>(());
+        match function.restore(ctx) {
+            Ok(function) => {
+                // A throwing timer callback used to disappear entirely.
+                if let Err(error) = function.call::<(), ()>(()) {
+                    eprintln!("[js] timer callback failed: {error}");
+                }
+            }
+            Err(error) => eprintln!("[js] timer callback could not be restored: {error}"),
         }
     }
 }

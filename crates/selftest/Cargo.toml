@@ -6,9 +6,15 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Link the real frida-gum backend; only meaningful on the arm64 device.
+device = ["gum/link"]
+
 [[bin]]
 name = "selftest"
 path = "src/main.rs"
+required-features = ["device"]
 
 [dependencies]
 gum.workspace = true

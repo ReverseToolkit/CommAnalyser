@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 runtime.workspace = true
+arch-arm64.workspace = true
 gum.workspace = true
 art.workspace = true
 js.workspace = true
@@ -21,4 +22,5 @@ libc.workspace = true
 
 [features]
 default = []
-qbdi-static = ["qbdi/link"]
+gum-static = ["gum/link"]
+qbdi-static = ["qbdi/link", "gum-static"]

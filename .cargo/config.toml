@@ -3,7 +3,16 @@
 # Outline atomics would pull compiler-rt aarch64.c constructors into the
 # cdylib; those call getauxval during load. LL/SC atomics avoid that object.
 linker = "/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-rustflags = ["-C", "target-feature=-outline-atomics"]
+# paca/pacg: gum signs and strips code pointers with paciza/xpaci. The asm
+# only assembles with the pointer authentication extension enabled; gum
+# guards the instructions with a HWCAP_PACA check at runtime.
+rustflags = [
+    "-C", "target-feature=-outline-atomics,+paca,+pacg",
+    # qbdi-rs links `unwind` and `clang_rt.builtins-aarch64-android`; rustc
+    # links with -nodefaultlibs, so point it at the NDK's clang runtime.
+    "-L", "native=/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/lib/linux/aarch64",
+    "-L", "native=/root/Android/Sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/lib/linux",
+]
 
 [env]
 # cc-rs (rquickjs-sys) looks up CC_<triple>, not cargo's linker key.

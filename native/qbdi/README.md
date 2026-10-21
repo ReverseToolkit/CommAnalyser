@@ -1,30 +1,30 @@
-# TAL payload for the Android agent
+# QBDI payload for the Android agent
 
-`Trace.function` loads **TAL** (`native/tal`), not a hand-rolled QBDI door.
+The agent links QBDI **statically**; it does not load TAL. The engine
+wrappers live in CommToolkit:
 
-Build `libtal.so` (Android arm64, no Triton):
+- `../CommToolkit/crates/qbdi-sys` — bindgen C API bindings plus the
+  `comm_check_and_break` shim and `clear_cache.c`.
+- `../CommToolkit/crates/qbdi-rs` — VM ownership, typed registers, callback
+  contexts, memory views, and the 16 MiB host stack.
+- `crates/qbdi` in this repo — the CommAnalyser trace session.
 
-```
-export ANDROID_NDK=/path/to/ndk
-cmake -S native/tal -B native/tal/build-android \
-  -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
-  -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
-  -DTAL_BUILD_TESTS=OFF -DTAL_ENABLE_TRITON=OFF
-cmake --build native/tal/build-android --target tal
-cp native/tal/build-android/libtal.so native/tal/android-arm64/libtal.so
-```
-
-Then:
+Build the agent with the QBDI payload:
 
 ```
-cargo build --release --target aarch64-linux-android -p agent --features qbdi-static
+export NDK=/root/Android/Sdk/ndk/27.2.12479018
+export QBDI_PREFIX=/root/Spec/CommToolkit/native/qbdi/build-android
+./build.sh
 ```
 
-The agent Interceptor is the attach door. On first `Trace.function` it
-decompresses `libtal.so` and calls `tal_prepare` / `tal_enter`. TAL's own
-`gum_attach` is not used.
+`QBDI_PREFIX` points at the QBDI build tree: it must contain `libQBDI.a`,
+`include/`, and `include-static/`. If unset, `qbdi-sys` falls back to
+`<CommToolkit>/native/qbdi/build-android`, then `build`. The QBDI sources
+under `../CommToolkit/native/qbdi` are used to generate the headers and to
+compile the private-header shim.
 
-Place `libc++_shared.so` next to the extracted `commanalyser-libtal.so`
-(`$ORIGIN`), typically `/data/local/tmp/`.
+The agent Interceptor is the attach door. On the first `Trace.function` it
+installs a one-shot Gum replacement on the target, runs the QBDI VM on a 16 MiB
+host stack of its own, and returns to the caller's LR after the trace
+completes. `native/qbdi/android-arm64/` holds an older prebuilt payload; it
+is not used by the current build.

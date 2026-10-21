@@ -12,11 +12,13 @@ rust-version = "1.85"
 [workspace.dependencies]
 runtime = { path = "crates/runtime" }
 arch-arm64 = { path = "crates/arch-arm64" }
-gum = { path = "crates/gum" }
+gum = { package = "gum-rs", path = "../CommToolkit/crates/gum-rs" }
+gum-sys = { path = "../CommToolkit/crates/gum-sys" }
 art = { path = "crates/art" }
 js = { path = "crates/js" }
 inject = { path = "crates/inject" }
 qbdi = { path = "crates/qbdi" }
+qbdi-rs = { path = "../CommToolkit/crates/qbdi-rs" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +29,10 @@ rquickjs = { version = "0.14", default-features = false, features = ["std", "mac
 lto = "thin"
 opt-level = "z"
 codegen-units = 1
-panic = "abort"
+# Unwind: the agent is a cdylib inside the target process. Every foreign
+# entry point (Gum trampolines, QBDI callbacks, agent_main) catches panics with
+# runtime::ffi::guard, which needs unwind to catch at all. abort turns every
+# script-triggered panic into a SIGABRT in the instrumented app.
+panic = "unwind"
 # Keep local symbols so a stripped ELF cannot hide a compiler-rt constructor.
 strip = "none"

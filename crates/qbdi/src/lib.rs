@@ -1,43 +1,66 @@
-//! QBDI-backed function trace. The `link` feature statically links QBDI.
-//! Host tests compile without that payload.
+//! QBDI-backed function trace.
+//!
+//! The crate is split in three layers:
+//!
+//! - `qbdi-sys` — the raw `qbdi_*` FFI and the `repr(C)` mirrors of QBDI's
+//!   structs.
+//! - `qbdi-rs` — a safe wrapper: an owned VM, typed registers, Rust
+//!   closures as callbacks.
+//! - this crate — CommAnalyser's trace session: what to instrument, when to
+//!   break out of the VM, and what to record.
+//!
+//! The `link` feature pulls in QBDI. Without it the crate compiles and the
+//! host tests run, but a trace cannot start.
 
+mod args;
 mod blacklist;
+mod disasm;
 mod policy;
-mod probe;
 mod ring;
 mod session;
+mod symbols;
 
 #[cfg(feature = "link")]
 mod engine;
-#[cfg(feature = "link")]
+#[cfg(feature = "vm")]
 mod load;
 
 pub use blacklist::{excluded_executable_ranges, is_conflict, is_excluded, ANDROID_CONFLICT};
-pub use probe::MemProbe;
 pub use ring::{EventKind, EventRing, TraceEvent};
 pub use session::{
-    begin, exclude_module, extra_excludes, Escape, EventMask, TraceConfig, TraceSession,
+    begin, exclude_module, extra_excludes, Escape, EventMask, PrintMode, TraceConfig,
+    DEFAULT_MAX_EVENTS,
 };
-
-use runtime::{Error, Result};
 
 /// QBDI version this crate is designed against.
 pub const QBDI_VERSION: &str = "0.12";
 
 /// Whether this build statically links QBDI.
 pub const fn linked() -> bool {
-    cfg!(feature = "link")
+    cfg!(feature = "vm")
 }
 
 /// Drain events produced by the last traced call (empty when not linked).
 pub fn take_events() -> Vec<TraceEvent> {
-    #[cfg(feature = "link")]
+    #[cfg(feature = "vm")]
     {
-        crate::engine::drain_events()
+        crate::load::take_events()
     }
-    #[cfg(not(feature = "link"))]
+    #[cfg(not(feature = "vm"))]
     {
         Vec::new()
+    }
+}
+
+/// Drain the last batch and report how many events were dropped.
+pub fn take_batch() -> (Vec<TraceEvent>, u64) {
+    #[cfg(feature = "vm")]
+    {
+        crate::load::take_batch()
+    }
+    #[cfg(not(feature = "vm"))]
+    {
+        (Vec::new(), 0)
     }
 }
 
@@ -46,29 +69,6 @@ pub fn take_events() -> Vec<TraceEvent> {
 pub struct Range {
     pub start: u64,
     pub end: u64,
-}
-
-/// A single QBDI VM.  QBDI requires one VM per guest thread and is not
-/// re-entrant; callers must serialize access.
-pub struct Vm {
-    ranges: Vec<Range>,
-}
-
-impl Vm {
-    pub fn new() -> Result<Self> {
-        if !linked() {
-            return Err(Error::Unsupported("QBDI is not linked (feature = link)"));
-        }
-        Ok(Self { ranges: Vec::new() })
-    }
-
-    pub fn add_instrumented_range(&mut self, range: Range) {
-        self.ranges.push(range);
-    }
-
-    pub fn ranges(&self) -> &[Range] {
-        &self.ranges
-    }
 }
 
 #[cfg(test)]
@@ -82,44 +82,32 @@ mod tests {
     }
 
     #[test]
-    fn vm_requires_link() {
-        let err = match Vm::new() {
-            Ok(_) => panic!("Vm::new must fail without link"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("QBDI is not linked"), "{err}");
+    fn unlinked_take_events_is_empty() {
+        assert!(!linked());
         assert!(take_events().is_empty());
     }
 
     #[test]
-    fn link_feature_statically_links_qbdi() {
-        let build = include_str!("../build.rs");
-        assert!(build.contains("cargo:rustc-link-lib=static=QBDI"));
-        assert!(build.contains("cargo:rustc-link-lib=static=qbdi-llvm"));
-        assert!(!build.contains("tal_static"));
-        assert!(!build.contains("frida-gum"));
-        let loader = include_str!("load.rs");
-        assert!(loader.contains("qbdi_initVM"));
-        assert!(loader.contains("qbdi_run"));
-        assert!(loader.contains("SKIP_PATCH"));
-        assert!(!loader.contains("tal_prepare"));
-        let clear = include_str!("../../agent/clear_cache.c");
-        assert!(!clear.contains("__builtin___clear_cache"));
-        assert!(clear.contains("dc cvau"));
-        let agent = include_str!("../../agent/Cargo.toml");
-        assert!(agent.contains("qbdi-static"));
-        assert!(agent.contains("qbdi/link"));
+    fn unlinked_take_batch_is_empty() {
+        assert_eq!(take_batch(), (Vec::new(), 0));
     }
 
     #[test]
-    fn engine_uses_qbdi_not_tal() {
-        let engine = include_str!("engine.rs");
-        assert!(engine.contains("InlineHook"), "our Interceptor is the door");
-        assert!(engine.contains("attach_and_return"), "QBDI already ran the body");
-        assert!(engine.contains("orig_lr"), "keep SP-PAC'd LR for trampoline ret");
-        assert!(engine.contains("load::prepare"));
-        assert!(engine.contains("load::run"));
-        assert!(!engine.contains("tal_prepare"));
-        assert!(!engine.contains("gum_attach"));
+    fn events_are_bounded() {
+        let mut ring = EventRing::new(2);
+        for pc in 0..5 {
+            ring.push(TraceEvent::inst(pc, 4, String::new()));
+        }
+        assert_eq!(ring.dropped(), 3);
+        assert_eq!(ring.drain().len(), 2);
+        // Dropped is cumulative for the session, not per batch.
+        assert_eq!(ring.dropped(), 3);
+    }
+
+    #[test]
+    fn default_session_is_bounded() {
+        let config = TraceConfig::new(0x1000);
+        assert_eq!(config.max_events, DEFAULT_MAX_EVENTS);
+        assert!(config.max_events > 0);
     }
 }

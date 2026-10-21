@@ -2,7 +2,8 @@
 
 use rquickjs::{Array, Ctx, Object, Result as JsResult, Value};
 
-use gum::arch::disasm::{decode, Operand};
+use arch_arm64::disasm::{decode, Operand};
+use arch_arm64::Decoded;
 use gum::memory;
 
 use crate::api::{parse_pointer, NativePointer};
@@ -10,7 +11,7 @@ use crate::api::{parse_pointer, NativePointer};
 pub(crate) fn from_decoded<'js>(
     ctx: Ctx<'js>,
     pc: u64,
-    decoded: &gum::arch::Decoded,
+    decoded: &Decoded,
 ) -> JsResult<Object<'js>> {
     let insn = Object::new(ctx.clone())?;
     insn.set("address", NativePointer::instance(ctx.clone(), pc)?)?;
@@ -60,7 +61,15 @@ pub fn parse<'js>(ctx: Ctx<'js>, address: Value<'js>) -> JsResult<Object<'js>> {
     let bytes = memory::read(pc as usize, 4).map_err(|error| {
         rquickjs::Error::new_from_js_message("comm-analyser", "instruction", error.to_string())
     })?;
-    let word = u32::from_le_bytes(bytes.try_into().unwrap());
+    // `gum_memory_read` reports a partial read through its out-parameter; a
+    // short read must become a JS exception, not a panic across the cdylib.
+    let word = u32::from_le_bytes(bytes.as_slice().try_into().map_err(|_| {
+        rquickjs::Error::new_from_js_message(
+            "comm-analyser",
+            "instruction",
+            "short read: instruction crosses a mapping boundary".to_owned(),
+        )
+    })?);
     let decoded = decode(word, pc);
     from_decoded(ctx, pc, &decoded)
 }
