@@ -106,6 +106,8 @@ pub struct TraceConfig {
     /// Hard cap on buffered events. A trace that overruns it drops the newest
     /// events and reports the count instead of growing until the process OOMs.
     pub max_events: usize,
+    /// When set, the traced call writes this file before returning to the guest.
+    pub file: Option<String>,
 }
 
 impl TraceConfig {
@@ -121,6 +123,7 @@ impl TraceConfig {
             trace_all: false,
             avoid: Vec::new(),
             max_events: DEFAULT_MAX_EVENTS,
+            file: None,
         }
     }
 
@@ -197,6 +200,7 @@ mod tests {
         assert!(PrintMode::from_name("addr").is_err());
         assert!(!config.trace_all);
         assert!(config.avoid.is_empty());
+        assert!(config.file.is_none());
         config.until = Some(0x20);
         config.escapes.push(Escape {
             break_at: 0x30,

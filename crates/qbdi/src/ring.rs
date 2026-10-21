@@ -118,6 +118,27 @@ impl EventRing {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &TraceEvent> {
+        self.events.iter()
+    }
+}
+
+impl TraceEvent {
+    /// One text line for a trace file. The ring itself stays unchanged.
+    pub fn line(&self) -> String {
+        match self.kind {
+            EventKind::Inst => format!("inst pc={:#x} size={} {}", self.pc, self.size, self.text),
+            EventKind::Call => format!("call pc={:#x} {}", self.pc, self.text),
+            EventKind::Mem => {
+                let access = if self.is_write { "write" } else { "read" };
+                format!(
+                    "mem pc={:#x} size={} {access} addr={:#x} value={:#x} {}",
+                    self.pc, self.size, self.mem_addr, self.mem_value, self.text
+                )
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +182,11 @@ mod tests {
         let batch = ring.drain();
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].pc, 1);
+        let mem = TraceEvent::mem(0x20, 8, 0x1000, 0x7, true, "str x0, [x1]".into());
+        assert_eq!(
+            mem.line(),
+            "mem pc=0x20 size=8 write addr=0x1000 value=0x7 str x0, [x1]"
+        );
         assert_eq!(batch[1].kind, EventKind::Mem);
         assert!(ring.is_empty());
     }

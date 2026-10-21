@@ -185,7 +185,7 @@ Installed on the worker when the agent is built with `gum-static`:
 - `Interceptor.attach` / `replace` / `revert` / `flush` / `detachAll`
 - `Instruction.parse`, `DebugSymbol`, `Arm64Writer`
 - `Java` (`perform`, `use`, fields, `implementation`, `original`)
-- `Trace.function` / `Trace.exclude` / `Trace.takeEvents`
+- `Trace.function` / `Trace.exclude`. `file` writes the batch when the traced call returns (`events=` / `dropped=` header, then one line per event)
 - `send`, `recv`, `rpc.exports`, `setTimeout` / `setInterval`
 
 `CModule` returns an empty object. `Script.bindWeak` returns 0.

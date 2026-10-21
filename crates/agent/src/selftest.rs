@@ -113,12 +113,14 @@ pub fn run(worker: Option<&JsWorker>, suite: Option<&str>) -> Value {
                 (function () {
                   var sqrt = Module.findExportByName('libm.so', 'sqrt');
                   if (!sqrt) throw new Error('no sqrt');
-                  Trace.function(sqrt, { events: ['inst', 'mem'] });
+                  var path = Process.getTmpDir() + '/ca-trace-sqrt.txt';
+                  Trace.function(sqrt, { events: ['inst', 'mem'], file: path });
                   var n = new NativeFunction(sqrt, 'double', ['double'])(9.0);
-                  var ev = Trace.takeEvents();
-                  if (ev.length < 1) throw new Error('no events n=' + n);
+                  var head = File.readAllText(path).split('\n')[0];
+                  var m = /^events=(\d+)/.exec(head);
+                  if (!m || parseInt(m[1], 10) < 1) throw new Error('no events ' + head + ' n=' + n);
                   if (Math.abs(n - 3) > 1e-9) throw new Error('want 3 n=' + n);
-                  return 'n=' + n + ' events=' + ev.length;
+                  return 'n=' + n + ' ' + head;
                 })()
                 "#,
             )),
@@ -133,12 +135,14 @@ pub fn run(worker: Option<&JsWorker>, suite: Option<&str>) -> Value {
                 (function () {
                   var ilogb = Module.findExportByName('libm.so', 'ilogb');
                   if (!ilogb) throw new Error('no ilogb');
-                  Trace.function(ilogb, { events: ['inst'] });
+                  var path = Process.getTmpDir() + '/ca-trace-ilogb.txt';
+                  Trace.function(ilogb, { events: ['inst'], file: path });
                   var n = new NativeFunction(ilogb, 'int', ['double'])(8.0);
-                  var ev = Trace.takeEvents();
+                  var head = File.readAllText(path).split('\n')[0];
+                  var m = /^events=(\d+)/.exec(head);
                   if (n !== 3) throw new Error('want 3 n=' + n);
-                  if (ev.length < 1) throw new Error('no events n=' + n);
-                  return 'n=' + n + ' events=' + ev.length;
+                  if (!m || parseInt(m[1], 10) < 1) throw new Error('no events ' + head);
+                  return 'n=' + n + ' ' + head;
                 })()
                 "#,
             )),
@@ -153,12 +157,14 @@ pub fn run(worker: Option<&JsWorker>, suite: Option<&str>) -> Value {
                 (function () {
                   var hypot = Module.findExportByName('libm.so', 'hypot');
                   if (!hypot) throw new Error('no hypot');
-                  Trace.function(hypot, { events: ['inst'] });
+                  var path = Process.getTmpDir() + '/ca-trace-hypot.txt';
+                  Trace.function(hypot, { events: ['inst'], file: path });
                   var n = new NativeFunction(hypot, 'double', ['double', 'double'])(3, 4);
-                  var ev = Trace.takeEvents();
+                  var head = File.readAllText(path).split('\n')[0];
+                  var m = /^events=(\d+)/.exec(head);
                   if (Math.abs(n - 5) > 1e-9) throw new Error('want 5 n=' + n);
-                  if (ev.length < 1) throw new Error('no events n=' + n);
-                  return 'n=' + n + ' events=' + ev.length;
+                  if (!m || parseInt(m[1], 10) < 1) throw new Error('no events ' + head);
+                  return 'n=' + n + ' ' + head;
                 })()
                 "#,
             )),

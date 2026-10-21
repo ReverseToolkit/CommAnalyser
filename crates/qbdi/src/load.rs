@@ -127,6 +127,9 @@ struct Door {
     writes: Vec<i16>,
     last_inst: bool,
     symbols: Symbols,
+    /// Written after the VM returns. The script reads this file; the ring is
+    /// not exposed.
+    file: Option<String>,
 }
 
 static DOOR: Mutex<Option<Door>> = Mutex::new(None);
@@ -250,6 +253,7 @@ pub fn prepare(config: &TraceConfig) -> Result<()> {
         writes: Vec::new(),
         last_inst: false,
         symbols: Symbols::default(),
+        file: config.file.clone(),
     });
     Ok(())
 }
@@ -286,8 +290,31 @@ pub fn run(regs: &mut GuestRegs, start: u64, fallback_stop: u64) -> Result<()> {
         .unwrap_or_else(|| Err(Error::Parse("QBDI trace panicked".into())));
     CURRENT.with(|cell| cell.set(std::ptr::null_mut()));
     copy_back(vm, regs);
-    // Do not touch `door` here: the callbacks created references from it.
-    result
+    // Callbacks have returned. The file is the script-facing record of this call.
+    // SAFETY: `door` points into `slot`, which is still held, and the VM
+    // callbacks that borrowed it have returned.
+    let write_result = flush_trace_file(unsafe { &*door });
+    match (result, write_result) {
+        (Ok(()), write) => write,
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn flush_trace_file(door: &Door) -> Result<()> {
+    let Some(path) = &door.file else {
+        return Ok(());
+    };
+    let mut body = format!(
+        "events={} dropped={}\n",
+        door.ring.len(),
+        door.ring.dropped()
+    );
+    for event in door.ring.iter() {
+        body.push_str(&event.line());
+        body.push('\n');
+    }
+    std::fs::write(path, body)?;
+    Ok(())
 }
 
 fn set_registers(vm: &Vm, regs: &GuestRegs) {

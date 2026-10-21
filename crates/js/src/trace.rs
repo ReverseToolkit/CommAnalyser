@@ -4,12 +4,9 @@ use rquickjs::function::Opt;
 use rquickjs::prelude::Func;
 use rquickjs::{Array, Ctx, Function, Object, Result as JsResult, Value};
 
-use qbdi::{
-    begin, exclude_module, take_batch, Escape, EventKind, EventMask, PrintMode, TraceConfig,
-    DEFAULT_MAX_EVENTS,
-};
+use qbdi::{begin, exclude_module, Escape, EventMask, PrintMode, TraceConfig, DEFAULT_MAX_EVENTS};
 
-use crate::api::{parse_pointer, to_js_error, NativePointer};
+use crate::api::{parse_pointer, to_js_error};
 
 pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     let trace = Object::new(ctx.clone())?;
@@ -20,7 +17,6 @@ pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
             exclude_module(name);
         }),
     )?;
-    trace.set("takeEvents", Func::from(take_events_js))?;
     ctx.globals().set("Trace", trace)?;
     Ok(())
 }
@@ -55,6 +51,12 @@ fn trace_function<'js>(
         if let Ok(mode) = options.get::<_, String>("mode") {
             config.mode = PrintMode::from_name(&mode).map_err(to_js_error)?;
         }
+        if let Ok(path) = options.get::<_, String>("file") {
+            if path.is_empty() {
+                return Err(to_js_error("Trace.function: empty file path"));
+            }
+            config.file = Some(path);
+        }
         if let Ok(max_events) = options.get::<_, f64>("maxEvents") {
             if max_events >= 1.0 {
                 config.max_events = max_events as usize;
@@ -74,35 +76,4 @@ fn trace_function<'js>(
     begin(config).map_err(to_js_error)?;
     let _ = ctx;
     Ok(())
-}
-
-fn take_events_js<'js>(ctx: Ctx<'js>) -> JsResult<Array<'js>> {
-    let (events, dropped) = take_batch();
-    let array = Array::new(ctx.clone())?;
-    // A script must be able to tell a complete trace from a truncated one.
-    array.as_object().set("dropped", dropped)?;
-    for (index, event) in events.into_iter().enumerate() {
-        let item = Object::new(ctx.clone())?;
-        let kind = match event.kind {
-            EventKind::Inst => "inst",
-            EventKind::Mem => "mem",
-            EventKind::Call => "call",
-        };
-        item.set("type", kind)?;
-        item.set("pc", NativePointer::instance(ctx.clone(), event.pc)?)?;
-        item.set("size", event.size)?;
-        if !event.text.is_empty() {
-            item.set("text", event.text)?;
-        }
-        if event.kind == EventKind::Mem {
-            item.set(
-                "address",
-                NativePointer::instance(ctx.clone(), event.mem_addr)?,
-            )?;
-            item.set("value", event.mem_value)?;
-            item.set("write", event.is_write)?;
-        }
-        array.set(index, item)?;
-    }
-    Ok(array)
 }

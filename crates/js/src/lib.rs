@@ -621,8 +621,7 @@ mod api_tests {
         assert_eq!(rt.eval("typeof Trace").unwrap(), "object");
         assert_eq!(rt.eval("typeof Trace.function").unwrap(), "function");
         assert_eq!(rt.eval("typeof Trace.exclude").unwrap(), "function");
-        assert_eq!(rt.eval("typeof Trace.takeEvents").unwrap(), "function");
-        assert_eq!(rt.eval("Trace.takeEvents().length").unwrap(), "0");
+        assert_eq!(rt.eval("typeof Trace.takeEvents").unwrap(), "undefined");
         rt.eval("Trace.exclude('libc.so')").unwrap();
         let err = rt
             .eval("Trace.function(ptr('0x1000'), { events: ['inst', 'mem'], exclude: ['libfoo.so'] })")
@@ -630,6 +629,10 @@ mod api_tests {
         assert!(err.to_string().contains("QBDI is not linked"), "{err}");
         let err2 = rt.eval("Trace.function(ptr('0x2000'))").unwrap_err();
         assert!(err2.to_string().contains("QBDI is not linked"), "{err2}");
+        let empty = rt
+            .eval("Trace.function(ptr('0x1000'), { file: '' })")
+            .unwrap_err();
+        assert!(empty.to_string().contains("empty file path"), "{empty}");
     }
 
     #[test]
