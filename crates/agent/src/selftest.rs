@@ -75,7 +75,9 @@ fn selected(layer: &str, name: &str) -> bool {
 }
 
 /// Run every in-process case. `suite` selects a layer or `layer.case` prefix
-/// (`runtime`, `gum`, `gum.hook_enter`, `js`, `trace`, `java`).
+/// (`runtime`, `gum`, `gum.hook_enter`, `js`, `trace`, `java`, `il2cpp`).
+/// `il2cpp` runs only when asked: a process without `libil2cpp.so` is not a failure
+/// of the other suites.
 pub fn run(worker: Option<&JsWorker>, suite: Option<&str>) -> Value {
     let mut cases = Vec::new();
     let want = suite.unwrap_or("");
@@ -171,6 +173,17 @@ pub fn run(worker: Option<&JsWorker>, suite: Option<&str>) -> Value {
             None => cases.push(Outcome::skip("trace", "libm_hypot", "QuickJS unavailable")),
         }
     }
+    if want == "il2cpp" || want.starts_with("il2cpp.") {
+        cases.push(guard("il2cpp", "summary", test_il2cpp_summary));
+        cases.push(guard("il2cpp", "domain", test_il2cpp_domain));
+        cases.push(guard("il2cpp", "class", test_il2cpp_class));
+        cases.push(guard("il2cpp", "method", test_il2cpp_method));
+        cases.push(guard("il2cpp", "field", test_il2cpp_field));
+        cases.push(guard("il2cpp", "string", test_il2cpp_string));
+        cases.push(guard("il2cpp", "gc", test_il2cpp_gc));
+        cases.push(guard("il2cpp", "dump", test_il2cpp_dump));
+        cases.push(guard("il2cpp", "trace", test_il2cpp_trace));
+    }
     if take("java") {
         cases.extend(java_cases(worker));
     }
@@ -228,10 +241,7 @@ fn test_module_export() -> Result<String, String> {
         .iter()
         .find(|m| m.name == "libc.so" || m.name.starts_with("libc.so."))
         .ok_or("libc.so module missing")?;
-    let getpid = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getpid".as_ptr()) } as usize;
-    if getpid == 0 {
-        return Err("dlsym(getpid) failed".into());
-    }
+    let getpid = runtime::dlsym::resolve("getpid").ok_or("dlsym(getpid) failed")?;
     if !libc.contains(getpid) && getpid < libc.base {
         // IFUNC / vdso aliases can live outside the file-backed range; still require a live symbol.
     }
@@ -254,6 +264,237 @@ fn test_process() -> Result<String, String> {
         "pid={pid} page={page} arch={}",
         runtime::process::arch()
     ))
+}
+
+fn test_il2cpp_summary() -> Result<String, String> {
+    let value = il2cpp::summary().map_err(|err| err.to_string())?;
+    let assemblies = value["assemblies"].as_array().map(|items| items.len()).unwrap_or(0);
+    if assemblies == 0 {
+        return Err(format!("no assemblies: {value}"));
+    }
+    let sample_len = value["sampleLen"].as_i64().unwrap_or(-1);
+    if sample_len != 5 {
+        return Err(format!("string length {sample_len}: {value}"));
+    }
+    let get_length = value["getLength"].as_str().unwrap_or("0x0");
+    if get_length == "0x0" {
+        return Err(format!("get_Length has no virtual address: {value}"));
+    }
+    Ok(format!(
+        "module={} assemblies={assemblies} corlibClasses={} stringMethods={} getLength={get_length} unity={}",
+        value["module"].as_str().unwrap_or("?"),
+        value["corlibClasses"],
+        value["stringMethods"],
+        value["unity"]
+    ))
+}
+
+fn il2cpp_runtime() -> Result<il2cpp::Runtime, String> {
+    il2cpp::Runtime::session().map_err(|err| err.to_string())
+}
+
+fn test_il2cpp_domain() -> Result<String, String> {
+    let rt = il2cpp_runtime()?;
+    let domain = rt.domain().map_err(|err| err.to_string())?;
+    let assemblies = domain.assemblies(&rt).map_err(|err| err.to_string())?;
+    if assemblies.is_empty() {
+        return Err("no assemblies".into());
+    }
+    let missing = domain
+        .try_assembly(&rt, "no.such.assembly")
+        .map_err(|err| err.to_string())?;
+    if missing.is_some() {
+        return Err("missing assembly resolved".into());
+    }
+    let mscorlib = domain.assembly(&rt, "mscorlib").map_err(|err| err.to_string())?;
+    let image = mscorlib.image(&rt).map_err(|err| err.to_string())?;
+    let name = image.name(&rt).map_err(|err| err.to_string())?;
+    if !name.contains("mscorlib") {
+        return Err(format!("image {name}"));
+    }
+    let count = image.class_count(&rt).map_err(|err| err.to_string())?;
+    if count == 0 {
+        return Err("mscorlib class count 0".into());
+    }
+    Ok(format!("assemblies={} image={name} classes={count}", assemblies.len()))
+}
+
+fn test_il2cpp_class() -> Result<String, String> {
+    let rt = il2cpp_runtime()?;
+    let class = rt
+        .corlib()
+        .map_err(|err| err.to_string())?
+        .class(&rt, "System.String")
+        .map_err(|err| err.to_string())?;
+    let full = class.full_name(&rt).map_err(|err| err.to_string())?;
+    if full != "System.String" {
+        return Err(full);
+    }
+    let parent = class
+        .parent(&rt)
+        .map_err(|err| err.to_string())?
+        .ok_or("String has no parent")?;
+    let parent_name = parent.full_name(&rt).map_err(|err| err.to_string())?;
+    if parent_name != "System.Object" {
+        return Err(format!("parent {parent_name}"));
+    }
+    if class.kind(&rt).map_err(|err| err.to_string())? != "class" {
+        return Err("String is not a class".into());
+    }
+    if class.is_enum(&rt).map_err(|err| err.to_string())? {
+        return Err("String is an enum".into());
+    }
+    let size = class.instance_size(&rt).map_err(|err| err.to_string())?;
+    if size <= 0 {
+        return Err(format!("instance size {size}"));
+    }
+    let flags = class.flags(&rt).map_err(|err| err.to_string())?;
+    let nested = class.nested(&rt).map_err(|err| err.to_string())?;
+    Ok(format!(
+        "full={full} parent={parent_name} size={size} flags={flags:#x} nested={}",
+        nested.len()
+    ))
+}
+
+fn test_il2cpp_method() -> Result<String, String> {
+    let mut rt = il2cpp_runtime()?;
+    let class = rt
+        .corlib()
+        .map_err(|err| err.to_string())?
+        .class(&rt, "System.String")
+        .map_err(|err| err.to_string())?;
+    let methods = class.methods(&rt).map_err(|err| err.to_string())?;
+    if methods.is_empty() {
+        return Err("no methods".into());
+    }
+    let length = class.method(&rt, "get_Length", 0).map_err(|err| err.to_string())?;
+    if length.is_static(&rt).map_err(|err| err.to_string())? {
+        return Err("get_Length is static".into());
+    }
+    if length.param_count(&rt).map_err(|err| err.to_string())? != 0 {
+        return Err("get_Length has parameters".into());
+    }
+    let signature = length.signature(&rt).map_err(|err| err.to_string())?;
+    let va = length.virtual_address(&mut rt).map_err(|err| err.to_string())?;
+    if va == 0 {
+        return Err("null virtual address".into());
+    }
+    let sample = rt.new_string("mouse").map_err(|err| err.to_string())?;
+    let got = length.invoke_raw(&mut rt, sample, &[]).map_err(|err| err.to_string())?;
+    if got != 5 {
+        return Err(format!("invoke get_Length={got}"));
+    }
+    Ok(format!("methods={} sig={signature} va={va:#x} invoke={got}", methods.len()))
+}
+
+fn test_il2cpp_field() -> Result<String, String> {
+    let rt = il2cpp_runtime()?;
+    let class = rt
+        .corlib()
+        .map_err(|err| err.to_string())?
+        .class(&rt, "System.String")
+        .map_err(|err| err.to_string())?;
+    let fields = class.fields(&rt).map_err(|err| err.to_string())?;
+    let field = fields.first().ok_or("String has no fields")?;
+    let name = field.name(&rt).map_err(|err| err.to_string())?;
+    if name.is_empty() {
+        return Err("empty field name".into());
+    }
+    let type_name = field.type_(&rt).map_err(|err| err.to_string())?.name(&rt).map_err(|err| err.to_string())?;
+    if type_name.is_empty() {
+        return Err(format!("field {name} has an empty type"));
+    }
+    let offset = field.offset(&rt).map_err(|err| err.to_string())?;
+    let flags = field.flags(&rt).map_err(|err| err.to_string())?;
+    Ok(format!(
+        "fields={} first={name} type={type_name} offset={offset:#x} flags={flags:#x} static={}",
+        fields.len(),
+        field.is_static(&rt).map_err(|err| err.to_string())?
+    ))
+}
+
+fn test_il2cpp_string() -> Result<String, String> {
+    let rt = il2cpp_runtime()?;
+    let sample = rt.new_string("mouse").map_err(|err| err.to_string())?;
+    let len = rt.string_length(sample).map_err(|err| err.to_string())?;
+    let text = rt.string_utf16(sample).map_err(|err| err.to_string())?;
+    if len != 5 || text != "mouse" {
+        return Err(format!("len={len} text={text}"));
+    }
+    Ok(format!("text={text} len={len}"))
+}
+
+fn test_il2cpp_gc() -> Result<String, String> {
+    let rt = il2cpp_runtime()?;
+    let heap = rt.gc_heap_size().map_err(|err| err.to_string())?;
+    let used = rt.gc_used_size().map_err(|err| err.to_string())?;
+    let threads = rt.attached_threads().map_err(|err| err.to_string())?;
+    if threads.is_empty() {
+        return Err("no attached threads".into());
+    }
+    Ok(format!("heap={heap} used={used} threads={}", threads.len()))
+}
+
+fn test_il2cpp_dump() -> Result<String, String> {
+    let rt = il2cpp_runtime()?;
+    let class = rt
+        .corlib()
+        .map_err(|err| err.to_string())?
+        .class(&rt, "System.String")
+        .map_err(|err| err.to_string())?;
+    let one = il2cpp::dump_class(&rt, class).map_err(|err| err.to_string())?;
+    if !one.contains("System.String") || !one.contains("get_Length") {
+        return Err(one);
+    }
+    let path = format!("{}/ca-il2cpp-dump.txt", app_cache_dir());
+    let text = il2cpp::dump_assembly(&rt, Some("mscorlib"), Some(1)).map_err(|err| err.to_string())?;
+    std::fs::write(&path, &text).map_err(|err| err.to_string())?;
+    let read = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
+    if read != text {
+        return Err("dump file mismatch".into());
+    }
+    Ok(format!("class_lines={} file={path}", one.lines().count()))
+}
+
+fn test_il2cpp_trace() -> Result<String, String> {
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("trace_method is built for Android".into())
+    }
+    #[cfg(target_os = "android")]
+    {
+        let mut rt = il2cpp_runtime()?;
+        let class = rt
+            .corlib()
+            .map_err(|err| err.to_string())?
+            .class(&rt, "System.String")
+            .map_err(|err| err.to_string())?;
+        let length = class.method(&rt, "get_Length", 0).map_err(|err| err.to_string())?;
+        let path = format!("{}/ca-il2cpp-trace.txt", app_cache_dir());
+        let _ = std::fs::remove_file(&path);
+        il2cpp::trace_method(&mut rt, length, path.clone()).map_err(|err| err.to_string())?;
+        let sample = rt.new_string("mouse").map_err(|err| err.to_string())?;
+        let got = length.invoke_raw(&mut rt, sample, &[]).map_err(|err| err.to_string())?;
+        if got != 5 {
+            return Err(format!("traced invoke={got}"));
+        }
+        let text = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
+        if !text.contains("enter") || !text.contains("leave") {
+            return Err(text);
+        }
+        Ok(format!("lines={} invoke={got}", text.lines().count()))
+    }
+}
+
+fn app_cache_dir() -> String {
+    let bytes = std::fs::read("/proc/self/cmdline").unwrap_or_default();
+    let name = String::from_utf8_lossy(&bytes);
+    let name = name.split('\0').next().unwrap_or("");
+    if name.contains('.') {
+        format!("/data/user/0/{name}/cache")
+    } else {
+        "/data/local/tmp".into()
+    }
 }
 
 fn test_memory() -> Result<String, String> {
@@ -282,10 +523,7 @@ fn test_memory() -> Result<String, String> {
 }
 
 fn test_native_strlen() -> Result<String, String> {
-    let strlen = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"strlen".as_ptr()) } as usize;
-    if strlen == 0 {
-        return Err("dlsym(strlen) failed".into());
-    }
+    let strlen = runtime::dlsym::resolve("strlen").ok_or("dlsym(strlen) failed")?;
     let hello = c"abcdef";
     let ret = unsafe { js::native::call(strlen, &[hello.as_ptr() as u64]) }
         .map_err(|err| err.to_string())?;
@@ -419,7 +657,7 @@ fn hook_cases() -> Vec<Outcome> {
 fn mmap_exec_page() -> Result<*mut c_void, String> {
     const PAGE: usize = 0x1000;
     const FIXED_NOREPLACE: i32 = 0x10_0000;
-    let near = unsafe { libc::dlsym(libc::RTLD_DEFAULT, b"getpid\0".as_ptr().cast()) } as usize;
+    let near = runtime::dlsym::resolve("getpid").unwrap_or(0);
     if near != 0 {
         for delta in (0x1_0000..0x40_00000).step_by(0x1_0000) {
             let hint = near.wrapping_add(delta) & !(PAGE - 1);

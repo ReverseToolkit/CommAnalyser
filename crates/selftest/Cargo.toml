@@ -19,3 +19,4 @@ required-features = ["device"]
 [dependencies]
 gum.workspace = true
 libc.workspace = true
+runtime.workspace = true

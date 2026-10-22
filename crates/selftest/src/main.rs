@@ -21,7 +21,7 @@ unsafe extern "C" fn on_getpid_leave(regs: *mut SavedRegs, _data: *mut c_void) {
 }
 
 fn main() {
-    let target = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getpid".as_ptr()) } as usize;
+    let target = runtime::dlsym::resolve("getpid").unwrap_or(0);
     if target == 0 {
         eprintln!("selftest: dlsym(getpid) failed");
         std::process::exit(2);

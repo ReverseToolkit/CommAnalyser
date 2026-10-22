@@ -1,6 +1,5 @@
 //! Minimal ELF export lookup for `Module.getExportByName`.
 
-use std::ffi::CString;
 use std::fs;
 
 use goblin::elf::Elf;
@@ -46,6 +45,9 @@ pub fn find_export(module_name: Option<&str>, symbol: &str) -> Result<Option<(us
             let Some(name) = elf.dynstrtab.get_at(sym.st_name) else {
                 continue;
             };
+            if is_ifunc(sym.st_info) {
+                continue;
+            }
             if name.split('@').next() == Some(symbol) {
                 return Ok(Some((
                     module.base.wrapping_add(sym.st_value as usize),
@@ -166,6 +168,10 @@ pub fn enumerate_dependencies(path: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+fn is_ifunc(info: u8) -> bool {
+    goblin::elf::sym::st_type(info) == goblin::elf::sym::STT_GNU_IFUNC
+}
+
 fn symbol_value(path: &str, symbol: &str, include_symtab: bool) -> Result<Option<usize>> {
     let data = fs::read(path).map_err(runtime::Error::Io)?;
     let elf =
@@ -178,6 +184,9 @@ fn symbol_value(path: &str, symbol: &str, include_symtab: bool) -> Result<Option
             let Some(name) = strtab.get_at(sym.st_name) else {
                 continue;
             };
+            if is_ifunc(sym.st_info) {
+                continue;
+            }
             if name.split('@').next() == Some(symbol) {
                 return Some(sym.st_value as usize);
             }
@@ -228,14 +237,7 @@ fn list_symbols(path: &str, base: usize, include_symtab: bool) -> Result<Vec<Sym
 }
 
 fn resolve_dlsym(symbol: &str) -> Option<usize> {
-    let name = CString::new(symbol).ok()?;
-    // SAFETY: dlsym only reads the NUL-terminated symbol name.
-    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-    if address.is_null() {
-        None
-    } else {
-        Some(address as usize)
-    }
+    runtime::dlsym::resolve(symbol)
 }
 
 #[cfg(test)]

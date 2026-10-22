@@ -7,5 +7,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+goblin = "0.10"
 libc.workspace = true
 thiserror.workspace = true

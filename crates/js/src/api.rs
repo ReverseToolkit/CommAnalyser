@@ -684,6 +684,7 @@ pub fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>>) -> J
     instruction.set("parse", Func::from(crate::instruction::parse))?;
     ctx.globals().set("Instruction", instruction)?;
     crate::java::install(ctx, java_hooks)?;
+    crate::il2cpp::install(ctx)?;
     Ok(())
 }
 

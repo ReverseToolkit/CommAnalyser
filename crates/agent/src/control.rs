@@ -368,8 +368,7 @@ unsafe extern "C" fn on_getpid(_regs: *mut gum::SavedRegs, _data: *mut c_void) {
 
 fn hook_getpid() -> Value {
     HOOK_HITS.store(0, Ordering::SeqCst);
-    // SAFETY: dlsym with a NUL-terminated symbol name.
-    let target = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getpid".as_ptr()) } as usize;
+    let target = runtime::dlsym::resolve("getpid").unwrap_or(0);
     if target == 0 {
         return json!({"ok": false, "error": "dlsym(getpid) failed"});
     }

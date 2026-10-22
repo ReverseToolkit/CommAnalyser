@@ -508,10 +508,9 @@ fn new_object_with_values<'a>(
 
 fn created_java_vm() -> Result<*mut RawJavaVM> {
     // SAFETY: dlsym returns the JNI entrypoint exported by libart.
-    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"JNI_GetCreatedJavaVMs".as_ptr()) };
-    if symbol.is_null() {
+    let Some(symbol) = runtime::dlsym::resolve("JNI_GetCreatedJavaVMs") else {
         return Err(Error::NotFound("JNI_GetCreatedJavaVMs".into()));
-    }
+    };
     // SAFETY: signature matches JNIInvokeInterface.
     let get: GetCreatedJavaVms = unsafe { std::mem::transmute(symbol) };
     let mut vm: *mut RawJavaVM = ptr::null_mut();

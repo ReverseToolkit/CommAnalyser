@@ -3,6 +3,7 @@
 //! This crate deliberately stays small: memory maps, modules, process and
 //! thread identity.  Android-specific probing lives in `art` / `inject`.
 
+pub mod dlsym;
 pub mod error;
 pub mod ffi;
 pub mod handles;

@@ -15,6 +15,7 @@ dependencies = [
  "arch-arm64",
  "art",
  "gum-rs",
+ "il2cpp",
  "js",
  "libc",
  "qbdi",
@@ -316,6 +317,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "il2cpp"
+version = "0.1.0"
+dependencies = [
+ "goblin",
+ "gum-rs",
+ "libc",
+ "runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -407,10 +419,12 @@ dependencies = [
  "art",
  "goblin",
  "gum-rs",
+ "il2cpp",
  "libc",
  "qbdi",
  "rquickjs",
  "runtime",
+ "serde_json",
  "thiserror",
 ]
 
@@ -638,6 +652,7 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "goblin",
  "libc",
  "thiserror",
 ]
@@ -692,6 +707,7 @@ version = "0.1.0"
 dependencies = [
  "gum-rs",
  "libc",
+ "runtime",
 ]
 
 [[package]]

@@ -12,9 +12,11 @@ arch-arm64.workspace = true
 gum.workspace = true
 art.workspace = true
 qbdi.workspace = true
+il2cpp.workspace = true
 goblin = "0.10"
 libc.workspace = true
 rquickjs.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]

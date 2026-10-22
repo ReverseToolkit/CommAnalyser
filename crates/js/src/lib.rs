@@ -6,6 +6,7 @@
 mod api;
 mod elf;
 mod extras;
+mod il2cpp;
 mod instruction;
 mod java;
 pub mod native;

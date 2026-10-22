@@ -18,6 +18,7 @@ Function traces go through QBDI. Both engines live in the sibling
 - `crates/arch-arm64` — instruction classification, writer, relocator. `NativeFunction` and `NativeCallback` emit stubs with this writer.
 - `crates/js` — QuickJS (rquickjs) and the Frida-shaped API, one worker thread.
 - `crates/art` — JNI, ArtMethod hooks, quick-ABI to JNI (SOA).
+- `crates/il2cpp` — IL2CPP runtime bridge (`Il2Cpp` in scripts): domain, classes, methods, fields, strings, GC. Port of frida-il2cpp-bridge. It reads `il2cpp_*` from `libil2cpp.so` and does not parse `global-metadata.dat`.
 - `crates/qbdi` — the trace session (`Trace.function`). The VM wrapper is `qbdi-rs`.
 - `crates/inject` — ptrace, remote calls, custom ELF loader, spawn-then-inject.
 - `crates/agent` — in-process payload (`cdylib`, entry `agent_main`).
