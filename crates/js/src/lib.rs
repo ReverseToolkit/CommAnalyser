@@ -4,6 +4,7 @@
 //! Frida API objects are added incrementally in later milestones.
 
 mod api;
+mod cmodule;
 mod elf;
 mod extras;
 mod il2cpp;
@@ -991,7 +992,10 @@ mod api_tests {
                     const id = Script.bindWeak({}, function () {});
                     Script.unbindWeak(id);
                     const cm = CModule('int add(int a, int b) { return a + b; }');
-                    if (typeof cm !== 'object') return 'cmodule';
+                    if (typeof cm !== 'object' || !cm.add) return 'cmodule';
+                    const add = new NativeFunction(cm.add, 'int', ['int', 'int']);
+                    if (add(20, 22) !== 42) return 'add=' + add(20, 22);
+                    cm.dispose();
                     if (String(new MatchPattern('ff ?? aa')) !== 'ff ?? aa') return 'pattern';
                     print('host-test-print');
                     globalThis.__imm = 0;

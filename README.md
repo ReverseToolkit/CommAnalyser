@@ -189,13 +189,13 @@ Installed on the worker when the agent is built with `gum-static`:
 - `Trace.function` / `Trace.exclude`. `file` writes the batch when the traced call returns (`events=` / `dropped=` header, then one line per event)
 - `send`, `recv`, `rpc.exports`, `setTimeout` / `setInterval`
 
-`CModule` returns an empty object. `Script.bindWeak` returns 0.
+`CModule(source[, symbols])` compiles `source` with TinyCC and exposes each global as a `NativePointer`. `dispose()` frees it. Unknown `extern` symbols come from `symbols` or from the process (`malloc`, `strlen`, …). `Script.bindWeak` returns 0.
 
 ## Limits
 
 - No unload. `detach` is the M2 error, and a failed inject still leaves the mapped agent after threads resume.
 - The host daemon has an empty embedded agent. Android `inject` needs a daemon built by `./build.sh` after the agent.
-- `CModule` and `Script.bindWeak` are stubs.
+- `Script.bindWeak` is a stub.
 - `NativeCallback` stubs are not freed.
 - Spawn does not stop the new process before `Application.onCreate`.
 

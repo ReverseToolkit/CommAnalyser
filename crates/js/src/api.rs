@@ -865,9 +865,12 @@ fn install_script_and_file<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
         "CModule",
         Func::from(
             |ctx: Ctx<'js>,
-             _code: String,
-             _symbols: rquickjs::function::Opt<Value<'js>>|
-             -> JsResult<Object<'js>> { Object::new(ctx) },
+             code: String,
+             symbols: rquickjs::function::Opt<Object<'js>>,
+             _options: rquickjs::function::Opt<Object<'js>>|
+             -> JsResult<Object<'js>> {
+                crate::cmodule::compile(ctx, code, symbols.0, _options.0)
+            },
         ),
     )?;
     Ok(())
