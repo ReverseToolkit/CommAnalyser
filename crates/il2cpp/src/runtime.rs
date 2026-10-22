@@ -59,7 +59,7 @@ impl Runtime {
         Ok(runtime)
     }
 
-    fn clone_shallow(&self) -> Runtime {
+    pub(crate) fn clone_shallow(&self) -> Runtime {
         Runtime {
             module: self.module.clone(),
             exports: self.exports.clone(),
@@ -139,6 +139,36 @@ impl Runtime {
             .exports
             .call(self.exports.thread_get_all_attached, [&mut count as *mut u64 as u64].as_slice())?;
         read_pointer_list(start, count)
+    }
+
+    pub fn object_class(&self, object: u64) -> Result<Class> {
+        Ok(Class(self.exports.call(self.exports.object_get_class, &[object])?))
+    }
+
+    pub fn object_size(&self, object: u64) -> Result<u32> {
+        Ok(self.exports.call(self.exports.object_get_size, &[object])? as u32)
+    }
+
+    pub fn array_length(&self, array: u64) -> Result<u32> {
+        Ok(self.exports.call(self.exports.array_length, &[array])? as u32)
+    }
+
+    pub fn array_new(&self, class: Class, length: u64) -> Result<u64> {
+        self.exports.call(self.exports.array_new, &[class.0, length])
+    }
+
+    pub fn gc_collect(&self, generation: i32) -> Result<()> {
+        self.exports.call(self.exports.gc_collect, &[generation as u64])?;
+        Ok(())
+    }
+
+    pub fn thread_current(&self) -> Result<u64> {
+        self.exports.call(self.exports.thread_current, &[])
+    }
+
+    pub fn thread_detach(&self, thread: u64) -> Result<()> {
+        self.exports.call(self.exports.thread_detach, &[thread])?;
+        Ok(())
     }
 
     pub fn resolve_icall(&self, name: &str) -> Result<u64> {
@@ -358,6 +388,46 @@ impl Class {
         Ok(Field(handle))
     }
 
+    pub fn is_abstract(&self, rt: &Runtime) -> Result<bool> {
+        Ok(rt.exports.call(rt.exports.class_is_abstract, &[self.0])? != 0)
+    }
+
+    pub fn is_generic(&self, rt: &Runtime) -> Result<bool> {
+        Ok(rt.exports.call(rt.exports.class_is_generic, &[self.0])? != 0)
+    }
+
+    pub fn is_inflated(&self, rt: &Runtime) -> Result<bool> {
+        Ok(rt.exports.call(rt.exports.class_is_inflated, &[self.0])? != 0)
+    }
+
+    pub fn is_assignable_from(&self, rt: &Runtime, other: Class) -> Result<bool> {
+        Ok(rt.exports.call(rt.exports.class_is_assignable_from, &[self.0, other.0])? != 0)
+    }
+
+    pub fn is_subclass_of(&self, rt: &Runtime, other: Class, check_interfaces: bool) -> Result<bool> {
+        Ok(rt.exports.call(
+            rt.exports.class_is_subclass_of,
+            &[self.0, other.0, u64::from(check_interfaces)],
+        )? != 0)
+    }
+
+    pub fn alloc(&self, rt: &Runtime) -> Result<u64> {
+        rt.exports.call(rt.exports.alloc, &[self.instance_size(rt)? as u64])
+    }
+
+    pub fn new_object(&self, rt: &Runtime) -> Result<u64> {
+        rt.class_init(self.0)?;
+        let object = rt.exports.call(rt.exports.object_new, &[self.0])?;
+        if object != 0 && rt.exports.object_init != 0 {
+            let _ = rt.exports.call(rt.exports.object_init, &[object]);
+        }
+        Ok(object)
+    }
+
+    pub fn array_class(&self, rt: &Runtime) -> Result<Class> {
+        Ok(Class(rt.exports.call(rt.exports.array_class_get, &[self.0, 1])?))
+    }
+
     pub fn kind(&self, rt: &Runtime) -> Result<&'static str> {
         if self.is_enum(rt)? {
             Ok("enum")
@@ -389,6 +459,22 @@ impl Method {
 
     pub fn param_name(&self, rt: &Runtime, index: u32) -> Result<String> {
         mem::cstr(rt.exports.call(rt.exports.method_get_param_name, &[self.0, index as u64])?)
+    }
+
+    pub fn param_type(&self, rt: &Runtime, index: u32) -> Result<Type> {
+        Ok(Type(rt.exports.call(rt.exports.method_get_param, &[self.0, index as u64])?))
+    }
+
+    pub fn is_generic(&self, rt: &Runtime) -> Result<bool> {
+        Ok(rt.exports.call(rt.exports.method_is_generic, &[self.0])? != 0)
+    }
+
+    pub fn is_inflated(&self, rt: &Runtime) -> Result<bool> {
+        Ok(rt.exports.call(rt.exports.method_is_inflated, &[self.0])? != 0)
+    }
+
+    pub fn is_instance(&self, rt: &Runtime) -> Result<bool> {
+        Ok(rt.exports.call(rt.exports.method_is_instance, &[self.0])? != 0)
     }
 
     pub fn return_type(&self, rt: &Runtime) -> Result<Type> {

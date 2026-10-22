@@ -4,6 +4,7 @@
 //! resolve `il2cpp_*` in `libil2cpp.so`, walk the domain, and hook method bodies.
 //! It does not parse `global-metadata.dat`. The script-facing object is `Il2Cpp`.
 
+mod bridge;
 mod exports;
 mod ffi;
 mod mem;
@@ -13,6 +14,7 @@ mod symbol;
 #[cfg(target_os = "android")]
 mod trace;
 
+pub use bridge::OverloadSpec;
 pub use runtime::{
     dump_assembly, dump_class, Assembly, Class, Domain, Field, Image, Method, Runtime, Type,
 };

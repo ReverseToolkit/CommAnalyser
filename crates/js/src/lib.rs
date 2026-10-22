@@ -8,6 +8,7 @@ mod cmodule;
 mod elf;
 mod extras;
 mod il2cpp;
+mod il2cpp_api;
 mod instruction;
 mod java;
 pub mod native;
