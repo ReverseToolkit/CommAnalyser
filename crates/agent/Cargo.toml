@@ -18,6 +18,7 @@ art.workspace = true
 js.workspace = true
 qbdi.workspace = true
 il2cpp.workspace = true
+sofix.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 

@@ -137,6 +137,7 @@ pub(crate) fn handle_op(op: &str, request: &Value, worker: Option<&JsWorker>) ->
     }
     Some(match op {
         "ping" => json!({"ok": true, "pong": true}),
+        "dumpso" => dump_so(request),
         "hook_getpid" => hook_getpid(),
         "selftest" => {
             let suite = request.get("suite").and_then(Value::as_str);
@@ -332,6 +333,23 @@ pub(crate) fn handle_op(op: &str, request: &Value, worker: Option<&JsWorker>) ->
         }
         other => json!({"ok": false, "error": format!("unknown command: {other}")}),
     })
+}
+
+fn dump_so(request: &Value) -> Value {
+    let module = request.get("module").and_then(Value::as_str).unwrap_or("");
+    let path = request.get("path").and_then(Value::as_str).unwrap_or("");
+    if module.is_empty() || path.is_empty() {
+        return json!({"ok": false, "error": "dumpso: module and path are required"});
+    }
+    match sofix::dump_here(module, path) {
+        Ok(report) => json!({
+            "ok": true,
+            "base": report.base,
+            "size": report.size,
+            "path": report.path,
+        }),
+        Err(err) => json!({"ok": false, "error": err.to_string()}),
+    }
 }
 
 pub fn spawn(name: String) {

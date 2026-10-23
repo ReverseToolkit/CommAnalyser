@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 runtime.workspace = true
+sofix.workspace = true
 inject.workspace = true
 libc.workspace = true
 serde.workspace = true

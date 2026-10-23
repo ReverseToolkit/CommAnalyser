@@ -13,6 +13,7 @@ gum.workspace = true
 art.workspace = true
 qbdi.workspace = true
 il2cpp.workspace = true
+sofix.workspace = true
 goblin = "0.10"
 libc.workspace = true
 rquickjs.workspace = true

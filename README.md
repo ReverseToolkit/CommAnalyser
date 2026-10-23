@@ -120,15 +120,19 @@ When the daemon is started with `--token`, every request must carry the same
 {"op":"rpc","pid":1234,"name":"add","args":[1,2]}
 {"op":"agent","pid":1234,"command":"hook_getpid"}
 {"op":"selftest","pid":1234,"suite":"js"}
+{"op":"dumpso","pid":1234,"module":"libc.so","path":"/data/local/tmp/libc.fix.so"}
 ```
 
 `inject` takes a pid. The agent bytes come from the daemon.
 `attach` answers `attach: use inject`. `detach` answers `detach: M2`.
 
 CLI commands: `ping`, `version`, `ps`, `attach`, `inject`, `spawn`, `agent`,
-`eval`, `rpc`, `selftest`. `ps`, `version`, `rpc`, and `selftest` are
+`eval`, `rpc`, `selftest`, `dumpso`. `ps`, `version`, `rpc`, and `selftest` are
 formatted. The other commands print the daemon JSON. `spawn` is
-`--package NAME` or `--exec PATH [-- args]`.
+`--package NAME` or `--exec PATH [-- args]`. `dumpso` reads
+`/proc/<pid>/mem` in the daemon and writes a repaired AArch64 ELF. The
+script form `Module.dumpSo(path)` does the same read inside the target,
+so `path` has to be writable by that process.
 
 ## Script surface
 
@@ -140,6 +144,7 @@ Installed on the Android agent (`qbdi-static`, which includes `gum-static`):
 - `Instruction.parse`, `DebugSymbol`, `Arm64Writer`
 - `Java` (`perform`, `use`, fields, `implementation`, `original`)
 - `Il2Cpp` (`perform`, classes, methods, fields, strings, `trace`, `gc`, `application`, plus `summary` / `assemblies` / `classes` / `methods` / `dump`)
+- `Module.dumpSo(path)` dumps that loaded library and repairs the AArch64 ELF (relative relocations, `DT_RELR`, import slots)
 - `Trace.function` / `Trace.exclude`. `file` writes the batch when the traced call returns (`events=` / `dropped=` header, then one line per event)
 - `CModule(source[, symbols])` compiles with TinyCC and exposes each global as a `NativePointer`. `dispose()` frees the compiler state. Unknown `extern` symbols come from `symbols` or from the process (`malloc`, `strlen`, …)
 - `send`, `recv`, `rpc.exports`, `setTimeout` / `setInterval`

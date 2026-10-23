@@ -19,6 +19,7 @@ js = { path = "crates/js" }
 inject = { path = "crates/inject" }
 qbdi = { path = "crates/qbdi" }
 il2cpp = { path = "crates/il2cpp" }
+sofix = { path = "crates/sofix" }
 qbdi-rs = { path = "../CommToolkit/crates/qbdi-rs" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

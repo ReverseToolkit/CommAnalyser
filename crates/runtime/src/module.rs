@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::maps::{self, Mapping};
 use crate::range::Range;
 
@@ -145,9 +145,130 @@ pub fn main_module() -> Result<Option<Module>> {
 
 /// Find a module by exact basename.
 pub fn find_by_name(name: &str) -> Result<Option<Module>> {
-    Ok(enumerate()?
+    Ok(find_in(&maps::read_self_maps()?, name))
+}
+
+/// Find `name` in an already parsed map list.
+pub fn find_in(maps: &[maps::Mapping], name: &str) -> Option<Module> {
+    aggregate(maps)
         .into_iter()
-        .find(|m| m.name == name || m.path == name))
+        .find(|module| module.name == name || module.path == name)
+}
+
+/// Bytes of one loaded module, plus the anonymous `.bss` mapped immediately
+/// after its last file-backed page.
+#[derive(Clone, Debug)]
+pub struct CapturedImage {
+    pub base: usize,
+    pub bytes: Vec<u8>,
+    pub perms: Vec<DumpPerm>,
+}
+
+/// One readable piece of a captured image. Offsets are relative to `base`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DumpPerm {
+    pub offset: usize,
+    pub len: usize,
+    pub read: bool,
+    pub write: bool,
+    pub exec: bool,
+}
+
+/// Address span to dump: the module's file-backed run, extended through a
+/// contiguous nameless writable tail.
+pub fn dump_span(module: &Module, maps: &[maps::Mapping]) -> Range {
+    let mut end = module.end;
+    while let Some(mapping) = maps.iter().find(|mapping| mapping.range.start == end) {
+        if mapping.path.is_some()
+            || !mapping.perms.read
+            || !mapping.perms.write
+            || mapping.perms.exec
+        {
+            break;
+        }
+        end = mapping.range.end;
+    }
+    Range::new(module.base, end)
+}
+
+/// Capture `name` from the current process.
+pub fn capture_here(name: &str) -> Result<CapturedImage> {
+    capture_process(std::process::id(), name, true)
+}
+
+/// Capture `name` from another process through `/proc/<pid>/mem`.
+pub fn capture_pid(pid: u32, name: &str) -> Result<CapturedImage> {
+    capture_process(pid, name, false)
+}
+
+fn capture_process(pid: u32, name: &str, direct: bool) -> Result<CapturedImage> {
+    let maps = maps::read_maps(pid)?;
+    let module = find_in(&maps, name).ok_or_else(|| Error::NotFound(name.to_owned()))?;
+    let span = dump_span(&module, &maps);
+    let mut bytes = vec![0u8; span.len()];
+    let mut perms = Vec::new();
+    let mut mem = if direct {
+        None
+    } else {
+        Some(std::fs::File::open(format!("/proc/{pid}/mem"))?)
+    };
+    for mapping in &maps {
+        if mapping.range.end <= span.start || mapping.range.start >= span.end {
+            continue;
+        }
+        let start = mapping.range.start.max(span.start);
+        let end = mapping.range.end.min(span.end);
+        let offset = start - span.start;
+        let len = end - start;
+        if mapping.perms.read {
+            if let Some(file) = mem.as_mut() {
+                read_mem(file, start, &mut bytes[offset..offset + len])?;
+            } else {
+                // SAFETY: `start..end` is a readable mapping in this process.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        start as *const u8,
+                        bytes[offset..offset + len].as_mut_ptr(),
+                        len,
+                    );
+                }
+            }
+        }
+        perms.push(DumpPerm {
+            offset,
+            len,
+            read: mapping.perms.read,
+            write: mapping.perms.write,
+            exec: mapping.perms.exec,
+        });
+    }
+    Ok(CapturedImage {
+        base: span.start,
+        bytes,
+        perms,
+    })
+}
+
+fn read_mem(file: &mut std::fs::File, address: usize, buf: &mut [u8]) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut done = 0usize;
+    while done < buf.len() {
+        let chunk = (buf.len() - done).min(0x1000);
+        let at = address + done;
+        if file.seek(SeekFrom::Start(at as u64)).is_err() {
+            done += chunk;
+            continue;
+        }
+        match file.read(&mut buf[done..done + chunk]) {
+            Ok(0) | Err(_) => {}
+            Ok(n) => {
+                done += n;
+                continue;
+            }
+        }
+        done += chunk;
+    }
+    Ok(())
 }
 
 pub fn score_containing(module: &Module, addr: usize) -> (u8, u8, usize) {
@@ -220,6 +341,39 @@ mod tests {
             modules.iter().find(|m| m.name == "libc.so").unwrap().base,
             0x5000
         );
+    }
+
+    #[test]
+    fn dump_span_includes_a_nameless_writable_tail() {
+        let maps = maps::parse_maps(
+            "1000-2000 r--p 00000000 fd:01 1 /data/libfoo.so\n\
+             2000-3000 r-xp 00001000 fd:01 1 /data/libfoo.so\n\
+             3000-4000 rw-p 00002000 fd:01 1 /data/libfoo.so\n\
+             4000-4800 rw-p 00000000 00:00 0 \n\
+             5000-6000 r-xp 00000000 fd:01 2 /data/libbar.so\n",
+        )
+        .unwrap();
+        let foo = aggregate(&maps)
+            .into_iter()
+            .find(|module| module.name == "libfoo.so")
+            .unwrap();
+        assert_eq!(foo.end, 0x4000);
+        assert_eq!(dump_span(&foo, &maps), Range::new(0x1000, 0x4800));
+    }
+
+    #[test]
+    fn dump_span_stops_at_a_hole_or_a_named_mapping() {
+        let maps = maps::parse_maps(
+            "1000-2000 r-xp 00000000 fd:01 1 /data/libfoo.so\n\
+             3000-4000 rw-p 00000000 00:00 0 \n\
+             4000-5000 rw-p 00000000 00:00 0 [anon:libc_malloc]\n",
+        )
+        .unwrap();
+        let foo = aggregate(&maps)
+            .into_iter()
+            .find(|module| module.name == "libfoo.so")
+            .unwrap();
+        assert_eq!(dump_span(&foo, &maps), Range::new(0x1000, 0x2000));
     }
 
     #[test]

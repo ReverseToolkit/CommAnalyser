@@ -789,9 +789,8 @@ pub(crate) fn install_with_hooks<'js>(
                     });
                     table.entries.len() - 1
                 };
-                let stub =
-                    native::make_callback_stub(callback_dispatch as *const () as usize, id)
-                        .map_err(to_js_error)?;
+                let stub = native::make_callback_stub(callback_dispatch as *const () as usize, id)
+                    .map_err(to_js_error)?;
                 NativePointer::instance(ctx, stub as u64)
             },
         ),
@@ -1901,6 +1900,18 @@ pub(crate) fn module_object_from<'js>(
         NativePointer::instance(ctx.clone(), module.base as u64)?,
     )?;
     obj.set("size", module.size())?;
+    let dump_name = module.name.clone();
+    obj.set(
+        "dumpSo",
+        Func::from(move |ctx: Ctx<'js>, path: String| -> JsResult<Object<'js>> {
+            let report = sofix::dump_here(&dump_name, &path).map_err(to_js_error)?;
+            let out = Object::new(ctx.clone())?;
+            out.set("base", NativePointer::instance(ctx, report.base)?)?;
+            out.set("size", report.size)?;
+            out.set("path", report.path)?;
+            Ok(out)
+        }),
+    )?;
     let path = module.path.clone();
     let base = module.base;
     let name = module.name.clone();

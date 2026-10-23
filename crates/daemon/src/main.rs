@@ -220,6 +220,26 @@ pub fn handle_request(line: &str, token: Option<&str>) -> String {
                 Err(err) => error_response(format!("selftest: {err}")),
             }
         }
+        "dumpso" => {
+            let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let module = request.get("module").and_then(Value::as_str).unwrap_or("");
+            let path = request.get("path").and_then(Value::as_str).unwrap_or("");
+            if module.is_empty() || path.is_empty() {
+                error_response("dumpso: module and path are required".to_owned())
+            } else {
+                match sofix::dump_pid(pid, module, path) {
+                    Ok(report) => json!({
+                        "ok": true,
+                        "pid": pid,
+                        "base": report.base,
+                        "size": report.size,
+                        "path": report.path,
+                    })
+                    .to_string(),
+                    Err(err) => error_response(format!("dumpso: {err}")),
+                }
+            }
+        }
         "eval" => {
             let pid = request.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
             let code = request.get("code").and_then(Value::as_str).unwrap_or("");
@@ -615,6 +635,10 @@ mod tests {
             (
                 r#"{"op":"selftest","pid":1,"suite":"runtime"}"#,
                 "selftest:",
+            ),
+            (
+                r#"{"op":"dumpso","pid":1,"module":"libc.so","path":"/tmp/a.so"}"#,
+                "dumpso:",
             ),
         ] {
             let value = parsed(line);

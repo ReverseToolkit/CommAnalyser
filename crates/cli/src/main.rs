@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: comm-analyser [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|spawn|agent|eval|rpc|selftest>";
+const USAGE: &str = "usage: comm-analyser [--addr HOST:PORT] [--token TOKEN] <ping|version|ps|attach|inject|spawn|agent|eval|rpc|selftest|dumpso>";
 
 fn main() -> ExitCode {
     match run() {
@@ -140,7 +140,8 @@ fn print_help() {
            agent <pid> <command>  send a command to an injected agent\n\
            eval <pid> <expression>  evaluate JS in the agent\n\
            rpc <pid> <name> [json-args]  invoke rpc.exports\n\
-           selftest <pid> [suite]  run in-process agent tests\n"
+           selftest <pid> [suite]  run in-process agent tests\n\
+           dumpso <pid> <module> <path>  dump a loaded so and repair the ELF\n"
     );
 }
 
@@ -240,6 +241,20 @@ fn command_to_json(command: &str, rest: &[String]) -> Result<Value, String> {
                 return Err("usage: comm-analyser eval <pid> <expression>".to_owned());
             }
             Ok(json!({"op": "eval", "pid": pid, "code": code}))
+        }
+        "dumpso" => {
+            let pid = rest
+                .first()
+                .ok_or("usage: comm-analyser dumpso <pid> <module> <path>")?
+                .parse::<u32>()
+                .map_err(|_| "invalid pid".to_owned())?;
+            let module = rest
+                .get(1)
+                .ok_or("usage: comm-analyser dumpso <pid> <module> <path>")?;
+            let path = rest
+                .get(2)
+                .ok_or("usage: comm-analyser dumpso <pid> <module> <path>")?;
+            Ok(json!({"op": "dumpso", "pid": pid, "module": module, "path": path}))
         }
         "selftest" => {
             let pid = rest
@@ -368,7 +383,7 @@ mod tests {
     fn help_lists_every_usage_command() {
         for command in [
             "ping", "version", "ps", "attach", "inject", "spawn", "agent", "eval", "rpc",
-            "selftest",
+            "selftest", "dumpso",
         ] {
             assert!(USAGE.contains(command), "{command}");
         }
