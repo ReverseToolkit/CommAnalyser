@@ -128,8 +128,10 @@ When the daemon is started with `--token`, every request must carry the same
 
 CLI commands: `ping`, `version`, `ps`, `attach`, `inject`, `spawn`, `agent`,
 `eval`, `rpc`, `selftest`, `dumpso`. `ps`, `version`, `rpc`, and `selftest` are
-formatted. The other commands print the daemon JSON. `spawn` is
-`--package NAME` or `--exec PATH [-- args]`. `dumpso` reads
+formatted. The other commands print the daemon JSON. `spawn --package` arms the package and lets the Zygisk module load the agent
+in `postAppSpecialize`, before `Application.onCreate`. The module lives in
+`zygisk/` and is loaded by CommZygisk. `spawn --exec` still injects after the
+process is up. `dumpso` reads
 `/proc/<pid>/mem` in the daemon and writes a repaired AArch64 ELF. The
 script form `Module.dumpSo(path)` does the same read inside the target,
 so `path` has to be writable by that process.

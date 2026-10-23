@@ -43,6 +43,37 @@ fn wait_for_libc(pid: u32) -> Result<()> {
     )))
 }
 
+/// Force-stop `package` and ask `am` to start it without waiting for the activity.
+///
+/// Waiting here would deadlock a Zygisk specialize hook that blocks until the
+/// daemon accepts the agent: `am start -W` does not return until `onCreate`.
+pub fn launch_package(package: &str) -> Result<()> {
+    let _ = Command::new("am").args(["force-stop", package]).status();
+    let started = Command::new("am")
+        .args([
+            "start",
+            "-a",
+            "android.intent.action.MAIN",
+            "-c",
+            "android.intent.category.LAUNCHER",
+            package,
+        ])
+        .status()
+        .map_err(Error::Io)?;
+    if started.success() {
+        return Ok(());
+    }
+    let fallback = Command::new("monkey")
+        .args(["-p", package, "-c", "android.intent.category.LAUNCHER", "1"])
+        .status()
+        .map_err(Error::Io)?;
+    if fallback.success() {
+        Ok(())
+    } else {
+        Err(Error::Parse(format!("failed to start {package}")))
+    }
+}
+
 /// Force-stop `package`, launch it, and return the new pid.
 ///
 /// Uses `am` / `monkey` which exist on the Android daemon.  This is start +

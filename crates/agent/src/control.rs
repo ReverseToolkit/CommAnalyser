@@ -60,7 +60,7 @@ fn connect_abstract(name: &str) -> std::io::Result<UnixStream> {
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
-fn run(name: &str) -> std::io::Result<()> {
+fn run(name: &str, ready: &mpsc::Sender<()>) -> std::io::Result<()> {
     let stream = connect_abstract(name)?;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let mut reader = BufReader::new(stream);
@@ -100,6 +100,7 @@ fn run(name: &str) -> std::io::Result<()> {
         writeln!(output, "{hello}")?;
         output.flush()?;
     }
+    let _ = ready.send(());
 
     let mut line = String::new();
     loop {
@@ -352,13 +353,43 @@ fn dump_so(request: &Value) -> Value {
     }
 }
 
+/// Start the control thread and return once the hello line has been written.
+///
+/// `agent_main` itself must return before the ptrace injector resumes the
+/// target, so that path does not wait. Zygisk calls this from a live thread
+/// and must not leave `postAppSpecialize` until the daemon can see the agent.
+pub fn spawn_ready(name: String) -> bool {
+    let (ready, wait) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut last = None;
+        for _ in 0..50 {
+            match runtime::ffi::guard("agent control channel", || run(&name, &ready)) {
+                Some(Ok(())) => return,
+                Some(Err(err)) => {
+                    last = Some(err);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                None => {
+                    eprintln!("[agent] control channel panicked; giving up");
+                    return;
+                }
+            }
+        }
+        if let Some(err) = last {
+            eprintln!("[agent] control channel failed: {err}");
+        }
+    });
+    wait.recv_timeout(Duration::from_secs(5)).is_ok()
+}
+
 pub fn spawn(name: String) {
+    let (ready, _wait) = mpsc::channel();
     std::thread::spawn(move || {
         let mut last = None;
         for _ in 0..50 {
             // Contain a panic so the control thread survives a bad script or
             // a torn-down runtime instead of going silent.
-            match runtime::ffi::guard("agent control channel", || run(&name)) {
+            match runtime::ffi::guard("agent control channel", || run(&name, &ready)) {
                 Some(Ok(())) => return,
                 Some(Err(err)) => {
                     last = Some(err);

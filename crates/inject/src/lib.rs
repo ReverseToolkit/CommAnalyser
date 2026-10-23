@@ -15,7 +15,7 @@ pub mod spawn;
 use runtime::Error;
 
 pub use session::{attach, Session};
-pub use spawn::{pids_named, start_executable, start_package};
+pub use spawn::{launch_package, pids_named, start_executable, start_package};
 
 /// Whether injection is supported on this build target.
 pub const fn supported() -> bool {

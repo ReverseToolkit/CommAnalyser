@@ -4,6 +4,7 @@
 //! and `ps`.  Script/attach operations are added in M1.
 
 mod control_server;
+mod gate;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -59,6 +60,13 @@ fn main() -> ExitCode {
                 }
             },
             "--token" => token = args.next(),
+            // The installed module's service.sh passes this. The gate does not use it.
+            "--root" => {
+                if args.next().is_none() {
+                    eprintln!("missing --root value");
+                    return ExitCode::from(2);
+                }
+            }
             "-h" | "--help" => {
                 println!("usage: daemon [--addr 127.0.0.1:17321] [--token TOKEN]");
                 println!("  the agent is the gzip blob embedded in this binary");
@@ -80,6 +88,7 @@ fn main() -> ExitCode {
     };
     println!("LISTEN {addr}");
     let _ = std::io::stdout().flush();
+    std::thread::spawn(gate::serve);
 
     for incoming in listener.incoming() {
         match incoming {
@@ -265,7 +274,7 @@ fn spawn(
     args: &[String],
 ) -> Result<(u32, String), String> {
     let pid = if let Some(package) = package {
-        inject::start_package(package).map_err(|err| format!("{err}"))?
+        return gate::launch(package);
     } else if let Some(path) = exec {
         inject::start_executable(path, args).map_err(|err| format!("{err}"))?
     } else {
@@ -343,6 +352,33 @@ fn inject(pid: u32) -> Result<String, String> {
         );
 
     session.resume();
+    Ok(hello)
+}
+
+pub(crate) fn adopt_agent(pid: u32, stream: UnixStream) -> Result<String, String> {
+    let hello = control_server::Listener::read_hello(&stream, Duration::from_secs(5))
+        .map_err(|err| format!("hello: {err}"))?;
+    stream
+        .set_read_timeout(Some(AGENT_REQUEST_TIMEOUT))
+        .map_err(|err| format!("set timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(AGENT_REQUEST_TIMEOUT))
+        .map_err(|err| format!("set write timeout: {err}"))?;
+    let reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|err| format!("clone agent stream: {err}"))?,
+    );
+    agents()
+        .lock()
+        .map_err(|_| "agent registry poisoned".to_owned())?
+        .insert(
+            pid,
+            Arc::new(Mutex::new(Some(AgentChannel {
+                writer: stream,
+                reader,
+            }))),
+        );
     Ok(hello)
 }
 
