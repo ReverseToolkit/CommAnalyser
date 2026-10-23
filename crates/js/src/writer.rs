@@ -425,7 +425,6 @@ impl Arm64Writer {
     }
 }
 
-
 fn encode_label(kind: LabelKind, delta: i64) -> u32 {
     match kind {
         LabelKind::B => 0x1400_0000 | (((delta >> 2) as u32) & 0x03FF_FFFF),
@@ -559,11 +558,10 @@ pub fn install<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                         }
                         let pc = cursor_r.get();
                         let bytes = memory::read(pc, 4).map_err(map_err)?;
-                        let word = u32::from_le_bytes(
-                            bytes.as_slice().try_into().map_err(|_| {
+                        let word =
+                            u32::from_le_bytes(bytes.as_slice().try_into().map_err(|_| {
                                 js_err("readOne: instruction crosses a mapping boundary")
-                            })?,
-                        );
+                            })?);
                         last_r.set((word, pc));
                         cursor_r.set(pc + 4);
                         let insn = arch_arm64::classify(word);
@@ -644,9 +642,10 @@ mod tests {
     fn simulate(bytes: &[u8]) -> [u64; 32] {
         let mut regs: [u64; 32] = core::array::from_fn(|index| 0x1000 + index as u64);
         let sp = 0x7000u64;
-        for word in bytes.chunks_exact(4).map(|chunk| {
-            u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"))
-        }) {
+        for word in bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("4-byte chunk")))
+        {
             let rd = (word & 0x1F) as usize;
             let rn = ((word >> 5) & 0x1F) as usize;
             let rm = ((word >> 16) & 0x1F) as usize;
@@ -682,10 +681,12 @@ mod tests {
     #[test]
     fn js_layer_moves_arguments_in_parallel() {
         // Naive ordering would leave x1 == old x1 instead of old x0.
-        let bytes = emit(r#"
+        let bytes = emit(
+            r#"
             globalThis.w = new Arm64Writer(base);
             w.putCallAddressWithArguments(0x1000, ["x1", "x0"]);
-        "#)
+        "#,
+        )
         .expect("emit");
         let regs = simulate(&bytes);
         assert_eq!(regs[0], 0x1001, "x0 must receive the old x1");
@@ -694,10 +695,12 @@ mod tests {
 
     #[test]
     fn js_layer_breaks_a_three_way_cycle() {
-        let bytes = emit(r#"
+        let bytes = emit(
+            r#"
             globalThis.w = new Arm64Writer(base);
             w.putCallAddressWithArguments(0x2000, ["x2", "x0", "x1"]);
-        "#)
+        "#,
+        )
         .expect("emit");
         let regs = simulate(&bytes);
         assert_eq!(regs[0], 0x1002);
@@ -708,10 +711,12 @@ mod tests {
     #[test]
     fn js_layer_writes_immediates_after_register_moves() {
         // Immediate first would destroy x0 before the move reads it.
-        let bytes = emit(r#"
+        let bytes = emit(
+            r#"
             globalThis.w = new Arm64Writer(base);
             w.putCallAddressWithArguments(0x3000, [0x1234, "x0"]);
-        "#)
+        "#,
+        )
         .expect("emit");
         let regs = simulate(&bytes);
         assert_eq!(regs[0], 0x1234);
@@ -720,16 +725,20 @@ mod tests {
 
     #[test]
     fn js_layer_rejects_unsupported_argument_shapes() {
-        let too_many = emit(r#"
+        let too_many = emit(
+            r#"
             globalThis.w = new Arm64Writer(base);
             w.putCallAddressWithArguments(0x1000, ["x0","x1","x2","x3","x4","x5","x6","x7","x0"]);
-        "#);
+        "#,
+        );
         assert!(too_many.is_err(), "9 arguments must be rejected");
 
-        let bad_register = emit(r#"
+        let bad_register = emit(
+            r#"
             globalThis.w = new Arm64Writer(base);
             w.putCallAddressWithArguments(0x1000, ["x99"]);
-        "#);
+        "#,
+        );
         assert!(bad_register.is_err(), "x99 must be rejected");
     }
 
@@ -755,18 +764,22 @@ mod tests {
     #[test]
     fn js_layer_preserves_unaligned_store_offsets() {
         // 5 is not a multiple of 8 and must go through STUR unchanged.
-        let bytes = emit(r#"
+        let bytes = emit(
+            r#"
             globalThis.w = new Arm64Writer(base);
             w.putStrRegRegOffset("x0", "x1", 5);
-        "#)
+        "#,
+        )
         .expect("emit");
         assert_eq!(decode_store(&bytes), (5, false));
 
         // A 32-bit store gets its own scaled form (scale 4), not a rejection.
-        let bytes = emit(r#"
+        let bytes = emit(
+            r#"
             globalThis.w = new Arm64Writer(base);
             w.putStrRegRegOffset("w0", "x1", 256);
-        "#)
+        "#,
+        )
         .expect("emit");
         assert_eq!(decode_store(&bytes), (256, true));
     }
@@ -775,9 +788,10 @@ mod tests {
     fn simulate_store(bytes: &[u8]) -> i64 {
         let mut regs: [u64; 32] = core::array::from_fn(|index| 0x1000 + index as u64);
         let mut address = None;
-        for word in bytes.chunks_exact(4).map(|chunk| {
-            u32::from_le_bytes(chunk.try_into().expect("4 bytes"))
-        }) {
+        for word in bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("4 bytes")))
+        {
             let rd = (word & 0x1F) as usize;
             let base = ((word >> 5) & 0x1F) as usize;
             let rm = ((word >> 16) & 0x1F) as usize;
@@ -791,15 +805,11 @@ mod tests {
                 let immediate = ((word >> 5) & 0xFFFF) as u64;
                 let shift = ((word >> 21) & 0x3) * 16;
                 regs[rd] = (regs[rd] & !(0xFFFFu64 << shift)) | (immediate << shift);
-            } else if word & 0xFFC0_0000 == 0x9100_0000
-                || word & 0xFFC0_0000 == 0x9140_0000
-            {
+            } else if word & 0xFFC0_0000 == 0x9100_0000 || word & 0xFFC0_0000 == 0x9140_0000 {
                 let immediate = ((word >> 10) & 0xFFF) as u64;
                 let shift = if word & 0x0040_0000 != 0 { 12 } else { 0 };
                 regs[rd] = regs[base].wrapping_add(immediate << shift);
-            } else if word & 0xFFC0_0000 == 0xD100_0000
-                || word & 0xFFC0_0000 == 0xD140_0000
-            {
+            } else if word & 0xFFC0_0000 == 0xD100_0000 || word & 0xFFC0_0000 == 0xD140_0000 {
                 let immediate = ((word >> 10) & 0xFFF) as u64;
                 let shift = if word & 0x0040_0000 != 0 { 12 } else { 0 };
                 regs[rd] = regs[base].wrapping_sub(immediate << shift);
@@ -823,23 +833,29 @@ mod tests {
     fn js_layer_falls_back_for_large_store_offsets() {
         // -1000 fits neither STR nor STUR; the writer materializes the address
         // in x16 and stores at offset 0.
-        let bytes = emit(r#"
+        let bytes = emit(
+            r#"
             globalThis.w = new Arm64Writer(base);
             w.putStrRegRegOffset("x0", "x1", -1000);
-        "#)
+        "#,
+        )
         .expect("emit");
-        assert!(bytes.len() > 4, "fallback must emit more than one instruction");
+        assert!(
+            bytes.len() > 4,
+            "fallback must emit more than one instruction"
+        );
         assert_eq!(simulate_store(&bytes), 0x1001 - 1000);
     }
 
     #[test]
     fn js_layer_rejects_large_offset_without_a_scratch_register() {
         // x16/x17 are the scratch candidates; using both leaves none.
-        let result = emit(r#"
+        let result = emit(
+            r#"
             globalThis.w = new Arm64Writer(base);
             w.putStrRegRegOffset("x16", "x17", 5001);
-        "#);
+        "#,
+        );
         assert!(result.is_err(), "no scratch register available");
     }
 }
-

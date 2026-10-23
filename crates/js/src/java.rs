@@ -184,10 +184,8 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>, java_hooks: Rc<RefCell<JavaHookTable>
             },
         ),
     )?;
-    ctx.globals().set(
-        "__analyser_java_handle_stats",
-        Func::from(handle_stats),
-    )?;
+    ctx.globals()
+        .set("__analyser_java_handle_stats", Func::from(handle_stats))?;
     ctx.globals().set(
         "__analyser_java_release",
         Func::from(|id: u32, generation: u32| {
@@ -441,7 +439,10 @@ fn instance_object<'js>(ctx: Ctx<'js>, class: Rc<JavaClass>, id: u32) -> JsResul
     // the script never called $dispose().
     // Tracking is best effort: if the registry is unavailable or throws, the
     // wrapper still works and the handle is only freed by $dispose().
-    if let Ok(track) = ctx.globals().get::<_, Function<'js>>("__analyser_java_track") {
+    if let Ok(track) = ctx
+        .globals()
+        .get::<_, Function<'js>>("__analyser_java_track")
+    {
         let _ = track.call::<_, ()>((wrapper.clone(), id, generation));
     }
     for (name, methods) in method_groups(&class.info) {
@@ -1130,11 +1131,9 @@ fn original_args(
             }
             Kind::Object(name) if is_global => {
                 let param_class = JavaClass::find(name).map_err(to_js_error)?;
-                let object = art::java::object_from_global_handle(
-                    param_class.info.clone(),
-                    word as usize,
-                )
-                .map_err(to_js_error)?;
+                let object =
+                    art::java::object_from_global_handle(param_class.info.clone(), word as usize)
+                        .map_err(to_js_error)?;
                 JavaArg::Object(Rc::new(object))
             }
             Kind::Object(_) | Kind::Array(_) | Kind::Void => JavaArg::Null,
@@ -1346,7 +1345,9 @@ fn register(object: JavaObject) -> u32 {
 }
 
 fn generation_of(id: u32) -> u32 {
-    OBJECTS.with(|table| table.borrow().generation(id)).unwrap_or(0)
+    OBJECTS
+        .with(|table| table.borrow().generation(id))
+        .unwrap_or(0)
 }
 
 fn get_object(id: u32) -> Option<Rc<JavaObject>> {

@@ -129,24 +129,8 @@ int puts(const char *s);
 ];
 
 const BUILTIN_SYMBOLS: &[&str] = &[
-    "malloc",
-    "calloc",
-    "realloc",
-    "free",
-    "memcpy",
-    "memmove",
-    "memset",
-    "memcmp",
-    "strlen",
-    "strcmp",
-    "strncmp",
-    "strcpy",
-    "strncpy",
-    "printf",
-    "snprintf",
-    "puts",
-    "abort",
-    "exit",
+    "malloc", "calloc", "realloc", "free", "memcpy", "memmove", "memset", "memcmp", "strlen",
+    "strcmp", "strncmp", "strcpy", "strncpy", "printf", "snprintf", "puts", "abort", "exit",
 ];
 
 thread_local! {
@@ -193,7 +177,10 @@ pub fn compile<'js>(
         if !is_public_symbol(name) {
             continue;
         }
-        object.set(name.as_str(), NativePointer::instance(ctx.clone(), *address)?)?;
+        object.set(
+            name.as_str(),
+            NativePointer::instance(ctx.clone(), *address)?,
+        )?;
     }
     let id = compiled.id;
     object.set(
@@ -221,7 +208,8 @@ fn compile_source(source: &str, symbols: &HashMap<String, u64>) -> Result<Compil
         }
         tcc_set_error_func(state, ptr::null_mut(), Some(on_error));
         let lib = CString::new(runtime.lib.display().to_string()).map_err(|err| err.to_string())?;
-        let include = CString::new(runtime.include.display().to_string()).map_err(|err| err.to_string())?;
+        let include =
+            CString::new(runtime.include.display().to_string()).map_err(|err| err.to_string())?;
         tcc_set_lib_path(state, lib.as_ptr());
         tcc_add_sysinclude_path(state, include.as_ptr());
         let options = CString::new("-nostdinc -nostdlib -Wall").unwrap();
@@ -232,7 +220,8 @@ fn compile_source(source: &str, symbols: &HashMap<String, u64>) -> Result<Compil
             return Err(format!("tcc_set_output_type: {message}"));
         }
         let prefixed = format!("#line 1 \"module.c\"\n{source}");
-        let code = CString::new(prefixed).map_err(|_| "C source contains an interior NUL".to_string())?;
+        let code =
+            CString::new(prefixed).map_err(|_| "C source contains an interior NUL".to_string())?;
         if tcc_compile_string(state, code.as_ptr()) != 0 {
             let message = take_errors();
             tcc_delete(state);
@@ -250,7 +239,10 @@ fn compile_source(source: &str, symbols: &HashMap<String, u64>) -> Result<Compil
         modules
             .get_or_insert_with(HashMap::new)
             .insert(id, StatePtr(state));
-        Ok(Compiled { id, symbols: listed })
+        Ok(Compiled {
+            id,
+            symbols: listed,
+        })
     }
 }
 
@@ -295,7 +287,9 @@ unsafe extern "C" fn on_symbol(ctx: *mut c_void, name: *const c_char, value: *co
     }
     // SAFETY: caller passes the Vec allocated in `list_symbols`.
     let out = unsafe { &mut *ctx.cast::<Vec<(String, u64)>>() };
-    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+    let name = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned();
     out.push((name, value as u64));
 }
 
@@ -400,9 +394,10 @@ fn symbol_map(symbols: &Option<Object<'_>>) -> JsResult<HashMap<String, u64>> {
     };
     for key in symbols.keys::<String>() {
         let key = key.map_err(|err| to_js_error(err.to_string()))?;
-        let value: Value = symbols.get(&key).map_err(|err| to_js_error(err.to_string()))?;
+        let value: Value = symbols
+            .get(&key)
+            .map_err(|err| to_js_error(err.to_string()))?;
         out.insert(key, parse_pointer(&value)?);
     }
     Ok(out)
 }
-

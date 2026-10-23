@@ -392,10 +392,12 @@ fn worker_loop(
     let deadline = Arc::new(AtomicU64::new(0));
     {
         let deadline = deadline.clone();
-        runtime.runtime().set_interrupt_handler(Some(Box::new(move || {
-            let armed = deadline.load(Ordering::Relaxed);
-            armed != 0 && epoch.elapsed().as_millis() as u64 > armed
-        })));
+        runtime
+            .runtime()
+            .set_interrupt_handler(Some(Box::new(move || {
+                let armed = deadline.load(Ordering::Relaxed);
+                armed != 0 && epoch.elapsed().as_millis() as u64 > armed
+            })));
     }
 
     loop {
